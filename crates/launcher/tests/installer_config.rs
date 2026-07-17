@@ -97,3 +97,47 @@ fn launch_vbs_generation_quotes_the_exe_path() {
          got {run_line}"
     );
 }
+
+/// Uninstall must stop the running IME processes, or their exe/dll files
+/// stay locked and {app} can't be removed.
+#[test]
+fn uninstall_stops_the_running_processes() {
+    let iss = read("Installer.iss");
+
+    assert!(
+        iss.contains(r#"Filename: "taskkill""#),
+        "uninstall should invoke taskkill"
+    );
+
+    // Inno line-continues each field, so the process list is on the
+    // Parameters line, separate from the Filename line
+    let params = iss
+        .lines()
+        .find(|l| l.contains("/IM") && l.contains("launcher.exe"))
+        .expect("Installer.iss should pass the processes to taskkill via /IM");
+
+    for proc in ["launcher.exe", "ui.exe", "azookey-server.exe"] {
+        assert!(
+            params.contains(proc),
+            "uninstall's taskkill must target {proc}: got {params}"
+        );
+    }
+}
+
+/// The build-directory glob must not re-copy the TIP DLL: it is already
+/// placed and registered as azookey.dll / azookey32.dll, so the glob would
+/// only add unregistered dead copies.
+#[test]
+fn build_glob_excludes_the_registered_dll() {
+    let iss = read("Installer.iss");
+
+    let glob_line = iss
+        .lines()
+        .find(|l| l.contains(r#"Source: "../build/*""#))
+        .expect("Installer.iss should have a build/* glob");
+
+    assert!(
+        glob_line.contains("azookey_windows.dll"),
+        "the build/* glob must exclude azookey_windows.dll: got {glob_line}"
+    );
+}

@@ -55,8 +55,10 @@ Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit
 Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit
 ; exclude the installer's own output (OutputDir is also ../build): a stale
-; azookey-setup.exe would otherwise be bundled into — or clash with — the new one
-Source: "../build/*"; Excludes: "azookey-setup.exe"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; azookey-setup.exe would otherwise be bundled into — or clash with — the new one.
+; also exclude azookey_windows.dll: it's already placed and registered above as
+; azookey.dll / azookey32.dll, so the glob would only add unregistered dead copies
+Source: "../build/*"; Excludes: "azookey-setup.exe,azookey_windows.dll"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "../target/release/bundle/nsis/{#TauriSetupExe}"; Flags: dontcopy noencryption
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
@@ -88,6 +90,13 @@ Filename: "icacls"; \
 Type: files; Name: "{app}\launch.vbs"
 
 [UninstallRun]
+; stop the running IME processes first, or their exe/dll files stay locked
+; and {app} can't be removed (UninstallNeedRestart hides this by deferring
+; deletion to the reboot, but the unregistered DLL keeps loading until then)
+Filename: "taskkill"; \
+  RunOnceId: "KillAzookeyProcs"; \
+  Parameters: "/F /IM launcher.exe /IM ui.exe /IM azookey-server.exe"; \
+  Flags: runhidden runascurrentuser
 Filename: "schtasks"; \
   RunOnceId: "DelAzookeyStartupTask"; \
   Parameters: "/Delete /TN ""Azookey Startup"" /F"; \
