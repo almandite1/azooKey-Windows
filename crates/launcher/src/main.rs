@@ -11,7 +11,12 @@ use tokio::process::{Child, Command};
 use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::HealthCheckRequest;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows::Win32::System::Threading::CreateMutexW;
 
 /// give up when a child keeps crashing this many times within RESTART_WINDOW
@@ -35,6 +40,79 @@ const MAX_CONSECUTIVE_WATCHDOG_KILLS: u32 = 5;
 
 /// keep at most this many launcher session logs
 const MAX_LOG_FILES: usize = 10;
+
+/// A job object with KILL_ON_JOB_CLOSE: the children are added to it, so if
+/// the launcher dies (crash or kill) instead of exiting cleanly, Windows
+/// closes the last job handle and tears the children down too. Without this,
+/// orphaned server/ui processes keep the machine-global pipe names open, and
+/// the next logon's launcher — which the single-instance mutex lets through,
+/// since it only guards launchers — burns its whole restart budget losing
+/// first_pipe_instance to the orphan.
+///
+/// The handle is deliberately leaked into a OnceLock and never closed: the
+/// job must outlive every child, i.e. live exactly as long as this process.
+static CHILD_JOB: OnceLock<JobHandle> = OnceLock::new();
+
+struct JobHandle(HANDLE);
+// the job handle is only ever passed to AssignProcessToJobObject, which is
+// thread-safe; children are assigned from the per-child supervisor tasks
+unsafe impl Send for JobHandle {}
+unsafe impl Sync for JobHandle {}
+
+/// Creates the kill-on-close job the children are assigned to. A failure is
+/// not fatal — the launcher still supervises, it just loses the guarantee
+/// that its children die with it.
+fn init_child_job() {
+    let job = unsafe {
+        match CreateJobObjectW(None, PCWSTR::null()) {
+            Ok(job) => job,
+            Err(e) => {
+                log_err(&format!("CreateJobObject failed ({e}); children won't be tied to the launcher's lifetime"));
+                return;
+            }
+        }
+    };
+
+    let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        BasicLimitInformation:
+            windows::Win32::System::JobObjects::JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                ..Default::default()
+            },
+        ..Default::default()
+    };
+
+    let ok = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if let Err(e) = ok {
+        log_err(&format!(
+            "SetInformationJobObject failed ({e}); children won't be tied to the launcher's lifetime"
+        ));
+        return;
+    }
+
+    let _ = CHILD_JOB.set(JobHandle(job));
+}
+
+/// Adds a freshly spawned child to the kill-on-close job, if the job exists.
+fn assign_to_child_job(child: &Child, prefix: &str) {
+    let Some(job) = CHILD_JOB.get() else {
+        return;
+    };
+    let Some(raw) = child.raw_handle() else {
+        log_err(&format!("{prefix} has no handle to assign to the job"));
+        return;
+    };
+    if let Err(e) = unsafe { AssignProcessToJobObject(job.0, HANDLE(raw)) } {
+        log_err(&format!("{prefix} could not be assigned to the job ({e})"));
+    }
+}
 
 // The launcher normally runs headless from the logon scheduled task, so
 // console output is lost — everything is also teed into
@@ -127,6 +205,9 @@ async fn main() -> anyhow::Result<()> {
         )),
     }
 
+    // children are added to this job so a launcher crash can't orphan them
+    init_child_job();
+
     let config = AppConfig::new();
 
     let exe_path = env::current_exe()?
@@ -151,12 +232,12 @@ async fn main() -> anyhow::Result<()> {
     // application until re-login, so both children are supervised: exits
     // are restarted with backoff, and a health-check watchdog kills a child
     // that stops answering (the kill then flows into the same restart path)
-    let server_handle = tokio::spawn(supervise(
+    let server_handle = tokio::spawn(run_supervisor(
         "azookey-server.exe",
         "[server]",
         shared::pipe::SERVER_PIPE,
     ));
-    let ui_handle = tokio::spawn(supervise("ui.exe", "[ui]", shared::pipe::UI_PIPE));
+    let ui_handle = tokio::spawn(run_supervisor("ui.exe", "[ui]", shared::pipe::UI_PIPE));
 
     let _ = server_handle.await;
     let _ = ui_handle.await;
@@ -164,10 +245,43 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Runs one child's supervisor and, if it gives up, ends the whole launcher.
+///
+/// If a supervisor gives up (spawn failure, or a crash/hang loop that blew
+/// its budget) the IME is dead until something restarts it — but the
+/// single-instance mutex is held for as long as this launcher lives, so a
+/// manual relaunch would just exit immediately. Exiting the process releases
+/// that mutex (letting a fresh launch recover) and, via the job's
+/// KILL_ON_JOB_CLOSE, tears down the other child so it can't linger and hold
+/// the pipe names.
+async fn run_supervisor(exe: &'static str, prefix: &'static str, pipe_name: &'static str) {
+    if supervise(exe, prefix, pipe_name).await == SuperviseOutcome::GaveUp {
+        log_err(&format!(
+            "{prefix} is unrecoverable; exiting the launcher so a fresh start can take over"
+        ));
+        std::process::exit(1);
+    }
+}
+
+/// Why a supervisor loop stopped.
+#[derive(Debug, PartialEq, Eq)]
+enum SuperviseOutcome {
+    /// The child exited cleanly and on purpose (e.g. the UI re-executing
+    /// itself with a UIAccess token). Nothing to recover.
+    Exited,
+    /// The child is unrecoverable — spawn failure, or a crash/hang loop that
+    /// exhausted the restart budget. The launcher should stand down.
+    GaveUp,
+}
+
 /// Keeps a child process running: restarts it when it exits abnormally or
 /// stops answering health checks, with exponential backoff, and gives up on
 /// a tight crash/hang loop.
-async fn supervise(exe: &'static str, prefix: &'static str, pipe_name: &'static str) {
+async fn supervise(
+    exe: &'static str,
+    prefix: &'static str,
+    pipe_name: &'static str,
+) -> SuperviseOutcome {
     let mut recent_restarts: Vec<Instant> = Vec::new();
     let mut backoff = Duration::from_secs(1);
     let mut consecutive_watchdog_kills: u32 = 0;
@@ -176,7 +290,7 @@ async fn supervise(exe: &'static str, prefix: &'static str, pipe_name: &'static 
         let Some(mut child) = start_process(exe, prefix) else {
             // spawn failure (e.g. missing binary) won't fix itself
             log_err(&format!("{prefix} could not be started; giving up"));
-            return;
+            return SuperviseOutcome::GaveUp;
         };
 
         let started_at = Instant::now();
@@ -187,15 +301,17 @@ async fn supervise(exe: &'static str, prefix: &'static str, pipe_name: &'static 
                 match status {
                     Ok(s) if s.success() => {
                         log_info(&format!("{prefix} exited normally"));
-                        return;
+                        return SuperviseOutcome::Exited;
                     }
                     Ok(s) => {
                         log_err(&format!("{prefix} exited abnormally: {s}"));
                         false
                     }
                     Err(e) => {
+                        // can't observe the child anymore: treat as
+                        // unrecoverable rather than spin-restarting blind
                         log_err(&format!("{prefix} wait failed: {e}"));
-                        return;
+                        return SuperviseOutcome::GaveUp;
                     }
                 }
             }
@@ -218,7 +334,7 @@ async fn supervise(exe: &'static str, prefix: &'static str, pipe_name: &'static 
                 log_err(&format!(
                     "{prefix} was killed by the watchdog {MAX_CONSECUTIVE_WATCHDOG_KILLS} times without ever becoming healthy; giving up"
                 ));
-                return;
+                return SuperviseOutcome::GaveUp;
             }
         } else if saw_healthy.load(Ordering::SeqCst) {
             consecutive_watchdog_kills = 0;
@@ -237,7 +353,7 @@ async fn supervise(exe: &'static str, prefix: &'static str, pipe_name: &'static 
             log_err(&format!(
                 "{prefix} crashed {MAX_RESTARTS_IN_WINDOW} times within {RESTART_WINDOW:?}; giving up"
             ));
-            return;
+            return SuperviseOutcome::GaveUp;
         }
         recent_restarts.push(now);
 
@@ -360,6 +476,10 @@ fn start_process(exe: &str, prefix: &str) -> Option<Child> {
             return None;
         }
     };
+
+    // tie the child to the launcher's lifetime before anything else, so a
+    // launcher crash in the next instant still can't orphan it
+    assign_to_child_job(&child, prefix);
 
     if let Some(stdout) = child.stdout.take() {
         let prefix = prefix.to_string();
