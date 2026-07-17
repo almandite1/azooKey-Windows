@@ -7,3 +7,9 @@ logs/*
 *.gguf
 *.dll
 *.lib
+
+# llama.cpp prebuilt binaries — downloaded and SHA256-verified by
+# .github/workflows/actions.yml; never committed
+llama_cpu/
+llama_cuda/
+llama_vulkan/
