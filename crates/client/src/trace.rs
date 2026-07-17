@@ -23,7 +23,8 @@ impl<'a> Visit for StringVisitor<'a> {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         // do nothing
         if field.name() == "message" {
-            write!(self.string, "{:?}", value).unwrap();
+            // writing into a String cannot fail
+            let _ = write!(self.string, "{:?}", value);
         }
     }
 }

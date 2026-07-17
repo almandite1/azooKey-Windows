@@ -264,7 +264,7 @@ impl TextServiceFactory {
         let mut suffix = composition.suffix.clone();
         let mut raw_input = composition.raw_input.clone();
         let mut raw_hiragana = composition.raw_hiragana.clone();
-        let mut corresponding_count = composition.corresponding_count.clone();
+        let mut corresponding_count = composition.corresponding_count;
         let mut candidates = composition.candidates.clone();
         let mut selection_index = composition.selection_index;
         let mut ipc_service = IMEState::get()?
@@ -299,7 +299,7 @@ impl TextServiceFactory {
                         ipc_service.clear_text()?;
                     }
                     ClientAction::AppendText(text) => {
-                        raw_input.push_str(&text);
+                        raw_input.push_str(text);
 
                         let text = match mode {
                             InputMode::Kana => to_fullwidth(text, false),
@@ -318,7 +318,7 @@ impl TextServiceFactory {
 
                         self.set_text(&text, &sub_text)?;
                         ipc_service.set_candidates(candidates.texts.clone());
-                        ipc_service.set_selection(selection_index as i32);
+                        ipc_service.set_selection(selection_index);
                     }
                     ClientAction::RemoveText => {
                         candidates = ipc_service.remove_text()?;
@@ -336,7 +336,7 @@ impl TextServiceFactory {
 
                         self.set_text(&text, &sub_text)?;
                         ipc_service.set_candidates(candidates.texts.clone());
-                        ipc_service.set_selection(selection_index as i32);
+                        ipc_service.set_selection(selection_index);
                     }
                     ClientAction::MoveCursor(_offset) => {
                         // TODO: I'll use azookey-kkc's composingText
@@ -372,8 +372,8 @@ impl TextServiceFactory {
                         let candidates = {
                             let text_service = self.borrow()?;
                             let composition = text_service.borrow_composition()?.clone();
-                            let candidates = composition.candidates.clone();
-                            candidates
+
+                            composition.candidates.clone()
                         };
 
                         let texts = candidates.texts.clone();
@@ -387,7 +387,7 @@ impl TextServiceFactory {
                         }
                         .clamp(0, max(0, texts.len() as i32 - 1));
 
-                        ipc_service.set_selection(selection_index as i32);
+                        ipc_service.set_selection(selection_index);
                         let (text, sub_text, count) = candidates.entry(selection_index as usize);
                         let hiragana = candidates.hiragana.clone();
                         corresponding_count = count;
@@ -400,13 +400,13 @@ impl TextServiceFactory {
                     }
                     ClientAction::ShrinkText(text) => {
                         // shrink text
-                        raw_input.push_str(&text);
+                        raw_input.push_str(text);
                         raw_input = raw_input
                             .chars()
                             .skip(corresponding_count as usize)
                             .collect();
 
-                        ipc_service.shrink_text(corresponding_count.clone())?;
+                        ipc_service.shrink_text(corresponding_count)?;
                         let text = match mode {
                             InputMode::Kana => to_fullwidth(text, false),
                             InputMode::Latin => text.to_string(),
@@ -424,7 +424,7 @@ impl TextServiceFactory {
                         raw_hiragana = hiragana.clone();
 
                         ipc_service.set_candidates(candidates.texts.clone());
-                        ipc_service.set_selection(selection_index as i32);
+                        ipc_service.set_selection(selection_index);
                         self.update_pos()?;
 
                         transition = CompositionState::Composing;

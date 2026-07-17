@@ -74,7 +74,7 @@ pub extern "system" fn DllMain(
 
         check_err!(result, true, false)
     } else {
-        return true;
+        true
     }
 }
 

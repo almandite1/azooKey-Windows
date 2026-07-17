@@ -422,10 +422,10 @@ mod tests {
     fn second_mutex_holder_detects_the_first() {
         // a test-only name so a real running launcher can't interfere
         let name = w!("Local\\AzookeyLauncherSingletonTest");
-        assert_eq!(another_instance_running(name).unwrap(), false);
+        assert!(!another_instance_running(name).unwrap());
         // the first handle is still open in this process, so a second
         // acquisition sees ERROR_ALREADY_EXISTS — same as a second process
-        assert_eq!(another_instance_running(name).unwrap(), true);
+        assert!(another_instance_running(name).unwrap());
     }
 
     #[test]

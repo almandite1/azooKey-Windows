@@ -1,4 +1,7 @@
 // modifying from https://github.com/thoren-d/tracing-chrome
+// vendored third-party code: exempt from this crate's lint policy
+// (unwrap_used/expect_used are restriction lints, not covered by clippy::all)
+#![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, dead_code)]
 
 use serde::Serialize;
 use tracing::field::Visit;

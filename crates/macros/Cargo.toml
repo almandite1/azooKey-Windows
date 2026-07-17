@@ -6,6 +6,11 @@ edition = "2021"
 [lib]
 proc-macro = true
 
+# the MSVC linker always reports creating the .lib/.exp for a proc-macro
+# dylib on stdout; that message is noise, not a problem
+[lints.rust]
+linker_messages = "allow"
+
 [dependencies]
 syn = "2.0"
 quote = "1.0"

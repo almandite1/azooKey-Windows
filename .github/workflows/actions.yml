@@ -17,35 +17,40 @@ jobs:
     - name: Cache Rust
       uses: Swatinem/rust-cache@v2
 
+    # 6.3.3 matches the locally verified toolchain (devenv.bat); newer SDKs
+    # no longer need the ucrt.modulemap patch the 6.0.2 setup fetched from a
+    # personal gist
     - name: Install Swift
       uses: compnerd/gha-setup-swift@main
       with:
-        branch: swift-6.0.2-release
-        tag: 6.0.2-RELEASE
+        branch: swift-6.3.3-release
+        tag: 6.3.3-RELEASE
 
-    - name: Fix swift sdk
-      shell: pwsh
-      run: |
-        $SwiftPath = "$env:APPDATA\..\Local\Programs\Swift\Platforms\6.0.2\Windows.platform\Developer\SDKs\Windows.sdk\usr"
-        $modulemapUrl = "https://gist.githubusercontent.com/fkunn1326/ef8be2217082302b291f2b8d4178194a/raw/c424968c250afcd5afa1131aea1329dc0744a7f9/ucrt.modulemap"
-        $destination = "$SwiftPath\share\ucrt.modulemap"
-        Invoke-WebRequest -Uri $modulemapUrl -OutFile $destination
-    
     - name: Install Protoc
       uses: arduino/setup-protoc@v3
+
+    - name: Install x86 Rust target
+      run: rustup target add i686-pc-windows-msvc
 
     - name: Install cargo-make
       run: cargo install --force cargo-make
 
     - name: Download prebuilt llama
       run: |
-        function Download-Extract {
+        # every downloaded artifact is pinned by SHA256: a moved release tag
+        # or tampered file fails the build instead of shipping silently
+        function Download-Verify-Extract {
           param (
             [string]$url,
-            [string]$destFolder
+            [string]$destFolder,
+            [string]$sha256
           )
           $tempZip = Join-Path $env:TEMP "llama_temp.zip"
           Invoke-WebRequest -Uri $url -OutFile $tempZip
+          $actual = (Get-FileHash $tempZip -Algorithm SHA256).Hash
+          if ($actual -ne $sha256) {
+            throw "checksum mismatch for ${url}: expected $sha256, got $actual"
+          }
           New-Item -Path $destFolder -ItemType Directory -Force
           Expand-Archive -Path $tempZip -DestinationPath $destFolder -Force
           Remove-Item $tempZip
@@ -57,10 +62,10 @@ jobs:
         $llamaVulkanDir = "llama_vulkan"
         New-Item -Path $llamaCpuDir, $llamaCudaDir, $llamaVulkanDir -ItemType Directory -Force
 
-        # Download and extract files
-        Download-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip" -destFolder $llamaCpuDir
-        Download-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-cuda-cu12.4-x64.zip" -destFolder $llamaCudaDir
-        Download-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-vulkan-x64.zip" -destFolder $llamaVulkanDir
+        # Download, verify, and extract files
+        Download-Verify-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip" -destFolder $llamaCpuDir -sha256 "AF34E4DFC7154DF650ED705421F26B3A56C685F2E35ABFDD6DF0CC0CB5C4B259"
+        Download-Verify-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-cuda-cu12.4-x64.zip" -destFolder $llamaCudaDir -sha256 "5307B89AAE1F076E031D6AAB95E63DF5CB96B8D3B1FA7828F412E283A0663019"
+        Download-Verify-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-vulkan-x64.zip" -destFolder $llamaVulkanDir -sha256 "ED1B7E6AA70CDB2A93EAAAD8586539DCE83F4FA8A44F4DDEE5A1AB09FFB1189B"
 
         # Copy llama.lib to server-swift
         Copy-Item "$llamaCpuDir\llama.lib" -Destination "server-swift\" -Force
@@ -69,6 +74,11 @@ jobs:
         $zenzUrl = "https://huggingface.co/Miwa-Keita/zenz-v3-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf"
         $zenzDest = "zenz.gguf"
         Invoke-WebRequest -Uri $zenzUrl -OutFile $zenzDest
+        $zenzActual = (Get-FileHash $zenzDest -Algorithm SHA256).Hash
+        $zenzExpected = "501F605D088F5B988791A00AE19ED46985ED7C48144F364B2F3F1F951C9B2083"
+        if ($zenzActual -ne $zenzExpected) {
+          throw "checksum mismatch for ${zenzUrl}: expected $zenzExpected, got $zenzActual"
+        }
 
     - name: Install node dependencies
       run: |
@@ -83,6 +93,9 @@ jobs:
     # excluded by default
     - name: Test
       run: cargo test --workspace --release
+
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets --release -- -D warnings
 
     - name: Upload Setup Artifact
       uses: actions/upload-artifact@v4

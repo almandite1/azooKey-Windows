@@ -105,7 +105,9 @@ impl DllModule {
         self.ref_count.fetch_sub(1, Ordering::SeqCst)
     }
 
+    // referenced by the (currently disabled) DllCanUnloadNow logic
+    #[allow(dead_code)]
     pub fn can_unload(&self) -> bool {
-        self.ref_count.load(Ordering::SeqCst) <= 0
+        self.ref_count.load(Ordering::SeqCst) == 0
     }
 }

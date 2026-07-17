@@ -7,6 +7,13 @@ resolver = "2"
 [lib]
 crate-type = ["cdylib"]
 
+# a panic unwinding out of a COM callback aborts the HOST application, so
+# unwrap/expect are banned in this crate (catch_unwind in macros::anyhow is
+# the last line of defense, not a license to panic)
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
 [dependencies]
 anyhow = "1.0"
 log = "0.4"

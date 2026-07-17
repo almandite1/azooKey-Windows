@@ -315,8 +315,7 @@ impl AzookeyService for MyAzookeyService {
         let context = request.into_inner().context;
         let trimmed_context = context
             .split('\r')
-            .filter(|s| !s.is_empty())
-            .last()
+            .rfind(|s| !s.is_empty())
             .unwrap_or_default();
 
         let context = to_cstring(trimmed_context);
@@ -347,7 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("executable path has no parent directory")?;
     initialize(&parent_dir.to_string_lossy());
 
-    let service = MyAzookeyService::default();
+    let service = MyAzookeyService;
 
     // standard gRPC health service, polled by the launcher's watchdog.
     // Because this runtime is single-threaded, ANY hang inside a Swift FFI
