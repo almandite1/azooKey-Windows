@@ -22,7 +22,15 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={userappdata}\{#MyAppName}
+; Machine-wide install: this is an admin install (PrivilegesRequired=admin)
+; that registers the IME machine-wide (HKCR/TSF, HKLM WER). {userappdata}
+; would resolve to the ELEVATING admin's roaming profile — often a different
+; account than the logged-in user — so the registered DLL paths could point
+; into the wrong profile and other users would never find the files.
+; {autopf} = Program Files (64-bit here), readable by every user. Mutable
+; runtime data (settings.json, logs, dumps) lives in each user's
+; %APPDATA%/%LOCALAPPDATA% via the app itself, not here.
+DefaultDirName={autopf}\{#MyAppName}
 ; "ArchitecturesAllowed=x64compatible" specifies that Setup cannot run
 ; on anything but x64 and Windows 11 on Arm.
 ArchitecturesAllowed=x64compatible
@@ -74,8 +82,14 @@ Filename: "icacls"; \
   Description: "Grant Permission"; \
   Flags: runhidden postinstall runascurrentuser
 
+[UninstallDelete]
+; launch.vbs is created at post-install by [Code], so Setup does not track
+; it; delete it explicitly, otherwise it keeps {app} from being removed
+Type: files; Name: "{app}\launch.vbs"
+
 [UninstallRun]
 Filename: "schtasks"; \
+  RunOnceId: "DelAzookeyStartupTask"; \
   Parameters: "/Delete /TN ""Azookey Startup"" /F"; \
   Flags: runhidden runascurrentuser
 
