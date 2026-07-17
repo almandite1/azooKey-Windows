@@ -156,7 +156,10 @@ begin
   VbsFile := ExpandConstant('{app}\launch.vbs');
   VbsContent :=
     'Set objShell = CreateObject("WScript.Shell")' + #13#10 +
-    'objShell.Run "' + ExpandConstant('{app}\launcher.exe') + '", 0, False' + #13#10;
+    // the path must be quoted inside the VBScript string (doubled quotes):
+    // {app} contains a space, and an unquoted Run argument lets a planted
+    // C:\Program.exe start instead — elevated, via the scheduled task
+    'objShell.Run """' + ExpandConstant('{app}\launcher.exe') + '""", 0, False' + #13#10;
 
   if SaveStringToFile(VbsFile, VbsContent, False) then
   begin

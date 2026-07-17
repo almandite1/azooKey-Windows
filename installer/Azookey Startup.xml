@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-16"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Date>2025-03-28T20:02:06</Date>
@@ -12,7 +12,11 @@
   </Triggers>
   <Principals>
     <Principal id="Author">
-      <GroupId>S-1-5-32-544</GroupId>
+      <!-- Users, not Administrators: the install is machine-wide, so the
+           logon trigger must fire for every user. HighestAvailable still
+           elevates members of Administrators (UIAccess needs it) and is a
+           no-op for standard users. -->
+      <GroupId>S-1-5-32-545</GroupId>
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
   </Principals>
@@ -39,8 +43,10 @@
   </Settings>
   <Actions Context="Author">
     <Exec>
+      <!-- quoted: the path contains a space (Program Files) and wscript
+           does no prefix guessing -->
       <Command>wscript.exe</Command>
-      <Arguments>PATH_TO_VBS</Arguments>
+      <Arguments>"PATH_TO_VBS"</Arguments>
     </Exec>
   </Actions>
 </Task>
