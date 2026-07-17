@@ -5,6 +5,15 @@
 
 #endif /* ffi_h */
 
+/*
+ * FFI contract (see azookey_server.swift and crates/server/src/main.rs):
+ * - all exported engine functions must be called from a single thread,
+ *   serially; the Swift side keeps unsynchronized global state
+ * - all out-parameters (cursor, length) are 32-bit ints
+ * - the char* members below and every returned string/list are owned by
+ *   the Swift side; the caller copies them and hands them back to
+ *   FreeString / FreeComposedText
+ */
 struct FFICandidate {
     char *text;
     char *subtext;

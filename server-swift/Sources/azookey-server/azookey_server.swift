@@ -2,6 +2,11 @@ import KanaKanjiConverterModule
 import Foundation
 import ffi
 
+// FFI THREADING CONTRACT:
+// All exported functions below mutate this @MainActor global state, but the
+// annotation is NOT enforced across the C boundary. The Rust server MUST
+// call every exported function from a single thread, serially (it runs a
+// current_thread tokio runtime on the process main thread).
 @MainActor let converter = KanaKanjiConverter()
 @MainActor var composingText = ComposingText()
 
@@ -12,6 +17,8 @@ import ffi
 ]
 
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
+    let zenzaiEnabled = (config["enable"] as? Bool) ?? false
+    let zenzaiProfile = (config["profile"] as? String) ?? ""
     return ConvertRequestOptions(
         requireJapanesePrediction: true,
         requireEnglishPrediction: false,
@@ -24,14 +31,14 @@ import ffi
             return execURL.appendingPathComponent("EmojiDictionary").appendingPathComponent("emoji_all_E15.1.txt")
         },
         // zenzai
-        zenzaiMode: config["enable"] as! Bool ? .on(
+        zenzaiMode: zenzaiEnabled ? .on(
             weight: execURL.appendingPathComponent("zenz.gguf"),
             inferenceLimit: 1,
             requestRichCandidates: true,
             personalizationMode: nil,
             versionDependentMode: .v3(
                 .init(
-                    profile: config["profile"] as! String,
+                    profile: zenzaiProfile,
                     leftSideContext: context
                 )
             )
@@ -41,25 +48,10 @@ import ffi
     )
 }
 
-class SimpleComposingText {
-    init(text: String, cursor: Int) {
-        self.text = UnsafeMutablePointer<CChar>(mutating: text.utf8String)!
-        self.cursor = cursor
-    }
-
-    var text: UnsafeMutablePointer<CChar>
-    var cursor: Int
-}
-
-struct SComposingText {
-    var text: UnsafeMutablePointer<CChar>
-    var cursor: Int
-}
-
 func constructCandidateString(candidate: Candidate, hiragana: String) -> String {
     var remainingHiragana = hiragana
     var result = ""
-    
+
     for data in candidate.data {
         if remainingHiragana.count < data.ruby.count {
             result += remainingHiragana
@@ -68,24 +60,24 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         remainingHiragana.removeFirst(data.ruby.count)
         result += data.word
     }
-    
+
     return result
 }
 
-@_silgen_name("LoadConfig")
+@_cdecl("LoadConfig")
 @MainActor public func load_config() {
     if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
         let settingsPath = URL(filePath: appDataPath).appendingPathComponent("Azookey/settings.json")
-        
+
         do {
             let data = try Data(contentsOf: settingsPath)
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let zenzaiDict = json["zenzai"] as? [String: Any] {
-                
+
                 if let enableValue = zenzaiDict["enable"] as? Bool {
                     config["enable"] = enableValue
                 }
-                
+
                 if let profileValue = zenzaiDict["profile"] as? String {
                     config["profile"] = profileValue
                 }
@@ -96,63 +88,67 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     }
 }
 
-@_silgen_name("Initialize")
+@_cdecl("Initialize")
 @MainActor public func initialize(
-    path: UnsafePointer<CChar>,
-    use_zenzai: Bool
+    path: UnsafePointer<CChar>
 ) {
     let path = String(cString: path)
     execURL = URL(filePath: path)
 
     load_config()
 
+    // warm up the converter (and the zenzai model when enabled)
     composingText.insertAtCursorPosition("a", inputStyle: .roman2kana)
     converter.requestCandidates(composingText, options: getOptions())
     composingText = ComposingText()
+
+    // a missing/corrupt zenz.gguf degrades silently to non-neural
+    // conversion inside the converter; surface its status in the log
+    if !converter.zenzStatus.isEmpty {
+        print("zenzai status: \(converter.zenzStatus)")
+    }
 }
 
-@_silgen_name("AppendText")
+@_cdecl("AppendText")
 @MainActor public func append_text(
     input: UnsafePointer<CChar>,
-    cursorPtr: UnsafeMutablePointer<Int>
-) -> UnsafeMutablePointer<CChar> {
+    cursorPtr: UnsafeMutablePointer<Int32>
+) -> UnsafeMutablePointer<CChar>? {
     let inputString = String(cString: input)
     composingText.insertAtCursorPosition(inputString, inputStyle: .roman2kana)
 
-    cursorPtr.pointee = composingText.convertTargetCursorPosition    
-    return _strdup(composingText.convertTarget)!
+    cursorPtr.pointee = Int32(composingText.convertTargetCursorPosition)
+    return _strdup(composingText.convertTarget)
 }
 
-@_silgen_name("RemoveText")
+@_cdecl("RemoveText")
 @MainActor public func remove_text(
-    cursorPtr: UnsafeMutablePointer<Int>
-) -> UnsafeMutablePointer<CChar> {
+    cursorPtr: UnsafeMutablePointer<Int32>
+) -> UnsafeMutablePointer<CChar>? {
     composingText.deleteBackwardFromCursorPosition(count: 1)
 
-    cursorPtr.pointee = composingText.convertTargetCursorPosition
-    return _strdup(composingText.convertTarget)!
+    cursorPtr.pointee = Int32(composingText.convertTargetCursorPosition)
+    return _strdup(composingText.convertTarget)
 }
 
-@_silgen_name("MoveCursor")
+@_cdecl("MoveCursor")
 @MainActor public func move_cursor(
     offset: Int32,
-    cursorPtr: UnsafeMutablePointer<Int>
-) -> UnsafeMutablePointer<CChar> {
-    let previousCursor = composingText.convertTargetCursorPosition
+    cursorPtr: UnsafeMutablePointer<Int32>
+) -> UnsafeMutablePointer<CChar>? {
     let cursor = composingText.moveCursorFromCursorPosition(count: Int(offset))
-    print("offset: \(offset), cursor: \(cursor)")
 
-    cursorPtr.pointee = cursor
-    return _strdup(composingText.convertTarget)!
+    cursorPtr.pointee = Int32(cursor)
+    return _strdup(composingText.convertTarget)
 }
 
-@_silgen_name("ClearText")
+@_cdecl("ClearText")
 @MainActor public func clear_text() {
     composingText = ComposingText()
 }
 
 func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
-    let pointer = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>.allocate(capacity: list.count)
+    let pointer = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>.allocate(capacity: max(list.count, 1))
     for (i, item) in list.enumerated() {
         pointer[i] = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
         pointer[i]?.pointee = item
@@ -160,8 +156,8 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     return pointer
 }
 
-@_silgen_name("GetComposedText")
-@MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+@_cdecl("GetComposedText")
+@MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<Int32>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let hiragana = composingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
     let options = getOptions(context: contextString)
@@ -171,37 +167,65 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     for i in 0..<converted.mainResults.count {
         let candidate = converted.mainResults[i]
 
-        let text = strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
-        let hiragana = strdup(hiragana)
+        let text = _strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
+        let hiragana = _strdup(hiragana)
         let correspondingCount = candidate.correspondingCount
 
         var afterComposingText = composingText
         afterComposingText.prefixComplete(correspondingCount: correspondingCount)
-        let subtext = strdup(afterComposingText.convertTarget)
+        let subtext = _strdup(afterComposingText.convertTarget)
 
-        result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))        
+        result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
     }
 
-    lengthPtr.pointee = result.count
+    lengthPtr.pointee = Int32(result.count)
 
     return to_list_pointer(result)
 }
 
-@_silgen_name("ShrinkText")
+@_cdecl("ShrinkText")
 @MainActor public func shrink_text(
     offset: Int32
-) -> UnsafeMutablePointer<CChar>  {
+) -> UnsafeMutablePointer<CChar>? {
     var afterComposingText = composingText
     afterComposingText.prefixComplete(correspondingCount: Int(offset))
     composingText = afterComposingText
 
-    return _strdup(composingText.convertTarget)!
+    return _strdup(composingText.convertTarget)
 }
 
-@_silgen_name("SetContext")
+@_cdecl("SetContext")
 @MainActor public func set_context(
     context: UnsafePointer<CChar>
 ) {
     let contextString = String(cString: context)
     config["context"] = contextString
+}
+
+// MEMORY OWNERSHIP CONTRACT:
+// Every string returned by the functions above is allocated with
+// strdup/_strdup and every candidate list with allocate(); the caller must
+// return them to FreeString / FreeComposedText after copying. Freeing on
+// the Swift side keeps allocation and deallocation in the same CRT.
+
+@_cdecl("FreeString")
+public func free_string(ptr: UnsafeMutablePointer<CChar>?) {
+    free(ptr)
+}
+
+@_cdecl("FreeComposedText")
+public func free_composed_text(
+    listPtr: UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>?,
+    length: Int32
+) {
+    guard let listPtr else { return }
+    for i in 0..<Int(length) {
+        if let item = listPtr[i] {
+            free(item.pointee.text)
+            free(item.pointee.subtext)
+            free(item.pointee.hiragana)
+            item.deallocate()
+        }
+    }
+    listPtr.deallocate()
 }
