@@ -95,35 +95,82 @@ pub fn duplicate_winlogon_token(
             ..Default::default()
         };
 
-        Process32First(snapshot, &mut process_entry)?;
-        while let Ok(()) = Process32Next(snapshot, &mut process_entry) {
-            // check if the process is winlogon
-            let exe_string = process_entry
-                .szExeFile
-                .iter()
-                .map(|&c| c as u8)
-                .collect::<Vec<_>>();
-            let exe_string = String::from_utf8(exe_string)?;
+        // walk starting from the FIRST entry (the previous loop called
+        // Process32First then immediately Process32Next, skipping it), close
+        // the snapshot on the way out, and try_token failures per-process
+        // don't abort the whole scan
+        let mut result = Err(anyhow::anyhow!("no matching winlogon token found"));
+        if Process32First(snapshot, &mut process_entry).is_ok() {
+            loop {
+                if is_winlogon(&process_entry) {
+                    match try_duplicate_token(
+                        &process_entry,
+                        &mut privilege_set,
+                        session_id,
+                        desired_access,
+                    ) {
+                        Ok(token) => {
+                            *h_token = token;
+                            result = Ok(());
+                            // stop at the first winlogon whose session
+                            // matches, instead of overwriting with the last
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("winlogon token candidate rejected: {e:?}");
+                        }
+                    }
+                }
 
-            if !exe_string.to_lowercase().contains("winlogon") {
-                continue;
+                if Process32Next(snapshot, &mut process_entry).is_err() {
+                    break;
+                }
             }
+        }
 
-            let process = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION,
-                false,
-                process_entry.th32ProcessID,
-            )?;
+        let _ = CloseHandle(snapshot);
+        result
+    }
+}
 
-            let mut token = HANDLE::default();
+fn is_winlogon(entry: &PROCESSENTRY32) -> bool {
+    let exe = entry
+        .szExeFile
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect::<Vec<_>>();
+    String::from_utf8_lossy(&exe)
+        .to_lowercase()
+        .contains("winlogon")
+}
+
+/// Opens winlogon's token, verifies it has the TCB privilege and matches the
+/// target session, and duplicates it. Owns and closes the intermediate
+/// process/token handles; only the duplicated token escapes.
+unsafe fn try_duplicate_token(
+    entry: &PROCESSENTRY32,
+    privilege_set: &mut PRIVILEGE_SET,
+    session_id: u32,
+    desired_access: TOKEN_ACCESS_MASK,
+) -> Result<HANDLE> {
+    unsafe {
+        let process = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            entry.th32ProcessID,
+        )?;
+
+        let mut token = HANDLE::default();
+        // helper so every early return still closes the handles above
+        let inner = (|| {
             OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut token)?;
 
             let mut privilege_result = false.into();
-            PrivilegeCheck(token, &mut privilege_set as *mut _, &mut privilege_result)?;
+            PrivilegeCheck(token, privilege_set as *mut _, &mut privilege_result)?;
 
             let mut token_session_id: u32 = 0;
             let mut token_info_length: u32 = 0;
-
             GetTokenInformation(
                 token,
                 TokenSessionId,
@@ -131,24 +178,29 @@ pub fn duplicate_winlogon_token(
                 std::mem::size_of::<u32>() as u32,
                 &mut token_info_length,
             )?;
-
             anyhow::ensure!(
                 token_session_id == session_id,
                 "TokenSessionId does not match the session_id"
             );
 
+            let mut duplicated = HANDLE::default();
             DuplicateTokenEx(
                 token,
                 desired_access,
                 None,
                 SecurityImpersonation,
                 TokenImpersonation,
-                h_token,
+                &mut duplicated,
             )?;
-        }
-    }
+            Ok(duplicated)
+        })();
 
-    Ok(())
+        if !token.is_invalid() {
+            let _ = CloseHandle(token);
+        }
+        let _ = CloseHandle(process);
+        inner
+    }
 }
 
 pub fn create_uiaccess_token(token_handle: &mut HANDLE) -> Result<()> {
