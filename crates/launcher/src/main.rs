@@ -1,8 +1,10 @@
 use shared::AppConfig;
 use std::env;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -31,20 +33,98 @@ const STARTUP_GRACE: Duration = Duration::from_secs(120);
 /// without the child ever becoming healthy in between
 const MAX_CONSECUTIVE_WATCHDOG_KILLS: u32 = 5;
 
+/// keep at most this many launcher session logs
+const MAX_LOG_FILES: usize = 10;
+
+// The launcher normally runs headless from the logon scheduled task, so
+// console output is lost — everything is also teed into
+// %LOCALAPPDATA%\Azookey\logs\launcher-<timestamp>-<pid>.log. This is the
+// only record of server crashes, watchdog kills, and restarts in the field.
+static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+
+fn init_log_file() {
+    let Some(base) = env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+    let dir = Path::new(&base).join("Azookey").join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+
+    prune_old_logs(&dir);
+
+    let name = format!(
+        "launcher-{}-{}.log",
+        chrono::Local::now().format("%Y%m%d-%H%M%S"),
+        std::process::id()
+    );
+    if let Ok(file) = std::fs::File::create(dir.join(name)) {
+        let _ = LOG_FILE.set(Mutex::new(file));
+    }
+}
+
+fn prune_old_logs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut logs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("launcher-") && n.ends_with(".log"))
+        })
+        .collect();
+    // timestamped names sort chronologically
+    logs.sort();
+    if logs.len() >= MAX_LOG_FILES {
+        for old in &logs[..logs.len() + 1 - MAX_LOG_FILES] {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+}
+
+fn log_to_file(line: &str) {
+    if let Some(file) = LOG_FILE.get() {
+        let mut file = file.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = writeln!(
+            file,
+            "[{}] {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            line
+        );
+    }
+}
+
+fn log_info(line: &str) {
+    println!("{line}");
+    log_to_file(line);
+}
+
+fn log_err(line: &str) {
+    eprintln!("{line}");
+    log_to_file(line);
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_log_file();
+
     // single-instance guard: the scheduled task and a manual start can race,
     // and two launchers would fight over the (machine-global) pipe names —
     // the loser's server dies on first_pipe_instance and burns through its
     // restart budget. Global\ namespace matches the pipes' global scope.
     match another_instance_running(w!("Global\\AzookeyLauncherSingleton")) {
         Ok(true) => {
-            eprintln!("another azooKey launcher is already running; exiting");
+            log_err("another azooKey launcher is already running; exiting");
             return Ok(());
         }
         Ok(false) => {}
         // an unlikely mutex failure must not keep the IME from starting
-        Err(e) => eprintln!("single-instance check failed ({e}); continuing anyway"),
+        Err(e) => log_err(&format!(
+            "single-instance check failed ({e}); continuing anyway"
+        )),
     }
 
     let config = AppConfig::new();
@@ -95,7 +175,7 @@ async fn supervise(exe: &'static str, prefix: &'static str, pipe_name: &'static 
     loop {
         let Some(mut child) = start_process(exe, prefix) else {
             // spawn failure (e.g. missing binary) won't fix itself
-            eprintln!("{prefix} could not be started; giving up");
+            log_err(&format!("{prefix} could not be started; giving up"));
             return;
         };
 
@@ -106,24 +186,24 @@ async fn supervise(exe: &'static str, prefix: &'static str, pipe_name: &'static 
             status = child.wait() => {
                 match status {
                     Ok(s) if s.success() => {
-                        println!("{prefix} exited normally");
+                        log_info(&format!("{prefix} exited normally"));
                         return;
                     }
                     Ok(s) => {
-                        eprintln!("{prefix} exited abnormally: {s}");
+                        log_err(&format!("{prefix} exited abnormally: {s}"));
                         false
                     }
                     Err(e) => {
-                        eprintln!("{prefix} wait failed: {e}");
+                        log_err(&format!("{prefix} wait failed: {e}"));
                         return;
                     }
                 }
             }
             _ = watchdog(pipe_name, prefix, saw_healthy.clone()) => {
-                eprintln!("{prefix} stopped answering health checks; killing it");
+                log_err(&format!("{prefix} stopped answering health checks; killing it"));
                 // tokio's kill() forces termination and reaps the child
                 if let Err(e) = child.kill().await {
-                    eprintln!("{prefix} kill failed: {e}");
+                    log_err(&format!("{prefix} kill failed: {e}"));
                 }
                 true
             }
@@ -135,9 +215,9 @@ async fn supervise(exe: &'static str, prefix: &'static str, pipe_name: &'static 
         if hung && !saw_healthy.load(Ordering::SeqCst) {
             consecutive_watchdog_kills += 1;
             if consecutive_watchdog_kills >= MAX_CONSECUTIVE_WATCHDOG_KILLS {
-                eprintln!(
+                log_err(&format!(
                     "{prefix} was killed by the watchdog {MAX_CONSECUTIVE_WATCHDOG_KILLS} times without ever becoming healthy; giving up"
-                );
+                ));
                 return;
             }
         } else if saw_healthy.load(Ordering::SeqCst) {
@@ -154,14 +234,14 @@ async fn supervise(exe: &'static str, prefix: &'static str, pipe_name: &'static 
         let now = Instant::now();
         recent_restarts.retain(|t| now.duration_since(*t) < RESTART_WINDOW);
         if recent_restarts.len() >= MAX_RESTARTS_IN_WINDOW {
-            eprintln!(
+            log_err(&format!(
                 "{prefix} crashed {MAX_RESTARTS_IN_WINDOW} times within {RESTART_WINDOW:?}; giving up"
-            );
+            ));
             return;
         }
         recent_restarts.push(now);
 
-        eprintln!("{prefix} restarting in {backoff:?}");
+        log_err(&format!("{prefix} restarting in {backoff:?}"));
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
@@ -173,7 +253,9 @@ async fn watchdog(pipe_name: &'static str, prefix: &'static str, saw_healthy: Ar
     let Ok(channel) = shared::pipe::lazy_pipe_channel(pipe_name) else {
         // cannot even build a channel: run without hang detection rather
         // than killing a possibly-fine child
-        eprintln!("watchdog for {pipe_name} disabled: failed to build channel");
+        log_err(&format!(
+            "watchdog for {pipe_name} disabled: failed to build channel"
+        ));
         std::future::pending::<()>().await;
         unreachable!();
     };
@@ -195,7 +277,7 @@ async fn watchdog(pipe_name: &'static str, prefix: &'static str, saw_healthy: Ar
         );
 
         if ok && !saw_healthy.swap(true, Ordering::SeqCst) {
-            println!("{prefix} health check ok");
+            log_info(&format!("{prefix} health check ok"));
         }
 
         if policy.on_ping_result(ok, Instant::now()) == Verdict::Hung {
@@ -270,7 +352,7 @@ fn start_process(exe: &str, prefix: &str) -> Option<Child> {
     {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("Failed to start {}: {}", exe, e);
+            log_err(&format!("Failed to start {}: {}", exe, e));
             return None;
         }
     };
@@ -280,7 +362,7 @@ fn start_process(exe: &str, prefix: &str) -> Option<Child> {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                println!("{}: {}", prefix, line);
+                log_info(&format!("{}: {}", prefix, line));
             }
         });
     }
@@ -290,7 +372,7 @@ fn start_process(exe: &str, prefix: &str) -> Option<Child> {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("{}: {}", prefix, line);
+                log_err(&format!("{}: {}", prefix, line));
             }
         });
     }
@@ -304,6 +386,36 @@ mod tests {
 
     fn at(base: Instant, secs: u64) -> Instant {
         base + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn prune_keeps_only_the_newest_logs() {
+        let dir = std::env::temp_dir().join(format!("azk-prune-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for day in 1..=12 {
+            let name = format!("launcher-202601{day:02}-000000-1.log");
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        std::fs::write(dir.join("unrelated.txt"), "x").unwrap();
+
+        prune_old_logs(&dir);
+
+        let mut remaining: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("launcher-"))
+            .collect();
+        remaining.sort();
+
+        // room is left for the new session's file: 12 -> MAX_LOG_FILES - 1
+        assert_eq!(remaining.len(), MAX_LOG_FILES - 1);
+        // the oldest files are the ones deleted
+        assert!(remaining[0].contains("20260104"));
+        // non-log files are untouched
+        assert!(dir.join("unrelated.txt").exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

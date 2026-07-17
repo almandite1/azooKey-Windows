@@ -53,6 +53,17 @@ Source: "../target/release/bundle/nsis/{#TauriSetupExe}"; Flags: dontcopy noencr
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
+[Registry]
+; Windows Error Reporting LocalDumps: capture minidumps of native crashes
+; (e.g. inside the Swift runtime or llama.cpp) for field diagnosis.
+; DumpFolder is REG_EXPAND_SZ, so each user's dumps land in their own
+; %LOCALAPPDATA%\Azookey\dumps. DumpType=1 = minidump, capped at 5 files.
+; Only azookey-server.exe: LocalDumps keys match by exe NAME alone, so a
+; generic name like ui.exe would also capture unrelated applications.
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\azookey-server.exe"; ValueType: expandsz; ValueName: "DumpFolder"; ValueData: "%LOCALAPPDATA%\Azookey\dumps"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\azookey-server.exe"; ValueType: dword; ValueName: "DumpType"; ValueData: "1"
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\azookey-server.exe"; ValueType: dword; ValueName: "DumpCount"; ValueData: "5"
+
 [Run]
 Filename: "icacls"; \
   Parameters: "{app}\azookey.dll /grant ""*S-1-15-2-1:(RX)"""; \

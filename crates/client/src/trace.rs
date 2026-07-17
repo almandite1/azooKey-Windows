@@ -28,9 +28,42 @@ impl<'a> Visit for StringVisitor<'a> {
     }
 }
 
+/// Forwards formatted tracing output to OutputDebugStringW. Used in release
+/// builds: the DLL runs inside every application, so writing log FILES from
+/// here would contend across processes — debugger output is side-effect-free
+/// and can be captured in the field with DebugView when diagnosing.
+#[cfg(not(debug_assertions))]
+struct DebugOutputWriter;
+
+#[cfg(not(debug_assertions))]
+impl std::io::Write for DebugOutputWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        let wide: Vec<u16> = format!("azookey: {}", text).as_str().to_wide_16();
+        unsafe { OutputDebugStringW(PCWSTR(wide.as_ptr())) };
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub fn setup_logger() -> anyhow::Result<()> {
     #[cfg(not(debug_assertions))]
     {
+        // release: warnings and errors only, no file I/O
+        let filter = Targets::new()
+            .with_target("azookey_windows", LevelFilter::WARN)
+            .with_default(LevelFilter::OFF);
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(|| DebugOutputWriter);
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .try_init();
         return Ok(());
     }
     let Some(folder) = log_folder() else {

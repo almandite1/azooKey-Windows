@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+chrono = "0.4.39"
 shared = { path = "../shared" }
 tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
 tonic = "0.12.3"
