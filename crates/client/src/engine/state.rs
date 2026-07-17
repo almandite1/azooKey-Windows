@@ -29,9 +29,17 @@ unsafe impl Send for IMEState {}
 
 impl IMEState {
     pub fn get() -> anyhow::Result<MutexGuard<'static, IMEState>> {
+        // TSF runs in a single-threaded apartment, so contention here means
+        // re-entrancy (a TSF callback fired while another borrow was alive);
+        // failing the call is safer than deadlocking. A poisoned lock (a
+        // panic while held) is recovered instead of permanently disabling
+        // the IME.
         match IME_STATE.try_lock() {
             Ok(guard) => Ok(guard),
-            Err(e) => anyhow::bail!("Failed to lock state: {:?}", e),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                anyhow::bail!("IMEState is already borrowed (re-entrant TSF callback)")
+            }
         }
     }
 }

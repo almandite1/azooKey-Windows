@@ -9,7 +9,11 @@ use crate::extension::StringExt as _;
 use crate::globals::DllModule;
 use crate::tracing_chrome::{ChromeLayerBuilder, EventOrSpan};
 
-const LOG_FOLDER: &str = "D:/azookey-windows/logs";
+fn log_folder() -> Option<std::path::PathBuf> {
+    // %LOCALAPPDATA%\Azookey\logs — never a hardcoded dev-machine path
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    Some(std::path::Path::new(&base).join("Azookey").join("logs"))
+}
 
 pub struct StringVisitor<'a> {
     string: &'a mut String,
@@ -29,8 +33,14 @@ pub fn setup_logger() -> anyhow::Result<()> {
     {
         return Ok(());
     }
+    let Some(folder) = log_folder() else {
+        return Ok(());
+    };
+    if std::fs::create_dir_all(&folder).is_err() {
+        return Ok(());
+    }
     let timestamp = chrono::Local::now().format("%Y-%m-%d-%H.%M.%S");
-    let path = format!("{}/{}.json", LOG_FOLDER, timestamp);
+    let path = folder.join(format!("{}.json", timestamp));
 
     let writer = {
         if let Ok(file) = std::fs::File::create(&path) {

@@ -11,7 +11,7 @@ pub fn get_theme() -> Result<bool> {
     let mut data = [0u8; 4];
     let mut data_size = data.len() as u32;
 
-    let _ = unsafe {
+    let status = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
             w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
@@ -22,6 +22,11 @@ pub fn get_theme() -> Result<bool> {
             Some(&mut data_size),
         )
     };
+
+    if status.is_err() {
+        // value missing (e.g. theme never changed): Windows defaults to light
+        return Ok(true);
+    }
 
     Ok(data[0] != 0)
 }

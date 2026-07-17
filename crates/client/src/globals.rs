@@ -74,11 +74,13 @@ impl DllModule {
     }
 
     pub fn get() -> Result<MutexGuard<'static, DllModule>> {
-        DLL_INSTANCE
+        // recover from poisoning: one panic while the lock was held must
+        // not permanently break every later Activate/LockServer call
+        Ok(DLL_INSTANCE
             .get()
             .ok_or_else(|| anyhow::anyhow!("DllModule is not initialized"))?
             .lock()
-            .map_err(|e| anyhow::anyhow!(e.to_string()))
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     pub fn get_path() -> anyhow::Result<String> {

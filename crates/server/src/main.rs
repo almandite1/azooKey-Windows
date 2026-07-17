@@ -13,6 +13,9 @@ use std::ffi::{c_char, c_int, CStr, CString};
 
 struct RawComposingText {
     text: String,
+    // provided by the engine but not yet exposed over gRPC (the client's
+    // MoveCursor handling is still a TODO)
+    #[allow(dead_code)]
     cursor: i8,
 }
 
