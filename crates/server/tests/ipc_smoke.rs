@@ -79,6 +79,66 @@ async fn append_and_clear_roundtrip() {
 
 #[tokio::test]
 #[ignore = "requires a running azookey-server with its DLL environment"]
+async fn sessions_are_isolated_between_connections() {
+    // each connect() opens its own pipe connection = its own session
+    let mut a = connect().await;
+    let mut b = connect().await;
+
+    // interleave typing on both connections: "kaki" on A, "susi" on B
+    for (on_a, key) in [
+        (true, "k"),
+        (false, "s"),
+        (true, "a"),
+        (false, "u"),
+        (true, "k"),
+        (false, "s"),
+        (false, "i"),
+    ] {
+        let client = if on_a { &mut a } else { &mut b };
+        client
+            .append_text(shared::proto::AppendTextRequest {
+                text_to_append: key.to_string(),
+            })
+            .await
+            .expect("append_text failed");
+    }
+
+    let a_final = a
+        .append_text(shared::proto::AppendTextRequest {
+            text_to_append: "i".to_string(),
+        })
+        .await
+        .expect("append_text failed")
+        .into_inner()
+        .composing_text
+        .expect("composing_text missing");
+
+    // before per-session state, B's keystrokes would have been spliced
+    // into A's composition (and vice versa)
+    assert_eq!(a_final.hiragana, "かき");
+
+    // B's composition is intact as well: append nothing new, just clear
+    // after checking via one more keystroke round trip
+    let b_final = b
+        .remove_text(shared::proto::RemoveTextRequest {})
+        .await
+        .expect("remove_text failed")
+        .into_inner()
+        .composing_text
+        .expect("composing_text missing");
+    // "すし" minus one deletion = "す"
+    assert_eq!(b_final.hiragana, "す");
+
+    for client in [&mut a, &mut b] {
+        client
+            .clear_text(shared::proto::ClearTextRequest {})
+            .await
+            .expect("clear_text failed");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment"]
 async fn hostile_inputs_do_not_kill_the_server() {
     let mut client = connect().await;
 

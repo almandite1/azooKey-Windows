@@ -1,4 +1,4 @@
-use azookey_server::TonicNamedPipeServer;
+use azookey_server::{PipeConnectInfo, TonicNamedPipeServer};
 use tonic::{transport::Server, Request, Response, Status};
 use tonic_reflection::server::Builder as ReflectionBuilder;
 
@@ -9,7 +9,10 @@ use shared::proto::{
     ShrinkTextRequest, ShrinkTextResponse, Suggestion,
 };
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, CStr, CString};
+use std::sync::{LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 struct RawComposingText {
     text: String,
@@ -33,20 +36,59 @@ struct FFICandidate {
 //   side keeps unsynchronized global state (see the current_thread runtime
 //   in main())
 // - out-parameters are 32-bit (c_int on both sides)
+// - `session` selects the per-client composing state; it is the pipe
+//   connection id assigned in lib.rs (see PipeConnectInfo)
 // - every returned string/list is owned by the callee and must be handed
 //   back to FreeString / FreeComposedText after copying
 unsafe extern "C" {
     fn Initialize(path: *const c_char);
-    fn SetContext(context: *const c_char);
-    fn AppendText(input: *const c_char, cursorPtr: *mut c_int) -> *mut c_char;
-    fn RemoveText(cursorPtr: *mut c_int) -> *mut c_char;
-    fn MoveCursor(offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
-    fn ShrinkText(offset: c_int) -> *mut c_char;
-    fn ClearText();
-    fn GetComposedText(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
+    fn SetContext(session: c_int, context: *const c_char);
+    fn AppendText(session: c_int, input: *const c_char, cursorPtr: *mut c_int) -> *mut c_char;
+    fn RemoveText(session: c_int, cursorPtr: *mut c_int) -> *mut c_char;
+    fn MoveCursor(session: c_int, offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
+    fn ShrinkText(session: c_int, offset: c_int) -> *mut c_char;
+    fn ClearText(session: c_int);
+    fn GetComposedText(session: c_int, lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
+    fn RemoveSession(session: c_int);
     fn LoadConfig();
     fn FreeString(ptr: *mut c_char);
     fn FreeComposedText(listPtr: *mut *mut FFICandidate, length: c_int);
+}
+
+/// Sessions are created implicitly on first use, but nothing tells the
+/// server when a client connection goes away — evict engine state that has
+/// been idle for a while so exited applications don't accumulate sessions.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+static SESSION_LAST_USED: LazyLock<Mutex<HashMap<i32, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Extracts the pipe-connection session id tonic stored in the request.
+fn session_of<T>(request: &Request<T>) -> i32 {
+    let id = request
+        .extensions()
+        .get::<PipeConnectInfo>()
+        .map(|info| info.session_id)
+        .unwrap_or(0);
+    touch_session(id);
+    id
+}
+
+fn touch_session(id: i32) {
+    let mut map = SESSION_LAST_USED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    map.insert(id, Instant::now());
+
+    let expired: Vec<i32> = map
+        .iter()
+        .filter(|(sid, last)| **sid != id && last.elapsed() > SESSION_IDLE_TIMEOUT)
+        .map(|(sid, _)| *sid)
+        .collect();
+    for sid in expired {
+        map.remove(&sid);
+        unsafe { RemoveSession(sid) };
+    }
 }
 
 /// Builds a CString from possibly untrusted input. Interior NUL bytes cannot
@@ -75,12 +117,12 @@ fn initialize(path: &str) {
     }
 }
 
-fn add_text(input: &str) -> RawComposingText {
+fn add_text(session: i32, input: &str) -> RawComposingText {
     unsafe {
         let input = to_cstring(input);
         let mut cursor: c_int = 0;
 
-        let result = AppendText(input.as_ptr(), &mut cursor);
+        let result = AppendText(session, input.as_ptr(), &mut cursor);
         let text = consume_cstr(result);
 
         RawComposingText {
@@ -90,12 +132,12 @@ fn add_text(input: &str) -> RawComposingText {
     }
 }
 
-fn move_cursor(offset: i8) -> RawComposingText {
+fn move_cursor(session: i32, offset: i8) -> RawComposingText {
     unsafe {
         let offset = c_int::from(offset);
         let mut cursor: c_int = 0;
 
-        let result = MoveCursor(offset, &mut cursor);
+        let result = MoveCursor(session, offset, &mut cursor);
         let text = consume_cstr(result);
 
         RawComposingText {
@@ -105,11 +147,11 @@ fn move_cursor(offset: i8) -> RawComposingText {
     }
 }
 
-fn remove_text() -> RawComposingText {
+fn remove_text(session: i32) -> RawComposingText {
     unsafe {
         let mut cursor: c_int = 0;
 
-        let result = RemoveText(&mut cursor);
+        let result = RemoveText(session, &mut cursor);
         let text = consume_cstr(result);
 
         RawComposingText {
@@ -119,9 +161,9 @@ fn remove_text() -> RawComposingText {
     }
 }
 
-fn clear_text() {
+fn clear_text(session: i32) {
     unsafe {
-        ClearText();
+        ClearText(session);
     }
 }
 
@@ -135,10 +177,10 @@ unsafe fn cstr_or_empty(ptr: *const c_char) -> String {
     }
 }
 
-fn get_composed_text() -> Vec<Suggestion> {
+fn get_composed_text(session: i32) -> Vec<Suggestion> {
     unsafe {
         let mut length: c_int = 0;
-        let result = GetComposedText(&mut length);
+        let result = GetComposedText(session, &mut length);
 
         if result.is_null() {
             return Vec::new();
@@ -178,10 +220,10 @@ fn get_composed_text() -> Vec<Suggestion> {
     }
 }
 
-fn shrink_text(offset: i8) -> RawComposingText {
+fn shrink_text(session: i32, offset: i8) -> RawComposingText {
     unsafe {
         let offset = c_int::from(offset);
-        let result = ShrinkText(offset);
+        let result = ShrinkText(session, offset);
         let text = consume_cstr(result);
 
         RawComposingText { text, cursor: 0 }
@@ -197,27 +239,29 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<AppendTextRequest>,
     ) -> Result<Response<AppendTextResponse>, Status> {
+        let session = session_of(&request);
         let input = request.into_inner().text_to_append;
-        let composing_text = add_text(&input);
+        let composing_text = add_text(session, &input);
 
         Ok(Response::new(AppendTextResponse {
             composing_text: Some(ComposingText {
                 hiragana: composing_text.text,
-                suggestions: get_composed_text().to_vec(),
+                suggestions: get_composed_text(session).to_vec(),
             }),
         }))
     }
 
     async fn remove_text(
         &self,
-        _: Request<RemoveTextRequest>,
+        request: Request<RemoveTextRequest>,
     ) -> Result<Response<RemoveTextResponse>, Status> {
-        let composing_text = remove_text();
+        let session = session_of(&request);
+        let composing_text = remove_text(session);
 
         Ok(Response::new(RemoveTextResponse {
             composing_text: Some(ComposingText {
                 hiragana: composing_text.text,
-                suggestions: get_composed_text().to_vec(),
+                suggestions: get_composed_text(session).to_vec(),
             }),
         }))
     }
@@ -226,22 +270,24 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<MoveCursorRequest>,
     ) -> Result<Response<MoveCursorResponse>, Status> {
+        let session = session_of(&request);
         let offset = request.into_inner().offset as i8;
-        let composing_text = move_cursor(offset);
+        let composing_text = move_cursor(session, offset);
 
         Ok(Response::new(MoveCursorResponse {
             composing_text: Some(ComposingText {
                 hiragana: composing_text.text,
-                suggestions: get_composed_text().to_vec(),
+                suggestions: get_composed_text(session).to_vec(),
             }),
         }))
     }
 
     async fn clear_text(
         &self,
-        _: Request<ClearTextRequest>,
+        request: Request<ClearTextRequest>,
     ) -> Result<Response<ClearTextResponse>, Status> {
-        clear_text();
+        let session = session_of(&request);
+        clear_text(session);
         Ok(Response::new(ClearTextResponse {}))
     }
 
@@ -249,13 +295,14 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<ShrinkTextRequest>,
     ) -> Result<Response<ShrinkTextResponse>, Status> {
+        let session = session_of(&request);
         let offset = request.into_inner().offset as i8;
-        let composing_text = shrink_text(offset);
+        let composing_text = shrink_text(session, offset);
 
         Ok(Response::new(ShrinkTextResponse {
             composing_text: Some(ComposingText {
                 hiragana: composing_text.text,
-                suggestions: get_composed_text().to_vec(),
+                suggestions: get_composed_text(session).to_vec(),
             }),
         }))
     }
@@ -264,6 +311,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::SetContextRequest>,
     ) -> Result<Response<shared::proto::SetContextResponse>, Status> {
+        let session = session_of(&request);
         let context = request.into_inner().context;
         let trimmed_context = context
             .split('\r')
@@ -273,7 +321,7 @@ impl AzookeyService for MyAzookeyService {
 
         let context = to_cstring(trimmed_context);
 
-        unsafe { SetContext(context.as_ptr()) };
+        unsafe { SetContext(session, context.as_ptr()) };
         Ok(Response::new(shared::proto::SetContextResponse {}))
     }
 

@@ -8,7 +8,26 @@ import ffi
 // call every exported function from a single thread, serially (it runs a
 // current_thread tokio runtime on the process main thread).
 @MainActor let converter = KanaKanjiConverter()
-@MainActor var composingText = ComposingText()
+
+// Per-client composing state, keyed by the session id the Rust server
+// assigns to each pipe connection. Every application hosting the IME has
+// its own session; sharing one global ComposingText made simultaneous
+// typing in two apps corrupt each other's composition. The converter
+// (dictionary + zenz model) stays shared — it is heavyweight and all
+// calls are serialized by the single-threaded caller.
+struct SessionState {
+    var composingText = ComposingText()
+    var context = ""
+}
+
+@MainActor var sessions: [Int32: SessionState] = [:]
+
+@MainActor func withSession<T>(_ id: Int32, _ body: (inout SessionState) -> T) -> T {
+    var state = sessions[id] ?? SessionState()
+    let result = body(&state)
+    sessions[id] = state
+    return result
+}
 
 @MainActor var execURL = URL(filePath: "")
 @MainActor var config: [String : Any] = [
@@ -98,9 +117,9 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     load_config()
 
     // warm up the converter (and the zenzai model when enabled)
-    composingText.insertAtCursorPosition("a", inputStyle: .roman2kana)
-    converter.requestCandidates(composingText, options: getOptions())
-    composingText = ComposingText()
+    var warmup = ComposingText()
+    warmup.insertAtCursorPosition("a", inputStyle: .roman2kana)
+    converter.requestCandidates(warmup, options: getOptions())
 
     // a missing/corrupt zenz.gguf degrades silently to non-neural
     // conversion inside the converter; surface its status in the log
@@ -111,40 +130,56 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
 @_cdecl("AppendText")
 @MainActor public func append_text(
+    session: Int32,
     input: UnsafePointer<CChar>,
     cursorPtr: UnsafeMutablePointer<Int32>
 ) -> UnsafeMutablePointer<CChar>? {
     let inputString = String(cString: input)
-    composingText.insertAtCursorPosition(inputString, inputStyle: .roman2kana)
+    return withSession(session) { state in
+        state.composingText.insertAtCursorPosition(inputString, inputStyle: .roman2kana)
 
-    cursorPtr.pointee = Int32(composingText.convertTargetCursorPosition)
-    return _strdup(composingText.convertTarget)
+        cursorPtr.pointee = Int32(state.composingText.convertTargetCursorPosition)
+        return _strdup(state.composingText.convertTarget)
+    }
 }
 
 @_cdecl("RemoveText")
 @MainActor public func remove_text(
+    session: Int32,
     cursorPtr: UnsafeMutablePointer<Int32>
 ) -> UnsafeMutablePointer<CChar>? {
-    composingText.deleteBackwardFromCursorPosition(count: 1)
+    withSession(session) { state in
+        state.composingText.deleteBackwardFromCursorPosition(count: 1)
 
-    cursorPtr.pointee = Int32(composingText.convertTargetCursorPosition)
-    return _strdup(composingText.convertTarget)
+        cursorPtr.pointee = Int32(state.composingText.convertTargetCursorPosition)
+        return _strdup(state.composingText.convertTarget)
+    }
 }
 
 @_cdecl("MoveCursor")
 @MainActor public func move_cursor(
+    session: Int32,
     offset: Int32,
     cursorPtr: UnsafeMutablePointer<Int32>
 ) -> UnsafeMutablePointer<CChar>? {
-    let cursor = composingText.moveCursorFromCursorPosition(count: Int(offset))
+    withSession(session) { state in
+        let cursor = state.composingText.moveCursorFromCursorPosition(count: Int(offset))
 
-    cursorPtr.pointee = Int32(cursor)
-    return _strdup(composingText.convertTarget)
+        cursorPtr.pointee = Int32(cursor)
+        return _strdup(state.composingText.convertTarget)
+    }
 }
 
 @_cdecl("ClearText")
-@MainActor public func clear_text() {
-    composingText = ComposingText()
+@MainActor public func clear_text(session: Int32) {
+    withSession(session) { state in
+        state.composingText = ComposingText()
+    }
+}
+
+@_cdecl("RemoveSession")
+@MainActor public func remove_session(session: Int32) {
+    sessions.removeValue(forKey: session)
 }
 
 func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
@@ -157,9 +192,14 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 }
 
 @_cdecl("GetComposedText")
-@MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<Int32>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+@MainActor public func get_composed_text(
+    session: Int32,
+    lengthPtr: UnsafeMutablePointer<Int32>
+) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+    let (composingText, contextString) = withSession(session) { state in
+        (state.composingText, state.context)
+    }
     let hiragana = composingText.convertTarget
-    let contextString = (config["context"] as? String) ?? ""
     let options = getOptions(context: contextString)
     let converted = converter.requestCandidates(composingText, options: options)
     var result: [FFICandidate] = []
@@ -185,21 +225,27 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
 @_cdecl("ShrinkText")
 @MainActor public func shrink_text(
+    session: Int32,
     offset: Int32
 ) -> UnsafeMutablePointer<CChar>? {
-    var afterComposingText = composingText
-    afterComposingText.prefixComplete(correspondingCount: Int(offset))
-    composingText = afterComposingText
+    withSession(session) { state in
+        var afterComposingText = state.composingText
+        afterComposingText.prefixComplete(correspondingCount: Int(offset))
+        state.composingText = afterComposingText
 
-    return _strdup(composingText.convertTarget)
+        return _strdup(state.composingText.convertTarget)
+    }
 }
 
 @_cdecl("SetContext")
 @MainActor public func set_context(
+    session: Int32,
     context: UnsafePointer<CChar>
 ) {
     let contextString = String(cString: context)
-    config["context"] = contextString
+    withSession(session) { state in
+        state.context = contextString
+    }
 }
 
 // MEMORY OWNERSHIP CONTRACT:

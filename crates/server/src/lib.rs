@@ -1,5 +1,6 @@
 use async_stream::stream;
 use futures_core::stream::Stream;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::{ffi::c_void, pin::Pin, ptr::addr_of_mut};
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
@@ -22,13 +23,24 @@ unsafe impl Sync for UnsafeSecurityAttributes {}
 
 pub struct TonicNamedPipeServer {
     inner: NamedPipeServer,
+    session_id: i32,
+}
+
+/// Identifies one accepted pipe connection. tonic clones this into every
+/// request's extensions, which lets handlers keep per-client (per-IME-
+/// instance) composing state instead of one global shared by all apps.
+#[derive(Debug, Clone, Copy)]
+pub struct PipeConnectInfo {
+    pub session_id: i32,
 }
 
 impl Connected for TonicNamedPipeServer {
-    type ConnectInfo = ();
+    type ConnectInfo = PipeConnectInfo;
 
     fn connect_info(&self) -> Self::ConnectInfo {
-        ()
+        PipeConnectInfo {
+            session_id: self.session_id,
+        }
     }
 }
 
@@ -102,10 +114,15 @@ impl TonicNamedPipeServer {
                         addr_of_mut!(security_attributes) as *mut c_void
                     )?;
 
+                static NEXT_SESSION_ID: AtomicI32 = AtomicI32::new(1);
+
                 loop {
                     match server.connect().await {
                         Ok(()) => {
-                            yield Ok(TonicNamedPipeServer { inner: server });
+                            yield Ok(TonicNamedPipeServer {
+                                inner: server,
+                                session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+                            });
                         }
                         Err(e) => {
                             eprintln!("named pipe accept failed: {e}");
