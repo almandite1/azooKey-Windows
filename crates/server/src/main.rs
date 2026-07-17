@@ -19,7 +19,7 @@ struct RawComposingText {
     // provided by the engine but not yet exposed over gRPC (the client's
     // MoveCursor handling is still a TODO)
     #[allow(dead_code)]
-    cursor: i8,
+    cursor: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -125,25 +125,18 @@ fn add_text(session: i32, input: &str) -> RawComposingText {
         let result = AppendText(session, input.as_ptr(), &mut cursor);
         let text = consume_cstr(result);
 
-        RawComposingText {
-            text,
-            cursor: cursor as i8,
-        }
+        RawComposingText { text, cursor }
     }
 }
 
-fn move_cursor(session: i32, offset: i8) -> RawComposingText {
+fn move_cursor(session: i32, offset: i32) -> RawComposingText {
     unsafe {
-        let offset = c_int::from(offset);
         let mut cursor: c_int = 0;
 
         let result = MoveCursor(session, offset, &mut cursor);
         let text = consume_cstr(result);
 
-        RawComposingText {
-            text,
-            cursor: cursor as i8,
-        }
+        RawComposingText { text, cursor }
     }
 }
 
@@ -154,10 +147,7 @@ fn remove_text(session: i32) -> RawComposingText {
         let result = RemoveText(session, &mut cursor);
         let text = consume_cstr(result);
 
-        RawComposingText {
-            text,
-            cursor: cursor as i8,
-        }
+        RawComposingText { text, cursor }
     }
 }
 
@@ -220,9 +210,12 @@ fn get_composed_text(session: i32) -> Vec<Suggestion> {
     }
 }
 
-fn shrink_text(session: i32, offset: i8) -> RawComposingText {
+// offset is the full int32 from the wire: it is a count of roman-input
+// keystrokes and routinely exceeds 127 in long compositions. Truncating
+// it (a former `as i8`) wrapped it negative, and a negative count makes
+// the Swift engine's Array.removeFirst trap, killing the whole server.
+fn shrink_text(session: i32, offset: i32) -> RawComposingText {
     unsafe {
-        let offset = c_int::from(offset);
         let result = ShrinkText(session, offset);
         let text = consume_cstr(result);
 
@@ -271,7 +264,7 @@ impl AzookeyService for MyAzookeyService {
         request: Request<MoveCursorRequest>,
     ) -> Result<Response<MoveCursorResponse>, Status> {
         let session = session_of(&request);
-        let offset = request.into_inner().offset as i8;
+        let offset = request.into_inner().offset;
         let composing_text = move_cursor(session, offset);
 
         Ok(Response::new(MoveCursorResponse {
@@ -296,7 +289,7 @@ impl AzookeyService for MyAzookeyService {
         request: Request<ShrinkTextRequest>,
     ) -> Result<Response<ShrinkTextResponse>, Status> {
         let session = session_of(&request);
-        let offset = request.into_inner().offset as i8;
+        let offset = request.into_inner().offset;
         let composing_text = shrink_text(session, offset);
 
         Ok(Response::new(ShrinkTextResponse {

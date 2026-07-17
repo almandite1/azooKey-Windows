@@ -139,6 +139,59 @@ async fn sessions_are_isolated_between_connections() {
 
 #[tokio::test]
 #[ignore = "requires a running azookey-server with its DLL environment"]
+async fn long_composition_shrink_does_not_kill_the_server() {
+    let mut client = connect().await;
+
+    client
+        .clear_text(shared::proto::ClearTextRequest {})
+        .await
+        .expect("clear_text failed");
+
+    // 130 roman keystrokes (65 x "ka"): the shrink offset is a count of
+    // keystrokes, so a long composition pushes it past 127. A former
+    // `as i8` truncation wrapped such counts negative, and the negative
+    // count made the Swift engine trap (Array.removeFirst), killing the
+    // whole server process.
+    for _ in 0..65 {
+        for key in ["k", "a"] {
+            client
+                .append_text(shared::proto::AppendTextRequest {
+                    text_to_append: key.to_string(),
+                })
+                .await
+                .expect("append_text failed");
+        }
+    }
+
+    client
+        .shrink_text(shared::proto::ShrinkTextRequest { offset: 130 })
+        .await
+        .expect("shrink_text with a >127 offset failed (server crash?)");
+
+    // a hostile negative offset must be clamped, not trap the engine
+    client
+        .shrink_text(shared::proto::ShrinkTextRequest { offset: -1 })
+        .await
+        .expect("shrink_text with a negative offset failed (server crash?)");
+
+    // the server must still answer
+    let response = client
+        .append_text(shared::proto::AppendTextRequest {
+            text_to_append: "a".to_string(),
+        })
+        .await
+        .expect("server no longer responds")
+        .into_inner();
+    assert!(response.composing_text.is_some(), "composing_text missing");
+
+    client
+        .clear_text(shared::proto::ClearTextRequest {})
+        .await
+        .expect("clear_text failed");
+}
+
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment"]
 async fn hostile_inputs_do_not_kill_the_server() {
     let mut client = connect().await;
 

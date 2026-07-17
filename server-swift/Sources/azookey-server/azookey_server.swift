@@ -230,7 +230,10 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 ) -> UnsafeMutablePointer<CChar>? {
     withSession(session) { state in
         var afterComposingText = state.composingText
-        afterComposingText.prefixComplete(correspondingCount: Int(offset))
+        // prefixComplete clamps the count from above (min with input.count)
+        // but a negative count traps in Array.removeFirst and takes the
+        // whole server down — clamp from below here, at the FFI boundary
+        afterComposingText.prefixComplete(correspondingCount: max(0, Int(offset)))
         state.composingText = afterComposingText
 
         return _strdup(state.composingText.convertTarget)
