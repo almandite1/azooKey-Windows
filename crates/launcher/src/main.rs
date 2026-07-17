@@ -8,6 +8,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::HealthCheckRequest;
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+use windows::Win32::System::Threading::CreateMutexW;
 
 /// give up when a child keeps crashing this many times within RESTART_WINDOW
 const MAX_RESTARTS_IN_WINDOW: usize = 5;
@@ -30,6 +33,20 @@ const MAX_CONSECUTIVE_WATCHDOG_KILLS: u32 = 5;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // single-instance guard: the scheduled task and a manual start can race,
+    // and two launchers would fight over the (machine-global) pipe names —
+    // the loser's server dies on first_pipe_instance and burns through its
+    // restart budget. Global\ namespace matches the pipes' global scope.
+    match another_instance_running(w!("Global\\AzookeyLauncherSingleton")) {
+        Ok(true) => {
+            eprintln!("another azooKey launcher is already running; exiting");
+            return Ok(());
+        }
+        Ok(false) => {}
+        // an unlikely mutex failure must not keep the IME from starting
+        Err(e) => eprintln!("single-instance check failed ({e}); continuing anyway"),
+    }
+
     let config = AppConfig::new();
 
     let exe_path = env::current_exe()?
@@ -235,6 +252,16 @@ impl WatchdogPolicy {
     }
 }
 
+/// Returns true when another process already owns the named mutex.
+/// The handle is intentionally kept open (never closed) so the mutex lives
+/// exactly as long as this process — that lifetime IS the lock.
+fn another_instance_running(name: PCWSTR) -> windows::core::Result<bool> {
+    unsafe {
+        let _handle = CreateMutexW(None, false, name)?;
+        Ok(GetLastError() == ERROR_ALREADY_EXISTS)
+    }
+}
+
 fn start_process(exe: &str, prefix: &str) -> Option<Child> {
     let mut child = match Command::new(exe)
         .stdout(Stdio::piped())
@@ -277,6 +304,16 @@ mod tests {
 
     fn at(base: Instant, secs: u64) -> Instant {
         base + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn second_mutex_holder_detects_the_first() {
+        // a test-only name so a real running launcher can't interfere
+        let name = w!("Local\\AzookeyLauncherSingletonTest");
+        assert_eq!(another_instance_running(name).unwrap(), false);
+        // the first handle is still open in this process, so a second
+        // acquisition sees ERROR_ALREADY_EXISTS — same as a second process
+        assert_eq!(another_instance_running(name).unwrap(), true);
     }
 
     #[test]

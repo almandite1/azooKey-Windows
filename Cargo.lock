@@ -2096,6 +2096,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-health",
+ "windows",
 ]
 
 [[package]]
