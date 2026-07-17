@@ -81,14 +81,27 @@ pub fn anyhow(_: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     // generate the new function
+    // catch_unwind: these functions are COM callbacks; a panic unwinding
+    // across the COM (extern "system") boundary aborts the host process,
+    // so it must be converted to an HRESULT here.
     let generated = quote! {
         fn #fn_name(#fn_inputs) -> windows::core::Result<#output> {
-            let result: Result<#output> = (|| #fn_body)();
+            let result: std::thread::Result<Result<#output>> =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| #fn_body));
 
             match result {
-                Ok(v) => Ok(v),
-                Err(e) => {
+                Ok(Ok(v)) => Ok(v),
+                Ok(Err(e)) => {
                     tracing::error!("Error: {:?}", e);
+                    Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
+                }
+                Err(panic) => {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    tracing::error!("Panic in COM callback: {}", message);
                     Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
                 }
             }

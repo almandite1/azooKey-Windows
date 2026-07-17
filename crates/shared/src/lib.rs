@@ -9,7 +9,9 @@ pub mod proto {
 }
 
 fn get_config_root() -> PathBuf {
-    let appdata = PathBuf::from(std::env::var("APPDATA").unwrap());
+    // APPDATA is always set on a normal Windows session; fall back to a
+    // relative path rather than panicking in whichever process loads us
+    let appdata = PathBuf::from(std::env::var("APPDATA").unwrap_or_default());
     appdata.join("Azookey")
 }
 
@@ -44,8 +46,15 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn write(&self) {
         let config_path = get_config_root().join(SETTINGS_FILENAME);
-        let config_str = serde_json::to_string_pretty(self).unwrap();
-        std::fs::write(config_path, config_str).unwrap();
+        // failure to persist settings must not take down the IME
+        match serde_json::to_string_pretty(self) {
+            Ok(config_str) => {
+                if let Err(e) = std::fs::write(&config_path, config_str) {
+                    eprintln!("failed to write {}: {e}", config_path.display());
+                }
+            }
+            Err(e) => eprintln!("failed to serialize settings: {e}"),
+        }
     }
 
     pub fn read() -> Self {
@@ -53,14 +62,28 @@ impl AppConfig {
         if !config_path.exists() {
             return AppConfig::default();
         }
-        let config_str = std::fs::read_to_string(config_path).unwrap();
-        serde_json::from_str(&config_str).unwrap()
+        // a hand-edited or truncated settings.json must not crash the
+        // launcher/server/settings app at startup — fall back to defaults
+        let config_str = match std::fs::read_to_string(&config_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("failed to read {}: {e}", config_path.display());
+                return AppConfig::default();
+            }
+        };
+        serde_json::from_str(&config_str).unwrap_or_else(|e| {
+            eprintln!("invalid settings.json, using defaults: {e}");
+            AppConfig::default()
+        })
     }
 
     pub fn new() -> Self {
         let config_path = get_config_root();
         if !config_path.exists() {
-            std::fs::create_dir_all(&config_path).unwrap();
+            if let Err(e) = std::fs::create_dir_all(&config_path) {
+                eprintln!("failed to create {}: {e}", config_path.display());
+                return AppConfig::default();
+            }
         }
         let config = AppConfig::read();
         config.write();

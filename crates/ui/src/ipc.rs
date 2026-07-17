@@ -14,6 +14,15 @@ impl WindowController {
     pub fn new(sender: mpsc::Sender<WindowAction>) -> Self {
         Self { sender }
     }
+
+    /// Forwards an action to the window event loop. Returns a gRPC error
+    /// instead of panicking when the event loop side has shut down.
+    async fn dispatch(&self, action: WindowAction) -> Result<(), Status> {
+        self.sender
+            .send(action)
+            .await
+            .map_err(|e| Status::internal(format!("window event loop is gone: {e}")))
+    }
 }
 
 // ウィンドウ操作コマンド
@@ -47,11 +56,7 @@ impl WindowServiceProto for WindowService {
         &self,
         _request: Request<EmptyResponse>,
     ) -> Result<Response<EmptyResponse>, Status> {
-        self.controller
-            .sender
-            .send(WindowAction::Show)
-            .await
-            .unwrap();
+        self.controller.dispatch(WindowAction::Show).await?;
         Ok(Response::new(EmptyResponse {}))
     }
 
@@ -59,32 +64,25 @@ impl WindowServiceProto for WindowService {
         &self,
         _request: Request<EmptyResponse>,
     ) -> Result<Response<EmptyResponse>, Status> {
-        self.controller
-            .sender
-            .send(WindowAction::Hide)
-            .await
-            .unwrap();
+        self.controller.dispatch(WindowAction::Hide).await?;
         Ok(Response::new(EmptyResponse {}))
     }
     async fn set_window_position(
         &self,
         request: Request<SetPositionRequest>,
     ) -> Result<Response<EmptyResponse>, Status> {
-        let position = request.into_inner().position.unwrap();
-        let top = position.top;
-        let left = position.left;
-        let bottom = position.bottom;
-        let right = position.right;
+        let position = request
+            .into_inner()
+            .position
+            .ok_or_else(|| Status::invalid_argument("position is required"))?;
         self.controller
-            .sender
-            .send(WindowAction::SetPosition {
-                top,
-                left,
-                bottom,
-                right,
+            .dispatch(WindowAction::SetPosition {
+                top: position.top,
+                left: position.left,
+                bottom: position.bottom,
+                right: position.right,
             })
-            .await
-            .unwrap();
+            .await?;
 
         Ok(Response::new(EmptyResponse {}))
     }
@@ -96,12 +94,10 @@ impl WindowServiceProto for WindowService {
         let candidate = request.into_inner().candidates;
 
         self.controller
-            .sender
-            .send(WindowAction::SetCandidate {
+            .dispatch(WindowAction::SetCandidate {
                 candidates: candidate,
             })
-            .await
-            .unwrap();
+            .await?;
 
         Ok(Response::new(EmptyResponse {}))
     }
@@ -112,10 +108,8 @@ impl WindowServiceProto for WindowService {
     ) -> Result<Response<EmptyResponse>, Status> {
         let index = request.into_inner().index;
         self.controller
-            .sender
-            .send(WindowAction::SetSelection { index })
-            .await
-            .unwrap();
+            .dispatch(WindowAction::SetSelection { index })
+            .await?;
 
         Ok(Response::new(EmptyResponse {}))
     }
@@ -126,10 +120,8 @@ impl WindowServiceProto for WindowService {
     ) -> Result<Response<EmptyResponse>, Status> {
         let mode = request.into_inner().mode;
         self.controller
-            .sender
-            .send(WindowAction::SetInputMode(mode))
-            .await
-            .unwrap();
+            .dispatch(WindowAction::SetInputMode(mode))
+            .await?;
 
         Ok(Response::new(EmptyResponse {}))
     }

@@ -1,4 +1,4 @@
-use std::cmp::{max, min};
+use std::cmp::max;
 
 use crate::{
     engine::user_action::UserAction,
@@ -378,11 +378,10 @@ impl TextServiceFactory {
                     };
 
                     candidates = ipc_service.append_text(text.clone())?;
-                    let text = candidates.texts[selection_index as usize].clone();
-                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
+                    let (text, sub_text, count) = candidates.entry(selection_index as usize);
                     let hiragana = candidates.hiragana.clone();
 
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
+                    corresponding_count = count;
 
                     preview = text.clone();
                     suffix = sub_text.clone();
@@ -394,23 +393,9 @@ impl TextServiceFactory {
                 }
                 ClientAction::RemoveText => {
                     candidates = ipc_service.remove_text()?;
-                    let empty = "".to_string();
-                    let text = candidates
-                        .texts
-                        .get(selection_index as usize)
-                        .cloned()
-                        .unwrap_or(empty.clone());
-                    let sub_text = candidates
-                        .sub_texts
-                        .get(selection_index as usize)
-                        .cloned()
-                        .unwrap_or(empty.clone());
+                    let (text, sub_text, count) = candidates.entry(selection_index as usize);
                     let hiragana = candidates.hiragana.clone();
-                    corresponding_count = candidates
-                        .corresponding_count
-                        .get(selection_index as usize)
-                        .cloned()
-                        .unwrap_or(0);
+                    corresponding_count = count;
 
                     raw_input = raw_input
                         .chars()
@@ -463,19 +448,20 @@ impl TextServiceFactory {
                     };
 
                     let texts = candidates.texts.clone();
-                    let sub_texts = candidates.sub_texts.clone();
 
+                    // clamp lower bound first: on an empty list len() - 1 is
+                    // -1 and the later `as usize` cast would go out of bounds
                     selection_index = match selection {
-                        SetSelectionType::Up => max(0, selection_index - 1),
-                        SetSelectionType::Down => min(texts.len() as i32 - 1, selection_index + 1),
+                        SetSelectionType::Up => selection_index - 1,
+                        SetSelectionType::Down => selection_index + 1,
                         SetSelectionType::Number(number) => *number,
-                    };
+                    }
+                    .clamp(0, max(0, texts.len() as i32 - 1));
 
                     ipc_service.set_selection(selection_index as i32)?;
-                    let text = texts[selection_index as usize].clone();
-                    let sub_text = sub_texts[selection_index as usize].clone();
+                    let (text, sub_text, count) = candidates.entry(selection_index as usize);
                     let hiragana = candidates.hiragana.clone();
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
+                    corresponding_count = count;
 
                     preview = text.clone();
                     suffix = sub_text.clone();
@@ -499,12 +485,11 @@ impl TextServiceFactory {
                     candidates = ipc_service.append_text(text)?;
                     selection_index = 0;
 
-                    let text = candidates.texts[selection_index as usize].clone();
-                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
+                    let (text, sub_text, count) = candidates.entry(selection_index as usize);
                     let hiragana = candidates.hiragana.clone();
                     self.shift_start(&preview, &text)?;
 
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
+                    corresponding_count = count;
                     preview = text.clone();
                     suffix = sub_text.clone();
                     raw_hiragana = hiragana.clone();

@@ -6,7 +6,10 @@ use std::{env, thread};
 fn main() -> anyhow::Result<()> {
     let config = AppConfig::new();
 
-    let exe_path = env::current_exe()?.parent().unwrap().to_path_buf();
+    let exe_path = env::current_exe()?
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("executable path has no parent directory"))?
+        .to_path_buf();
     let backend_dir = match config.zenzai.backend.as_str() {
         "cpu" => "llama_cpu",
         "cuda" => "llama_cuda",
@@ -36,33 +39,37 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn start_process(exe: &str, prefix: &str) -> Option<Child> {
-    let mut child = Command::new(exe)
+    let mut child = match Command::new(exe)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect(&format!("Failed to start {}", exe));
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("Failed to start {}: {}", exe, e);
+            return None;
+        }
+    };
 
-    let stdout = child.stdout.take().expect("Failed to capture stdout");
-    let stdout_reader = BufReader::new(stdout);
-    let prefix_stdout = prefix.to_string();
-    thread::spawn(move || {
-        for line in stdout_reader.lines() {
-            if let Ok(line) = line {
+    if let Some(stdout) = child.stdout.take() {
+        let stdout_reader = BufReader::new(stdout);
+        let prefix_stdout = prefix.to_string();
+        thread::spawn(move || {
+            for line in stdout_reader.lines().map_while(Result::ok) {
                 println!("{}: {}", prefix_stdout, line);
             }
-        }
-    });
+        });
+    }
 
-    let stderr = child.stderr.take().expect("Failed to capture stderr");
-    let stderr_reader = BufReader::new(stderr);
-    let prefix_stderr = prefix.to_string();
-    thread::spawn(move || {
-        for line in stderr_reader.lines() {
-            if let Ok(line) = line {
+    if let Some(stderr) = child.stderr.take() {
+        let stderr_reader = BufReader::new(stderr);
+        let prefix_stderr = prefix.to_string();
+        thread::spawn(move || {
+            for line in stderr_reader.lines().map_while(Result::ok) {
                 eprintln!("{}: {}", prefix_stderr, line);
             }
-        }
-    });
+        });
+    }
 
     Some(child)
 }

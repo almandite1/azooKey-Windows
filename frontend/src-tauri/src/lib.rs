@@ -2,19 +2,24 @@ mod ipc;
 
 use serde::{Deserialize, Serialize};
 use shared::AppConfig;
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Mutex, PoisonError},
+};
 
 #[derive(Debug)]
 pub struct AppState {
     settings: Mutex<AppConfig>,
-    ipc: ipc::IPCService,
+    // connected lazily: the server may not be running when the settings
+    // app starts, and that must not crash or hang the app
+    ipc: Mutex<Option<ipc::IPCService>>,
 }
 
 impl AppState {
     fn new() -> Self {
         AppState {
             settings: Mutex::new(AppConfig::new()),
-            ipc: ipc::IPCService::new().unwrap(),
+            ipc: Mutex::new(None),
         }
     }
 }
@@ -26,17 +31,44 @@ fn greet(name: &str) -> String {
 
 #[tauri::command]
 fn get_config(state: tauri::State<AppState>) -> AppConfig {
-    let config = state.settings.lock().unwrap();
+    let config = state
+        .settings
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     config.clone()
 }
 
 #[tauri::command]
-fn update_config(state: tauri::State<AppState>, new_config: AppConfig) {
-    let mut config = state.settings.lock().unwrap();
-    *config = new_config;
-    config.write();
+fn update_config(state: tauri::State<AppState>, new_config: AppConfig) -> Result<(), String> {
+    {
+        let mut config = state
+            .settings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *config = new_config;
+        config.write();
+    }
 
-    state.ipc.clone().update_config().unwrap();
+    // the settings file is already saved at this point; notifying the
+    // server is best-effort and reported to the frontend on failure
+    let mut ipc_guard = state.ipc.lock().unwrap_or_else(PoisonError::into_inner);
+
+    if ipc_guard.is_none() {
+        match ipc::IPCService::new() {
+            Ok(service) => *ipc_guard = Some(service),
+            Err(e) => return Err(format!("cannot connect to azookey server: {e}")),
+        }
+    }
+
+    if let Some(ipc) = ipc_guard.as_mut() {
+        if let Err(e) = ipc.update_config() {
+            // drop the broken connection so the next call reconnects
+            *ipc_guard = None;
+            return Err(format!("failed to notify azookey server: {e}"));
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

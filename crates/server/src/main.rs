@@ -39,24 +39,40 @@ unsafe extern "C" {
     fn LoadConfig();
 }
 
+/// Builds a CString from possibly untrusted input. Interior NUL bytes cannot
+/// be represented in a C string, so they are stripped instead of panicking —
+/// requests arrive over a pipe any local process can open.
+fn to_cstring(s: &str) -> CString {
+    CString::new(s.replace('\0', "")).unwrap_or_default()
+}
+
+/// Copies a C string returned by the Swift engine. Tolerates null pointers
+/// and invalid UTF-8 instead of crashing the server.
+unsafe fn cstr_or_empty(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+    }
+}
+
 fn initialize(path: &str) {
     unsafe {
-        let path = CString::new(path).expect("CString::new failed");
+        let path = to_cstring(path);
         Initialize(path.as_ptr(), USE_ZENZAI);
     }
 }
 
 fn add_text(input: &str) -> RawComposingText {
     unsafe {
-        let input = CString::new(input).expect("CString::new failed");
+        let input = to_cstring(input);
         let mut cursor: c_int = 0;
 
         let result = AppendText(input.as_ptr(), &mut cursor);
-
-        let text = CStr::from_ptr(&*result as *const c_char).to_str().unwrap();
+        let text = cstr_or_empty(result);
 
         RawComposingText {
-            text: text.to_string(),
+            text,
             cursor: cursor as i8,
         }
     }
@@ -65,15 +81,13 @@ fn add_text(input: &str) -> RawComposingText {
 fn move_cursor(offset: i8) -> RawComposingText {
     unsafe {
         let offset = c_int::from(offset);
-        println!("Offset: {}", offset);
         let mut cursor: c_int = 0;
 
         let result = MoveCursor(offset, &mut cursor);
-
-        let text = CStr::from_ptr(&*result as *const c_char).to_str().unwrap();
+        let text = cstr_or_empty(result);
 
         RawComposingText {
-            text: text.to_string(),
+            text,
             cursor: cursor as i8,
         }
     }
@@ -84,11 +98,10 @@ fn remove_text() -> RawComposingText {
         let mut cursor: c_int = 0;
 
         let result = RemoveText(&mut cursor);
-
-        let text = CStr::from_ptr(&*result as *const c_char).to_str().unwrap();
+        let text = cstr_or_empty(result);
 
         RawComposingText {
-            text: text.to_string(),
+            text,
             cursor: cursor as i8,
         }
     }
@@ -104,16 +117,21 @@ fn get_composed_text() -> Vec<Suggestion> {
     unsafe {
         let mut length: c_int = 0;
         let result = GetComposedText(&mut length);
+
+        if result.is_null() || length <= 0 {
+            return Vec::new();
+        }
+
         let mut suggestions = Vec::with_capacity(length as usize);
 
         for index in 0..length as usize {
-            let candidate = (**result.add(index)).clone();
-            let text = CStr::from_ptr(candidate.text)
-                .to_string_lossy()
-                .into_owned();
-            let subtext = CStr::from_ptr(candidate.subtext)
-                .to_string_lossy()
-                .into_owned();
+            let candidate_ptr = *result.add(index);
+            if candidate_ptr.is_null() {
+                continue;
+            }
+            let candidate = (*candidate_ptr).clone();
+            let text = cstr_or_empty(candidate.text);
+            let subtext = cstr_or_empty(candidate.subtext);
             let corresponding_count = candidate.corresponding_count;
 
             let suggestion = Suggestion {
@@ -140,13 +158,9 @@ fn shrink_text(offset: i8) -> RawComposingText {
     unsafe {
         let offset = c_int::from(offset);
         let result = ShrinkText(offset);
+        let text = cstr_or_empty(result);
 
-        let text = CStr::from_ptr(&*result as *const c_char).to_str().unwrap();
-
-        RawComposingText {
-            text: text.to_string(),
-            cursor: 0,
-        }
+        RawComposingText { text, cursor: 0 }
     }
 }
 
@@ -233,7 +247,7 @@ impl AzookeyService for MyAzookeyService {
             .last()
             .unwrap_or_default();
 
-        let context = CString::new(trimmed_context).expect("CString::new failed");
+        let context = to_cstring(trimmed_context);
 
         unsafe { SetContext(context.as_ptr()) };
         Ok(Response::new(shared::proto::SetContextResponse {}))
@@ -256,8 +270,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("AzookeyServer started");
     // get executable directory
     let current_exe = std::env::current_exe()?;
-    let parent_dir = current_exe.parent().unwrap();
-    initialize(parent_dir.to_str().unwrap());
+    let parent_dir = current_exe
+        .parent()
+        .ok_or("executable path has no parent directory")?;
+    initialize(&parent_dir.to_string_lossy());
 
     let service = MyAzookeyService::default();
 
@@ -268,10 +284,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(
             ReflectionBuilder::configure()
                 .register_encoded_file_descriptor_set(shared::proto::FILE_DESCRIPTOR_SET)
-                .build_v1()
-                .unwrap(),
+                .build_v1()?,
         )
-        .serve_with_incoming(TonicNamedPipeServer::new("azookey_server"))
+        .serve_with_incoming(TonicNamedPipeServer::new("azookey_server")?)
         .await?;
 
     Ok(())

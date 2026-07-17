@@ -15,7 +15,9 @@ use tsf::factory::TextServiceFactory;
 use windows::{
     core::{IUnknown, Interface as _, GUID, HRESULT},
     Win32::{
-        Foundation::{CLASS_E_CLASSNOTAVAILABLE, E_FAIL, E_UNEXPECTED, HMODULE, S_FALSE, S_OK},
+        Foundation::{
+            CLASS_E_CLASSNOTAVAILABLE, E_INVALIDARG, E_NOINTERFACE, HMODULE, S_FALSE, S_OK,
+        },
         System::{
             Com::IClassFactory,
             Ole::SELFREG_E_CLASS,
@@ -23,6 +25,18 @@ use windows::{
         },
     },
 };
+
+// Logger setup is deferred out of DllMain: spawning threads or doing real
+// work under the loader lock can deadlock the host process. First called
+// from DllGetClassObject, which runs outside the loader lock.
+static LOGGER_INIT: std::sync::Once = std::sync::Once::new();
+
+fn ensure_logger() {
+    LOGGER_INIT.call_once(|| {
+        // best effort: logging is optional, never fail the caller
+        let _ = trace::setup_logger();
+    });
+}
 // -- Dll Export Functions --
 // The IME DLL needs to implement the following four functions to operate as a COM server.
 
@@ -42,13 +56,6 @@ pub extern "system" fn DllMain(
             Ok(())
         })();
 
-        // use unwrap only in this function
-        std::thread::spawn(|| {
-            trace::setup_logger().unwrap();
-        });
-
-        tracing::debug!("DllMain");
-
         check_err!(result, true, false)
     } else if fdw_reason == DLL_PROCESS_DETACH {
         tracing::debug!("DLL_PROCESS_DETACH");
@@ -56,9 +63,10 @@ pub extern "system" fn DllMain(
         let result: anyhow::Result<()> = (|| {
             let mut dll_instance = DllModule::get()?;
             dll_instance.hinst = None;
-            // send a signal to the tracing writer thread to exit
+            // send a signal to the tracing writer thread to exit;
+            // the receiver may already be gone during process teardown
             if let Some(sender) = dll_instance.sender.take() {
-                sender.send(true).unwrap();
+                let _ = sender.send(true);
             }
 
             Ok(())
@@ -82,34 +90,41 @@ pub unsafe extern "system" fn DllGetClassObject(
     // This function will be called only once when applications request the TextService
     // So, You have to reopen the application to apply the changes in the TextService
     // https://zenn.dev/link/comments/d918e46723da80
+    ensure_logger();
     tracing::debug!("DllGetClassObject");
 
-    let result: anyhow::Result<()> = (|| {
-        let rclsid = unsafe { *rclsid };
-        let riid = unsafe { *riid };
-        let ppv = unsafe { &mut *ppv };
+    // COM contract: on failure return a failure HRESULT (never S_FALSE — a
+    // host checking SUCCEEDED(hr) would then read an invalid *ppv) and leave
+    // *ppv null.
+    if rclsid.is_null() || riid.is_null() || ppv.is_null() {
+        return E_INVALIDARG;
+    }
 
-        if rclsid != GUID_TEXT_SERVICE {
-            return Err(anyhow::anyhow!(CLASS_E_CLASSNOTAVAILABLE));
-        }
+    unsafe { *ppv = std::ptr::null_mut() };
 
-        if riid != IClassFactory::IID {
-            return Err(anyhow::anyhow!(E_UNEXPECTED));
-        }
+    let rclsid = unsafe { *rclsid };
+    let riid = unsafe { *riid };
 
-        *ppv = match riid {
-            IUnknown::IID => std::mem::transmute::<IUnknown, *mut c_void>(IUnknown::from(
+    if rclsid != GUID_TEXT_SERVICE {
+        return CLASS_E_CLASSNOTAVAILABLE;
+    }
+
+    let instance = match riid {
+        IUnknown::IID => unsafe {
+            std::mem::transmute::<IUnknown, *mut c_void>(IUnknown::from(
                 TextServiceFactory::default(),
-            )),
-            IClassFactory::IID => std::mem::transmute::<IClassFactory, *mut c_void>(
-                IClassFactory::from(TextServiceFactory::default()),
-            ),
-            _ => return Err(anyhow::anyhow!(E_UNEXPECTED)),
-        };
-        Ok(())
-    })();
+            ))
+        },
+        IClassFactory::IID => unsafe {
+            std::mem::transmute::<IClassFactory, *mut c_void>(IClassFactory::from(
+                TextServiceFactory::default(),
+            ))
+        },
+        _ => return E_NOINTERFACE,
+    };
 
-    check_err!(result)
+    unsafe { *ppv = instance };
+    S_OK
 }
 
 #[no_mangle]

@@ -137,7 +137,9 @@ pub fn to_half_katakana(s: &str) -> String {
     let mut iter = s.chars().peekable();
 
     while let Some(c) = iter.next() {
-        let c = to_halfwidth(&c.to_string()).chars().next().unwrap();
+        // to_halfwidth maps one char to one char today, but guard against an
+        // empty mapping rather than panicking inside a COM callback
+        let c = to_halfwidth(&c.to_string()).chars().next().unwrap_or(c);
 
         if let Some(&(_, hankaku_katakana)) = KANA_MAP.get(&c.to_string().as_str()) {
             result.push_str(hankaku_katakana);

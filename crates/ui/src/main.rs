@@ -1,7 +1,6 @@
 use std::cmp::max;
 use std::sync::Arc;
 
-use anyhow::Context as _;
 use azookey_server::TonicNamedPipeServer;
 use ipc::{WindowAction, WindowController, WindowService};
 use shared::proto::window_service_server::WindowServiceServer;
@@ -56,13 +55,18 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // start grpc server
+    let incoming = TonicNamedPipeServer::new("azookey_ui")?;
     tokio::spawn(async move {
         println!("WindowServer listening");
-        Server::builder()
+        let result = Server::builder()
             .add_service(WindowServiceServer::new(grpc_service))
-            .serve_with_incoming(TonicNamedPipeServer::new("azookey_ui"))
-            .await
-            .expect("gRPC server failed");
+            .serve_with_incoming(incoming)
+            .await;
+
+        // without IPC this process is a zombie (window alive, unreachable);
+        // exit so the launcher can restart it
+        eprintln!("gRPC server terminated: {:?}", result);
+        std::process::exit(1);
     });
 
     let event_loop_proxy = event_loop.create_proxy();
@@ -79,9 +83,7 @@ async fn main() -> anyhow::Result<()> {
                     if type_value == "resize" {
                         if let Some(height) = message.get("height") {
                             let height = height.as_f64().unwrap_or(0.0);
-                            proxy_clone
-                                .send_event(UserEvent::UpdateHeight(height as i32))
-                                .unwrap();
+                            let _ = proxy_clone.send_event(UserEvent::UpdateHeight(height as i32));
                         }
                     }
                 }
@@ -96,53 +98,12 @@ async fn main() -> anyhow::Result<()> {
     let proxy_clone = event_loop_proxy.clone();
     tokio::spawn(async move {
         while let Some(action) = rx.recv().await {
-            match action {
-                WindowAction::Show => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::Show))
-                        .unwrap();
-                }
-                WindowAction::Hide => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::Hide))
-                        .unwrap();
-                }
-                WindowAction::SetPosition {
-                    top,
-                    left,
-                    bottom,
-                    right,
-                } => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::SetPosition {
-                            top,
-                            left,
-                            bottom,
-                            right,
-                        }))
-                        .unwrap();
-                }
-                WindowAction::SetCandidate { candidates } => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::SetCandidate {
-                            candidates,
-                        }))
-                        .unwrap();
-                }
-                WindowAction::SetSelection { index } => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::SetSelection {
-                            index,
-                        }))
-                        .unwrap();
-                }
-                WindowAction::SetInputMode(input_method) => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::SetInputMode(
-                            input_method,
-                        )))
-                        .unwrap();
-                }
+            // send_event only fails when the event loop is gone
+            if proxy_clone
+                .send_event(UserEvent::WindowAction(action))
+                .is_err()
+            {
+                break;
             }
         }
     });
@@ -160,19 +121,25 @@ async fn main() -> anyhow::Result<()> {
             } => *control_flow = ControlFlow::Exit,
             Event::UserEvent(script) => match script {
                 UserEvent::UpdateCandidates(candidates) => {
-                    candidate_webview
-                        .evaluate_script(&format!("updateCandidates({})", candidates))
-                        .unwrap();
+                    if let Err(e) =
+                        candidate_webview.evaluate_script(&format!("updateCandidates({})", candidates))
+                    {
+                        eprintln!("evaluate_script failed: {e}");
+                    }
                 }
                 UserEvent::UpdateSelection(index) => {
-                    candidate_webview
-                        .evaluate_script(&format!("updateSelection({})", index))
-                        .unwrap();
+                    if let Err(e) =
+                        candidate_webview.evaluate_script(&format!("updateSelection({})", index))
+                    {
+                        eprintln!("evaluate_script failed: {e}");
+                    }
                 }
                 UserEvent::UpdateInputMethod(input_method) => {
-                    indicator_webview
+                    if let Err(e) = indicator_webview
                         .evaluate_script(&format!("updateInputMethod(\"{}\")", input_method))
-                        .unwrap();
+                    {
+                        eprintln!("evaluate_script failed: {e}");
+                    }
                 }
                 UserEvent::UpdateHeight(height) => {
                     let width = candidate_window.inner_size().width as i32;
@@ -271,23 +238,21 @@ async fn main() -> anyhow::Result<()> {
                                 height as u32,
                             ));
 
+                            // Vec<String> serialization cannot fail; fall back
+                            // to an empty list rather than crash the UI
                             let candidates = serde_json::to_string(&candidates)
-                                .context("Failed to serialize candidates")
-                                .unwrap();
+                                .unwrap_or_else(|_| "[]".to_string());
 
-                            event_loop_proxy
-                                .send_event(UserEvent::UpdateCandidates(candidates))
-                                .unwrap();
+                            let _ = event_loop_proxy
+                                .send_event(UserEvent::UpdateCandidates(candidates));
                         }
                         WindowAction::SetSelection { index } => {
-                            event_loop_proxy
-                                .send_event(UserEvent::UpdateSelection(index))
-                                .unwrap();
+                            let _ =
+                                event_loop_proxy.send_event(UserEvent::UpdateSelection(index));
                         }
                         WindowAction::SetInputMode(input_method) => {
-                            event_loop_proxy
-                                .send_event(UserEvent::UpdateInputMethod(input_method))
-                                .unwrap();
+                            let _ = event_loop_proxy
+                                .send_event(UserEvent::UpdateInputMethod(input_method));
 
                             let task_guard = task_guard.try_lock();
 

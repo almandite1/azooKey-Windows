@@ -67,7 +67,9 @@ impl AsyncWrite for TonicNamedPipeServer {
 }
 
 impl TonicNamedPipeServer {
-    pub fn new(path: &str) -> impl Stream<Item = io::Result<TonicNamedPipeServer>> {
+    pub fn new(
+        path: &str,
+    ) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>>> {
         // set security attributes to allow ipc from sandboxed processes
         // see https://nathancorvussolis.blogspot.com/2018/05/windows-ime-security.html
 
@@ -82,7 +84,7 @@ impl TonicNamedPipeServer {
                 &mut security_descriptor,
                 None,
             )
-            .unwrap();
+            .map_err(|e| io::Error::other(format!("invalid pipe security descriptor: {e}")))?;
 
             let mut security_attributes = UnsafeSecurityAttributes(SECURITY_ATTRIBUTES {
                 nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -90,7 +92,7 @@ impl TonicNamedPipeServer {
                 bInheritHandle: false.into(),
             });
 
-            stream! {
+            Ok(stream! {
                 let mut server = ServerOptions::new()
                     .first_pipe_instance(true)
                     .create_with_security_attributes_raw(
@@ -113,7 +115,7 @@ impl TonicNamedPipeServer {
                             addr_of_mut!(security_attributes) as *mut c_void
                         )?;
                 }
-            }
+            })
         }
     }
 }

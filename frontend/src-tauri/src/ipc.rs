@@ -19,9 +19,12 @@ impl IPCService {
     pub fn new() -> Result<Self> {
         let runtime = tokio::runtime::Runtime::new()?;
 
-        let server_channel = runtime.block_on(
-            Endpoint::try_from("http://[::]:50051")?.connect_with_connector(service_fn(
-                |_| async {
+        // bound the whole connection attempt: a busy pipe must not block
+        // the settings app forever
+        let server_channel = runtime.block_on(async {
+            let endpoint = Endpoint::try_from("http://[::]:50051")?;
+            let connect = endpoint.connect_with_connector(
+                service_fn(|_| async {
                     let client = loop {
                         match ClientOptions::new().open(r"\\.\pipe\azookey_server") {
                             Ok(client) => break client,
@@ -33,9 +36,14 @@ impl IPCService {
                     };
 
                     Ok::<_, std::io::Error>(TokioIo::new(client))
-                },
-            )),
-        )?;
+                }),
+            );
+
+            time::timeout(Duration::from_secs(3), connect)
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out connecting to azookey server"))?
+                .map_err(anyhow::Error::from)
+        })?;
 
         let azookey_client = AzookeyServiceClient::new(server_channel);
 

@@ -27,6 +27,21 @@ pub struct Candidates {
     pub corresponding_count: Vec<i32>,
 }
 
+impl Candidates {
+    /// Returns (text, sub_text, corresponding_count) for the given index.
+    /// The engine can return an empty candidate list (and the three vecs are
+    /// not guaranteed to have equal lengths), so out-of-bounds access must
+    /// degrade to empty values instead of panicking — a panic here unwinds
+    /// out of a COM callback and aborts the host application.
+    pub fn entry(&self, index: usize) -> (String, String, i32) {
+        (
+            self.texts.get(index).cloned().unwrap_or_default(),
+            self.sub_texts.get(index).cloned().unwrap_or_default(),
+            self.corresponding_count.get(index).copied().unwrap_or(0),
+        )
+    }
+}
+
 impl IPCService {
     pub fn new() -> Result<Self> {
         let runtime = tokio::runtime::Runtime::new()?;
