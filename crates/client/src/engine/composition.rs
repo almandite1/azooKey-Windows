@@ -31,7 +31,6 @@ pub enum CompositionState {
     None,
     Composing,
     Previewing,
-    Selecting,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -220,9 +219,6 @@ impl TextServiceFactory {
                         return Ok(None);
                     }
                 }
-            }
-            _ => {
-                return Ok(None);
             }
         };
 

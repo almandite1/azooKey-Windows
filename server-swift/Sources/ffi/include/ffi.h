@@ -3,8 +3,6 @@
 
 #include <stdio.h>
 
-#endif /* ffi_h */
-
 /*
  * FFI contract (see azookey_server.swift and crates/server/src/main.rs):
  * - all exported engine functions must be called from a single thread,
@@ -23,3 +21,5 @@ struct FFICandidate {
     char *hiragana;
     int correspondingCount;
 };
+
+#endif /* ffi_h */

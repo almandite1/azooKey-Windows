@@ -15,6 +15,10 @@ use windows::{
     },
 };
 
+// repr(transparent): the pipe-creation calls pass `&mut security_attributes
+// as *mut c_void`, which relies on the wrapper having its single field's
+// exact layout at offset 0 — repr(Rust) does not guarantee that
+#[repr(transparent)]
 #[allow(dead_code)]
 struct UnsafeSecurityAttributes(SECURITY_ATTRIBUTES);
 
