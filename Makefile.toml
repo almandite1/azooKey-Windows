@@ -12,7 +12,7 @@ script_runner = "@shell"
 script = """
 cd server-swift
 swift build -c release
-cp .build/release/azookey-server.lib ../
+cp .build/x86_64-unknown-windows-msvc/release/azookey-server.lib ../
 """
 
 [tasks.build_x64]
