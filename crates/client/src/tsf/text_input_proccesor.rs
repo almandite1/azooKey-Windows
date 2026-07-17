@@ -165,6 +165,12 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
 
         text_service.tid = 0;
         text_service.thread_mgr = None;
+        // break the self-reference: `this` holds an ITfTextInputProcessor to
+        // our own object, so without this the TextService — and the
+        // ITfContext that `context` pins — never reaches refcount 0 and leaks
+        // on every profile switch
+        text_service.this = None;
+        text_service.context = None;
 
         tracing::debug!("Deactivate success");
 

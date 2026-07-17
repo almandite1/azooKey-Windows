@@ -347,8 +347,12 @@ impl TextServiceFactory {
                         self.update_pos()?;
                         self.end_composition()?;
 
-                        let mut ime_state = IMEState::get()?;
-                        ime_state.input_mode = mode.clone();
+                        // scope the guard tightly: update_lang_bar re-enters
+                        // IMEState through AddItem -> GetIcon (a try_lock),
+                        // which fails outright if we still hold it here
+                        {
+                            IMEState::get()?.input_mode = mode.clone();
+                        }
 
                         // update the language bar
                         self.update_lang_bar()?;
