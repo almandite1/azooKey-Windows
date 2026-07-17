@@ -4,6 +4,13 @@ scripts/*.exe
 logs/*
 .idea
 
+# Claude Code の個人環境向け設定 — 共有する .claude/settings.json は追跡対象
+.claude/settings.local.json
+
+# ローカルの作業計画メモ (docs/done/ は実装完了分)
+# 先頭 / でルート限定 — 追跡対象の crates/client/docs/ にマッチさせないため
+/docs/
+
 *.gguf
 *.dll
 *.lib
