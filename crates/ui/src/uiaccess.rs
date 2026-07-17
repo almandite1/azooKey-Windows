@@ -213,41 +213,70 @@ pub fn create_uiaccess_token(token_handle: &mut HANDLE) -> Result<()> {
             &mut token_self,
         )?;
 
-        let mut session_id = 0;
-        let mut token_info_length = 0;
+        // everything below runs inside closures so that a failure still
+        // reverts the thread impersonation and closes every handle: if the
+        // caller falls back to running without UIAccess (see main.rs), a
+        // lingering winlogon impersonation token or a leaked handle would
+        // otherwise poison the rest of the process
+        let result = (|| {
+            let mut session_id = 0;
+            let mut token_info_length = 0;
 
-        GetTokenInformation(
-            token_self,
-            TokenSessionId,
-            Some(addr_of_mut!(session_id) as *mut c_void),
-            std::mem::size_of::<u32>() as u32,
-            &mut token_info_length,
-        )?;
+            GetTokenInformation(
+                token_self,
+                TokenSessionId,
+                Some(addr_of_mut!(session_id) as *mut c_void),
+                std::mem::size_of::<u32>() as u32,
+                &mut token_info_length,
+            )?;
 
-        let mut system_token_handle = HANDLE::default();
-        duplicate_winlogon_token(session_id, TOKEN_IMPERSONATE, &mut system_token_handle)?;
+            let mut system_token_handle = HANDLE::default();
+            duplicate_winlogon_token(session_id, TOKEN_IMPERSONATE, &mut system_token_handle)?;
 
-        SetThreadToken(None, system_token_handle)?;
-        DuplicateTokenEx(
-            token_self,
-            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
-            None,
-            SecurityAnonymous,
-            TokenPrimary,
-            token_handle,
-        )?;
+            // impersonate winlogon only for the duplication below, then
+            // revert no matter how it goes
+            let impersonated = (|| {
+                SetThreadToken(None, system_token_handle)?;
+                DuplicateTokenEx(
+                    token_self,
+                    TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
+                    None,
+                    SecurityAnonymous,
+                    TokenPrimary,
+                    token_handle,
+                )?;
 
-        let ui_access: BOOL = true.into();
+                let ui_access: BOOL = true.into();
+                SetTokenInformation(
+                    *token_handle,
+                    TokenUIAccess,
+                    &ui_access as *const _ as *mut _,
+                    std::mem::size_of::<BOOL>() as u32,
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })();
 
-        SetTokenInformation(
-            *token_handle,
-            TokenUIAccess,
-            &ui_access as *const _ as *mut _,
-            std::mem::size_of::<BOOL>() as u32,
-        )?;
+            // revert impersonation before returning to the caller's context
+            let _ = SetThreadToken(None, None);
+            if !system_token_handle.is_invalid() {
+                let _ = CloseHandle(system_token_handle);
+            }
+
+            impersonated
+        })();
+
+        if !token_self.is_invalid() {
+            let _ = CloseHandle(token_self);
+        }
+
+        // don't leak the half-built primary token if a later step failed
+        if result.is_err() && !token_handle.is_invalid() {
+            let _ = CloseHandle(*token_handle);
+            *token_handle = HANDLE::default();
+        }
+
+        result
     }
-
-    Ok(())
 }
 
 pub fn prepare_uiaccess_token() -> Result<()> {
@@ -265,7 +294,7 @@ pub fn prepare_uiaccess_token() -> Result<()> {
 
     unsafe {
         GetStartupInfoW(&mut startup_info);
-        CreateProcessAsUserW(
+        let created = CreateProcessAsUserW(
             token_handle,
             None,
             PWSTR(GetCommandLineW().as_ptr() as *mut u16),
@@ -277,7 +306,13 @@ pub fn prepare_uiaccess_token() -> Result<()> {
             None,
             &startup_info,
             &mut process_info,
-        )?;
+        );
+
+        // the primary token has done its job either way
+        if !token_handle.is_invalid() {
+            let _ = CloseHandle(token_handle);
+        }
+        created?;
 
         println!("Process created with UIAccess token");
         CloseHandle(process_info.hProcess)?;
