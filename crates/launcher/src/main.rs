@@ -265,6 +265,8 @@ async fn watchdog(pipe_name: &'static str, prefix: &'static str, saw_healthy: Ar
     loop {
         tokio::time::sleep(PING_INTERVAL).await;
 
+        // healthy = the RPC answered in time AND reports SERVING; the UI
+        // flips itself to NOT_SERVING when its event loop stalls
         let ok = matches!(
             tokio::time::timeout(
                 PING_TIMEOUT,
@@ -273,7 +275,9 @@ async fn watchdog(pipe_name: &'static str, prefix: &'static str, saw_healthy: Ar
                 }),
             )
             .await,
-            Ok(Ok(_))
+            Ok(Ok(response))
+                if response.get_ref().status
+                    == tonic_health::pb::health_check_response::ServingStatus::Serving as i32
         );
 
         if ok && !saw_healthy.swap(true, Ordering::SeqCst) {

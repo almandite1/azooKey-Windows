@@ -1,5 +1,6 @@
 use std::cmp::max;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use azookey_server::TonicNamedPipeServer;
 use ipc::{WindowAction, WindowController, WindowService};
@@ -36,12 +37,24 @@ pub enum UserEvent {
     UpdateSelection(i32),
     UpdateInputMethod(String),
     WindowAction(WindowAction),
+    /// liveness probe: proves the event loop is still processing events
+    Heartbeat,
 }
+
+/// how often the event loop's liveness is probed
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// no processed heartbeat for this long = the event loop is stalled
+const HEARTBEAT_STALL_THRESHOLD: Duration = Duration::from_secs(15);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // obtain uiaccess token
-    prepare_uiaccess_token()?;
+    // obtain uiaccess token (on success this re-executes the process and
+    // never returns). Without UIAccess the candidate window may appear
+    // behind full-screen or elevated applications, but a working IME beats
+    // no candidate window at all — continue instead of dying.
+    if let Err(e) = prepare_uiaccess_token() {
+        eprintln!("UIAccess unavailable ({e}); continuing without it");
+    }
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event()
         .with_any_thread(true)
@@ -56,16 +69,11 @@ async fn main() -> anyhow::Result<()> {
 
     // start grpc server
     let incoming = TonicNamedPipeServer::new("azookey_ui")?;
-    // health service for the launcher's watchdog. Limitation: handlers only
-    // forward to the event loop via a channel, so this detects a hung tokio
-    // runtime but NOT a hung event loop (that case is covered by the
-    // process-exit-on-gRPC-death path below).
-    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
-    tokio::spawn(async move {
-        health_reporter
-            .set_service_status("", tonic_health::ServingStatus::Serving)
-            .await;
-    });
+    // health service for the launcher's watchdog. The reported status
+    // follows the EVENT LOOP's liveness (via the heartbeat below), so a
+    // stalled window loop turns the whole process NOT_SERVING even while
+    // the tokio runtime is fine — the launcher then restarts us.
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
     tokio::spawn(async move {
         println!("WindowServer listening");
         let result = Server::builder()
@@ -119,6 +127,38 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // event-loop liveness: periodically post a Heartbeat event and reflect
+    // whether the loop processed a recent one in the health status
+    let last_beat = Arc::new(std::sync::Mutex::new(Instant::now()));
+    {
+        let last_beat = last_beat.clone();
+        let proxy = event_loop_proxy.clone();
+        let mut health_reporter = health_reporter;
+        tokio::spawn(async move {
+            health_reporter
+                .set_service_status("", tonic_health::ServingStatus::Serving)
+                .await;
+
+            loop {
+                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                let _ = proxy.send_event(UserEvent::Heartbeat);
+
+                let stalled = last_beat
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .elapsed()
+                    > HEARTBEAT_STALL_THRESHOLD;
+                let status = if stalled {
+                    eprintln!("event loop has not processed a heartbeat recently");
+                    tonic_health::ServingStatus::NotServing
+                } else {
+                    tonic_health::ServingStatus::Serving
+                };
+                health_reporter.set_service_status("", status).await;
+            }
+        });
+    }
+
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
@@ -155,6 +195,17 @@ async fn main() -> anyhow::Result<()> {
                 UserEvent::UpdateHeight(height) => {
                     let width = candidate_window.inner_size().width as i32;
                     candidate_window.set_inner_size(LogicalSize::new(width, height));
+                }
+                UserEvent::Heartbeat => {
+                    // test hook: simulate a stalled event loop (inert unless
+                    // the env var is set)
+                    if std::env::var_os("AZOOKEY_TEST_BLOCK_EVENT_LOOP").is_some() {
+                        eprintln!("TEST MODE: blocking the event loop now");
+                        std::thread::sleep(std::time::Duration::MAX);
+                    }
+                    *last_beat
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
                 }
                 UserEvent::WindowAction(action) => {
                     match action {
