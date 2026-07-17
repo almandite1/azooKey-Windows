@@ -56,9 +56,20 @@ async fn main() -> anyhow::Result<()> {
 
     // start grpc server
     let incoming = TonicNamedPipeServer::new("azookey_ui")?;
+    // health service for the launcher's watchdog. Limitation: handlers only
+    // forward to the event loop via a channel, so this detects a hung tokio
+    // runtime but NOT a hung event loop (that case is covered by the
+    // process-exit-on-gRPC-death path below).
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    tokio::spawn(async move {
+        health_reporter
+            .set_service_status("", tonic_health::ServingStatus::Serving)
+            .await;
+    });
     tokio::spawn(async move {
         println!("WindowServer listening");
         let result = Server::builder()
+            .add_service(health_service)
             .add_service(WindowServiceServer::new(grpc_service))
             .serve_with_incoming(incoming)
             .await;
