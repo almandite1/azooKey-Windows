@@ -68,6 +68,25 @@ impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
     }
 }
 
+/// Collapses the selection to `range`. `TF_SELECTION.range` is
+/// `ManuallyDrop` and `SetSelection` is [in]-only, so the AddRef taken here
+/// must be released by us afterwards — win or lose — or the range leaks in
+/// the host application once per call.
+fn set_selection(context: &ITfContext, cookie: u32, range: &ITfRange) -> windows::core::Result<()> {
+    let selections = [TF_SELECTION {
+        range: ManuallyDrop::new(Some(range.clone())),
+        style: TF_SELECTIONSTYLE {
+            ase: TF_AE_NONE,
+            fInterimChar: false.into(),
+        },
+    }];
+
+    let result = unsafe { context.SetSelection(cookie, &selections) };
+    let [selection] = selections;
+    drop(ManuallyDrop::into_inner(selection.range));
+    result
+}
+
 impl TextServiceFactory {
     #[tracing::instrument]
     pub fn start_composition(&self) -> Result<()> {
@@ -149,15 +168,7 @@ impl TextServiceFactory {
 
                             // shift the start of the composition
                             range.Collapse(cookie, TF_ANCHOR_END)?;
-                            let selection = TF_SELECTION {
-                                range: ManuallyDrop::new(Some(range.clone())),
-                                style: TF_SELECTIONSTYLE {
-                                    ase: TF_AE_NONE,
-                                    fInterimChar: false.into(),
-                                },
-                            };
-
-                            context.SetSelection(cookie, &[selection])?;
+                            set_selection(&context, cookie, &range)?;
 
                             composition.EndComposition(cookie)?;
                             Ok(())
@@ -187,7 +198,9 @@ impl TextServiceFactory {
                 text_service.tid,
                 text_service.context()?,
                 Rc::new({
-                    let text_len = text.chars().count() as i32;
+                    // TSF measures ranges in UTF-16 code units (like ACP
+                    // offsets); chars() would undercount non-BMP characters
+                    let text_len = text.encode_utf16().count() as i32;
 
                     // unpadded is all you need!
                     let text = format!("{text}{subtext}").as_str().to_wide_16_unpadded();
@@ -211,15 +224,7 @@ impl TextServiceFactory {
                         }
 
                         range.Collapse(cookie, TF_ANCHOR_END)?;
-                        let selection = TF_SELECTION {
-                            range: ManuallyDrop::new(Some(range.clone())),
-                            style: TF_SELECTIONSTYLE {
-                                ase: TF_AE_NONE,
-                                fInterimChar: false.into(),
-                            },
-                        };
-
-                        context.SetSelection(cookie, &[selection])?;
+                        set_selection(&context, cookie, &range)?;
 
                         Ok(())
                     }
@@ -241,7 +246,10 @@ impl TextServiceFactory {
                 text_service.tid,
                 text_service.context()?,
                 Rc::new({
-                    let text_len = text.chars().count() as i32;
+                    // UTF-16 code units, not chars: a boundary computed with
+                    // chars() lands inside a surrogate pair on confirm and
+                    // the following SetText corrupts committed text
+                    let text_len = text.encode_utf16().count() as i32;
                     let subtext = subtext.to_wide_16_unpadded();
                     let context = text_service.context::<ITfContext>()?;
                     let display_attribute_atom = text_service.display_attribute_atom.clone();
@@ -273,15 +281,7 @@ impl TextServiceFactory {
                         }
 
                         range.Collapse(cookie, TF_ANCHOR_END)?;
-                        let selection = TF_SELECTION {
-                            range: ManuallyDrop::new(Some(range)),
-                            style: TF_SELECTIONSTYLE {
-                                ase: TF_AE_NONE,
-                                fInterimChar: false.into(),
-                            },
-                        };
-
-                        context.SetSelection(cookie, &[selection])?;
+                        set_selection(&context, cookie, &range)?;
 
                         Ok(())
                     }
@@ -383,9 +383,26 @@ mod tests {
     use super::*;
     use crate::tsf::test_support::{
         factory_with_fake_context, fake_context_of, EditSessionBehavior, FakeComposition,
-        FakeContext, FAKE_COOKIE,
+        FakeContext, RangeLog, FAKE_COOKIE,
     };
-    use windows::Win32::UI::TextServices::TF_ES_SYNC;
+    use windows::Win32::UI::TextServices::{ITfTextInputProcessor, TF_ES_SYNC};
+
+    /// A factory whose composition is live and whose ranges report into the
+    /// returned [`RangeLog`].
+    fn factory_with_live_composition() -> (ITfTextInputProcessor, Rc<RangeLog>) {
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let log = Rc::new(RangeLog::default());
+
+        let factory = unsafe { tip.as_impl() };
+        factory
+            .borrow()
+            .unwrap()
+            .borrow_mut_composition()
+            .unwrap()
+            .tip_composition = Some(FakeComposition::with_log(log.clone()));
+
+        (tip, log)
+    }
 
     /// B7: a denied session must surface as an error.
     ///
@@ -523,6 +540,93 @@ mod tests {
                 .is_none(),
             "the client must let go of a composition it cannot end, or it \
              will keep trying to reuse a dead one"
+        );
+    }
+
+    /// B9: TSF measures ranges in UTF-16 code units (the same unit as ACP
+    /// offsets), but the shift amounts were computed with `chars().count()`,
+    /// which counts a non-BMP character like 𠮷 (U+20BB7) as 1 instead of 2.
+    /// On confirm, the composition boundary lands in the middle of the
+    /// surrogate pair and the following SetText corrupts committed text.
+    #[test]
+    fn shift_start_measures_utf16_code_units() {
+        let (tip, log) = factory_with_live_composition();
+        let factory = unsafe { tip.as_impl() };
+
+        factory
+            .shift_start("\u{20BB7}", "a")
+            .expect("shift_start failed");
+
+        assert_eq!(
+            log.shift_start_reqs.borrow().as_slice(),
+            &[2],
+            "𠮷 is two UTF-16 code units; shifting by chars() splits the \
+             surrogate pair"
+        );
+    }
+
+    /// B9, display-attribute variant: the underline extent in `set_text` is
+    /// measured the same wrong way (visual glitch rather than corruption).
+    #[test]
+    fn set_text_measures_utf16_code_units() {
+        let (tip, log) = factory_with_live_composition();
+        let factory = unsafe { tip.as_impl() };
+
+        factory.set_text("\u{20BB7}", "").expect("set_text failed");
+
+        assert_eq!(
+            log.shift_end_reqs.borrow().as_slice(),
+            &[2],
+            "the underline extent must be measured in UTF-16 code units"
+        );
+    }
+
+    /// B10: `TF_SELECTION.range` is `ManuallyDrop`, and `SetSelection` is an
+    /// [in] parameter — the callee does not take ownership. The AddRef taken
+    /// by `range.clone()` (or the moved range itself in `shift_start`) is
+    /// never released, leaking one range per call — per keystroke, inside the
+    /// host application's process.
+    #[test]
+    fn set_text_releases_its_ranges() {
+        let (tip, log) = factory_with_live_composition();
+        let factory = unsafe { tip.as_impl() };
+
+        factory.set_text("か", "ん").expect("set_text failed");
+
+        assert_eq!(
+            log.live_ranges(),
+            0,
+            "every range obtained during set_text must be released"
+        );
+    }
+
+    /// B10 for `shift_start`, which moves its range into the selection.
+    #[test]
+    fn shift_start_releases_its_ranges() {
+        let (tip, log) = factory_with_live_composition();
+        let factory = unsafe { tip.as_impl() };
+
+        factory.shift_start("か", "ん").expect("shift_start failed");
+
+        assert_eq!(
+            log.live_ranges(),
+            0,
+            "every range obtained during shift_start must be released"
+        );
+    }
+
+    /// B10 for `end_composition`.
+    #[test]
+    fn end_composition_releases_its_ranges() {
+        let (tip, log) = factory_with_live_composition();
+        let factory = unsafe { tip.as_impl() };
+
+        factory.end_composition().expect("end_composition failed");
+
+        assert_eq!(
+            log.live_ranges(),
+            0,
+            "every range obtained during end_composition must be released"
         );
     }
 }

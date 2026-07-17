@@ -116,7 +116,8 @@ impl TextServiceFactory {
                 text_service.tid,
                 parent_context.clone(),
                 Rc::new({
-                    let preview_count = preview.chars().count() as i32;
+                    // ShiftEnd counts UTF-16 code units, not chars
+                    let preview_count = preview.encode_utf16().count() as i32;
 
                     move |cookie| {
                         // 2. Get the selection from the parent context.
@@ -133,7 +134,11 @@ impl TextServiceFactory {
                             return Ok(String::new());
                         }
 
-                        let range = match pselection[0].range.as_ref() {
+                        // GetSelection is [out]: the range arrives AddRef'd
+                        // inside a ManuallyDrop, so take ownership or it
+                        // leaks in the host app on every keystroke
+                        let selection_range = ManuallyDrop::take(&mut pselection[0].range);
+                        let range = match selection_range.as_ref() {
                             Some(range) => range.Clone()?,
                             None => return Ok(String::new()),
                         };

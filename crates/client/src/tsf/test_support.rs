@@ -17,19 +17,22 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::new_ret_no_self)]
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use windows::{
-    core::{implement, Result as WinResult, GUID, PCWSTR},
+    core::{implement, IUnknown, Result as WinResult, GUID, PCWSTR, PWSTR, VARIANT},
     Win32::{
         Foundation::{BOOL, E_FAIL, E_NOTIMPL, S_OK},
         System::Com::IDataObject,
         UI::TextServices::{
-            IEnumITfCompositionView, IEnumTfContextViews, IEnumTfProperties, ITfComposition,
-            ITfCompositionSink, ITfCompositionView, ITfComposition_Impl, ITfContext,
-            ITfContextComposition, ITfContextComposition_Impl, ITfContextView, ITfContext_Impl,
-            ITfDocumentMgr, ITfEditSession, ITfInsertAtSelection, ITfInsertAtSelection_Impl,
-            ITfProperty, ITfRange, ITfRangeBackup, ITfReadOnlyProperty,
-            INSERT_TEXT_AT_SELECTION_FLAGS, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_S_ASYNC, TS_STATUS,
+            IEnumITfCompositionView, IEnumTfContextViews, IEnumTfProperties, IEnumTfRanges,
+            ITfComposition, ITfCompositionSink, ITfCompositionView, ITfComposition_Impl,
+            ITfContext, ITfContextComposition, ITfContextComposition_Impl, ITfContextView,
+            ITfContext_Impl, ITfDocumentMgr, ITfEditSession, ITfInsertAtSelection,
+            ITfInsertAtSelection_Impl, ITfProperty, ITfPropertyStore, ITfProperty_Impl, ITfRange,
+            ITfRangeBackup, ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl,
+            INSERT_TEXT_AT_SELECTION_FLAGS, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_HALTCOND, TF_S_ASYNC,
+            TS_STATUS,
         },
     },
 };
@@ -131,7 +134,8 @@ impl ITfContext_Impl for FakeContext_Impl {
         _ulcount: u32,
         _pselection: *const windows::Win32::UI::TextServices::TF_SELECTION,
     ) -> WinResult<()> {
-        Err(E_NOTIMPL.into())
+        // [in]-only: the caller keeps ownership of the ranges it passed
+        Ok(())
     }
 
     fn GetStart(&self, _ec: u32) -> WinResult<ITfRange> {
@@ -155,7 +159,7 @@ impl ITfContext_Impl for FakeContext_Impl {
     }
 
     fn GetProperty(&self, _guidprop: *const GUID) -> WinResult<ITfProperty> {
-        Err(E_NOTIMPL.into())
+        Ok(FakeProperty.into())
     }
 
     fn GetAppProperty(&self, _guidprop: *const GUID) -> WinResult<ITfReadOnlyProperty> {
@@ -238,28 +242,317 @@ impl ITfInsertAtSelection_Impl for FakeContext_Impl {
     }
 }
 
-/// A stand-in for a live composition. Enough to make
-/// `Composition::tip_composition` non-`None`.
+/// Shared recorder for every [`FakeRange`] a test's composition hands out.
+///
+/// `live_ranges` counts range *objects* currently alive. windows-rs drops
+/// the Rust struct exactly when the COM refcount reaches zero, so a leaked
+/// AddRef (e.g. a `ManuallyDrop` clone that is never released) shows up
+/// here as a count that never returns to zero.
+#[derive(Default)]
+pub struct RangeLog {
+    pub shift_start_reqs: RefCell<Vec<i32>>,
+    pub shift_end_reqs: RefCell<Vec<i32>>,
+    live: Cell<isize>,
+}
+
+impl RangeLog {
+    pub fn live_ranges(&self) -> isize {
+        self.live.get()
+    }
+}
+
+/// A recording stand-in for a text range. `ShiftStart`/`ShiftEnd` log the
+/// requested cch (the unit-of-measure bug B9 asserts on) and report it as
+/// fully shifted; text operations succeed and return nothing.
+#[implement(ITfRange)]
+pub struct FakeRange {
+    log: Rc<RangeLog>,
+}
+
+impl FakeRange {
+    pub fn new(log: Rc<RangeLog>) -> ITfRange {
+        log.live.set(log.live.get() + 1);
+        FakeRange { log }.into()
+    }
+}
+
+impl Drop for FakeRange {
+    fn drop(&mut self) {
+        self.log.live.set(self.log.live.get() - 1);
+    }
+}
+
+impl ITfRange_Impl for FakeRange_Impl {
+    fn GetText(
+        &self,
+        _ec: u32,
+        _dwflags: u32,
+        _pchtext: PWSTR,
+        _cchmax: u32,
+        pcch: *mut u32,
+    ) -> WinResult<()> {
+        if !pcch.is_null() {
+            unsafe { *pcch = 0 };
+        }
+        Ok(())
+    }
+
+    fn SetText(&self, _ec: u32, _dwflags: u32, _pchtext: &PCWSTR, _cch: i32) -> WinResult<()> {
+        Ok(())
+    }
+
+    fn GetFormattedText(&self, _ec: u32) -> WinResult<IDataObject> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn GetEmbedded(
+        &self,
+        _ec: u32,
+        _rguidservice: *const GUID,
+        _riid: *const GUID,
+    ) -> WinResult<IUnknown> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn InsertEmbedded(
+        &self,
+        _ec: u32,
+        _dwflags: u32,
+        _pdataobject: Option<&IDataObject>,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn ShiftStart(
+        &self,
+        _ec: u32,
+        cchreq: i32,
+        pcch: *mut i32,
+        _phalt: *const TF_HALTCOND,
+    ) -> WinResult<()> {
+        self.log.shift_start_reqs.borrow_mut().push(cchreq);
+        if !pcch.is_null() {
+            unsafe { *pcch = cchreq };
+        }
+        Ok(())
+    }
+
+    fn ShiftEnd(
+        &self,
+        _ec: u32,
+        cchreq: i32,
+        pcch: *mut i32,
+        _phalt: *const TF_HALTCOND,
+    ) -> WinResult<()> {
+        self.log.shift_end_reqs.borrow_mut().push(cchreq);
+        if !pcch.is_null() {
+            unsafe { *pcch = cchreq };
+        }
+        Ok(())
+    }
+
+    fn ShiftStartToRange(
+        &self,
+        _ec: u32,
+        _prange: Option<&ITfRange>,
+        _apos: windows::Win32::UI::TextServices::TfAnchor,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn ShiftEndToRange(
+        &self,
+        _ec: u32,
+        _prange: Option<&ITfRange>,
+        _apos: windows::Win32::UI::TextServices::TfAnchor,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn ShiftStartRegion(
+        &self,
+        _ec: u32,
+        _dir: windows::Win32::UI::TextServices::TfShiftDir,
+    ) -> WinResult<BOOL> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn ShiftEndRegion(
+        &self,
+        _ec: u32,
+        _dir: windows::Win32::UI::TextServices::TfShiftDir,
+    ) -> WinResult<BOOL> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn IsEmpty(&self, _ec: u32) -> WinResult<BOOL> {
+        Ok(false.into())
+    }
+
+    fn Collapse(
+        &self,
+        _ec: u32,
+        _apos: windows::Win32::UI::TextServices::TfAnchor,
+    ) -> WinResult<()> {
+        Ok(())
+    }
+
+    fn IsEqualStart(
+        &self,
+        _ec: u32,
+        _pwith: Option<&ITfRange>,
+        _apos: windows::Win32::UI::TextServices::TfAnchor,
+    ) -> WinResult<BOOL> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn IsEqualEnd(
+        &self,
+        _ec: u32,
+        _pwith: Option<&ITfRange>,
+        _apos: windows::Win32::UI::TextServices::TfAnchor,
+    ) -> WinResult<BOOL> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn CompareStart(
+        &self,
+        _ec: u32,
+        _pwith: Option<&ITfRange>,
+        _apos: windows::Win32::UI::TextServices::TfAnchor,
+    ) -> WinResult<i32> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn CompareEnd(
+        &self,
+        _ec: u32,
+        _pwith: Option<&ITfRange>,
+        _apos: windows::Win32::UI::TextServices::TfAnchor,
+    ) -> WinResult<i32> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn AdjustForInsert(&self, _ec: u32, _cchinsert: u32) -> WinResult<BOOL> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn GetGravity(
+        &self,
+        _pgstart: *mut windows::Win32::UI::TextServices::TfGravity,
+        _pgend: *mut windows::Win32::UI::TextServices::TfGravity,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn SetGravity(
+        &self,
+        _ec: u32,
+        _gstart: windows::Win32::UI::TextServices::TfGravity,
+        _gend: windows::Win32::UI::TextServices::TfGravity,
+    ) -> WinResult<()> {
+        Ok(())
+    }
+
+    fn Clone(&self) -> WinResult<ITfRange> {
+        Ok(FakeRange::new(self.log.clone()))
+    }
+
+    fn GetContext(&self) -> WinResult<ITfContext> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
+/// A property that accepts SetValue/Clear and refuses everything else —
+/// enough for the display-attribute bookkeeping in the edit sessions.
+#[implement(ITfProperty)]
+pub struct FakeProperty;
+
+impl ITfReadOnlyProperty_Impl for FakeProperty_Impl {
+    fn GetType(&self) -> WinResult<GUID> {
+        Ok(GUID::zeroed())
+    }
+
+    fn EnumRanges(
+        &self,
+        _ec: u32,
+        _ppenum: *mut Option<IEnumTfRanges>,
+        _ptargetrange: Option<&ITfRange>,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn GetValue(&self, _ec: u32, _prange: Option<&ITfRange>) -> WinResult<VARIANT> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn GetContext(&self) -> WinResult<ITfContext> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
+impl ITfProperty_Impl for FakeProperty_Impl {
+    fn FindRange(
+        &self,
+        _ec: u32,
+        _prange: Option<&ITfRange>,
+        _pprange: *mut Option<ITfRange>,
+        _apos: windows::Win32::UI::TextServices::TfAnchor,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn SetValueStore(
+        &self,
+        _ec: u32,
+        _prange: Option<&ITfRange>,
+        _ppropstore: Option<&ITfPropertyStore>,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn SetValue(
+        &self,
+        _ec: u32,
+        _prange: Option<&ITfRange>,
+        _pvarvalue: *const VARIANT,
+    ) -> WinResult<()> {
+        Ok(())
+    }
+
+    fn Clear(&self, _ec: u32, _prange: Option<&ITfRange>) -> WinResult<()> {
+        Ok(())
+    }
+}
+
+/// A stand-in for a live composition. Hands out [`FakeRange`]s that all
+/// report into the same [`RangeLog`].
 #[implement(ITfComposition)]
-pub struct FakeComposition;
+pub struct FakeComposition {
+    log: Rc<RangeLog>,
+}
 
 impl FakeComposition {
     pub fn new() -> ITfComposition {
-        FakeComposition.into()
+        Self::with_log(Rc::new(RangeLog::default()))
+    }
+
+    pub fn with_log(log: Rc<RangeLog>) -> ITfComposition {
+        FakeComposition { log }.into()
     }
 }
 
 impl ITfComposition_Impl for FakeComposition_Impl {
     fn GetRange(&self) -> WinResult<ITfRange> {
-        Err(E_NOTIMPL.into())
+        Ok(FakeRange::new(self.log.clone()))
     }
 
     fn ShiftStart(&self, _ecwrite: u32, _pnewstart: Option<&ITfRange>) -> WinResult<()> {
-        Err(E_NOTIMPL.into())
+        Ok(())
     }
 
     fn ShiftEnd(&self, _ecwrite: u32, _pnewend: Option<&ITfRange>) -> WinResult<()> {
-        Err(E_NOTIMPL.into())
+        Ok(())
     }
 
     fn EndComposition(&self, _ecwrite: u32) -> WinResult<()> {
