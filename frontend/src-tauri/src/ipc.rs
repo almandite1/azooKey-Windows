@@ -1,17 +1,18 @@
 use anyhow::Result;
-use hyper_util::rt::TokioIo;
 use shared::proto::azookey_service_client::AzookeyServiceClient;
 use std::{sync::Arc, time::Duration};
-use tokio::{net::windows::named_pipe::ClientOptions, time};
-use tonic::transport::Endpoint;
-use tower::service_fn;
-use windows::Win32::Foundation::ERROR_PIPE_BUSY;
+use tokio::time;
+
+/// Upper bound for a single request to the server, including the lazy
+/// connection attempt — a missing or busy server must not hang the
+/// settings app.
+const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 // connect to kkc server
 #[derive(Debug, Clone)]
 pub struct IPCService {
     // kkc server client
-    azookey_client: AzookeyServiceClient<tonic::transport::channel::Channel>,
+    azookey_client: AzookeyServiceClient<tonic::transport::Channel>,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -19,30 +20,9 @@ impl IPCService {
     pub fn new() -> Result<Self> {
         let runtime = tokio::runtime::Runtime::new()?;
 
-        // bound the whole connection attempt: a busy pipe must not block
-        // the settings app forever
-        let server_channel = runtime.block_on(async {
-            let endpoint = Endpoint::try_from("http://[::]:50051")?;
-            let connect = endpoint.connect_with_connector(service_fn(|_| async {
-                let client = loop {
-                    match ClientOptions::new().open(r"\\.\pipe\azookey_server") {
-                        Ok(client) => break client,
-                        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
-                        Err(e) => return Err(e),
-                    }
-
-                    time::sleep(Duration::from_millis(50)).await;
-                };
-
-                Ok::<_, std::io::Error>(TokioIo::new(client))
-            }));
-
-            time::timeout(Duration::from_secs(3), connect)
-                .await
-                .map_err(|_| anyhow::anyhow!("timed out connecting to azookey server"))?
-                .map_err(anyhow::Error::from)
-        })?;
-
+        // lazy: no connection is attempted until the first RPC, and tonic
+        // reconnects automatically after the server restarts
+        let server_channel = shared::pipe::lazy_pipe_channel(shared::pipe::SERVER_PIPE)?;
         let azookey_client = AzookeyServiceClient::new(server_channel);
 
         Ok(Self {
@@ -55,10 +35,14 @@ impl IPCService {
 // implement methods to interact with kkc server
 impl IPCService {
     pub fn update_config(&mut self) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::UpdateConfigRequest {});
-        self.runtime
-            .clone()
-            .block_on(self.azookey_client.update_config(request))?;
+        let mut client = self.azookey_client.clone();
+        self.runtime.block_on(async move {
+            let request = tonic::Request::new(shared::proto::UpdateConfigRequest {});
+            time::timeout(RPC_TIMEOUT, client.update_config(request))
+                .await
+                .map_err(|_| anyhow::anyhow!("request to azookey server timed out"))?
+                .map_err(anyhow::Error::from)
+        })?;
 
         Ok(())
     }

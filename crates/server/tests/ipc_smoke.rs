@@ -12,33 +12,24 @@
 //! shrink → clear, including inputs that previously crashed the server
 //! (interior NUL bytes, empty strings).
 
-use hyper_util::rt::TokioIo;
 use shared::proto::azookey_service_client::AzookeyServiceClient;
-use tokio::net::windows::named_pipe::ClientOptions;
-use tonic::transport::Endpoint;
-use tower::service_fn;
 
 async fn connect() -> AzookeyServiceClient<tonic::transport::Channel> {
-    let channel = Endpoint::try_from("http://[::]:50051")
-        .unwrap()
-        .connect_with_connector(service_fn(|_| async {
-            // the server exposes one pipe instance at a time; retry while
-            // busy (tests run concurrently)
-            for _ in 0..100 {
-                match ClientOptions::new().open(r"\\.\pipe\azookey_server") {
-                    Ok(client) => return Ok(TokioIo::new(client)),
-                    Err(e) if e.raw_os_error() == Some(231) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            Err(std::io::Error::other("pipe stayed busy"))
-        }))
-        .await
-        .expect("server is not running; start it first (see file header)");
+    let channel = shared::pipe::lazy_pipe_channel(shared::pipe::SERVER_PIPE)
+        .expect("failed to build pipe channel");
+    let mut client = AzookeyServiceClient::new(channel);
 
-    AzookeyServiceClient::new(channel)
+    // readiness probe: the channel is lazy, so surface "server not running"
+    // here with a clear message instead of on the first real assertion
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        client.clear_text(shared::proto::ClearTextRequest {}),
+    )
+    .await
+    .expect("timed out connecting; is the server running? (see file header)")
+    .expect("server is not running; start it first (see file header)");
+
+    client
 }
 
 #[tokio::test]

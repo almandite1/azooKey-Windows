@@ -1,13 +1,10 @@
 use anyhow::Result;
-use hyper_util::rt::TokioIo;
 use shared::proto::{
     azookey_service_client::AzookeyServiceClient, window_service_client::WindowServiceClient,
 };
 use std::{future::Future, sync::Arc, time::Duration};
-use tokio::{net::windows::named_pipe::ClientOptions, time};
-use tonic::transport::{Channel, Endpoint};
-use tower::service_fn;
-use windows::Win32::Foundation::ERROR_PIPE_BUSY;
+use tokio::time;
+use tonic::transport::Channel;
 
 /// Upper bound for a single IPC round trip. Every request is issued from the
 /// host application's UI thread via block_on, so a hung server must fail the
@@ -78,8 +75,8 @@ impl IPCService {
         // on demand and tonic re-establishes the connection after transport
         // failures, so the IME recovers automatically when the server or UI
         // process restarts — without re-activating the text service.
-        let server_channel = Self::lazy_pipe_channel(r"\\.\pipe\azookey_server")?;
-        let ui_channel = Self::lazy_pipe_channel(r"\\.\pipe\azookey_ui")?;
+        let server_channel = shared::pipe::lazy_pipe_channel(shared::pipe::SERVER_PIPE)?;
+        let ui_channel = shared::pipe::lazy_pipe_channel(shared::pipe::UI_PIPE)?;
 
         let azookey_client = AzookeyServiceClient::new(server_channel);
         let window_client = WindowServiceClient::new(ui_channel);
@@ -90,29 +87,6 @@ impl IPCService {
             window_client,
             runtime: Arc::new(runtime),
         })
-    }
-
-    fn lazy_pipe_channel(pipe_name: &'static str) -> Result<Channel> {
-        // the URI is a placeholder; the connector below opens a named pipe
-        Ok(
-            Endpoint::try_from("http://[::]:50051")?.connect_with_connector_lazy(service_fn(
-                move |_| async move {
-                    let client = loop {
-                        match ClientOptions::new().open(pipe_name) {
-                            Ok(client) => break client,
-                            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
-                            Err(e) => return Err(e),
-                        }
-
-                        // retrying forever is fine here: the whole connection
-                        // attempt is bounded by RPC_TIMEOUT at the call site
-                        time::sleep(Duration::from_millis(50)).await;
-                    };
-
-                    Ok::<_, std::io::Error>(TokioIo::new(client))
-                },
-            )),
-        )
     }
 
     /// Runs one RPC on the internal runtime with a hard deadline.
