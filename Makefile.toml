@@ -40,6 +40,10 @@ description = "Copy necessary files"
 script_runner = "powershell"
 script_extension = "ps1"
 script  = """
+# fail fast: a missing artifact must fail the build, not ship a broken
+# installer (previously the exit code was whatever the last icacls returned)
+$ErrorActionPreference = "Stop"
+
 $str=$args[0]
 if ([string]::IsNullOrEmpty($str)) {
     $str = "debug"
@@ -48,7 +52,7 @@ if ([string]::IsNullOrEmpty($str)) {
 }
 
 
-mkdir build/x86 -Force
+mkdir build/x86 -Force | Out-Null
 
 cp target/$str/ui.exe build
 cp target/$str/azookey-server.exe build
@@ -64,15 +68,44 @@ cp -Recurse -Force llama_cpu build
 cp -Recurse -Force llama_cuda build
 cp -Recurse -Force llama_vulkan build
 
-cp $env:APPDATA/../Local/Programs/Swift/Runtimes/*/usr/bin/* build
+# pick ONE Swift runtime deterministically (the newest); a wildcard over all
+# installed runtimes let a random mix of versions end up in the installer
+$runtimeRoot = Join-Path $env:LOCALAPPDATA "Programs/Swift/Runtimes"
+$runtime = Get-ChildItem $runtimeRoot -Directory |
+    Sort-Object { [version]$_.Name } -Descending |
+    Select-Object -First 1
+if ($null -eq $runtime) { throw "no Swift runtime found under $runtimeRoot" }
+Write-Host "bundling Swift runtime $($runtime.Name)"
+cp "$($runtime.FullName)/usr/bin/*" build
 
 cp -Recurse -Force server-swift/azooKey_emoji_dictionary_storage/EmojiDictionary build
 cp -Recurse -Force server-swift/azooKey_dictionary_storage/Dictionary build
 
 cp zenz.gguf build
 
+# required artifacts must exist before the installer step
+$required = @(
+    "build/ui.exe",
+    "build/azookey-server.exe",
+    "build/azookey-server.dll",
+    "build/azookey_windows.dll",
+    "build/launcher.exe",
+    "build/x86/azookey_windows.dll",
+    "build/zenz.gguf",
+    "build/llama_cpu/llama.dll",
+    "build/swiftCore.dll",
+    "build/dispatch.dll",
+    "build/Dictionary",
+    "build/EmojiDictionary"
+)
+foreach ($f in $required) {
+    if (-not (Test-Path $f)) { throw "post_build: missing required artifact: $f" }
+}
+
 icacls build/azookey_windows.dll /grant "*S-1-15-2-1:(RX)"
+if ($LASTEXITCODE -ne 0) { throw "icacls failed for build/azookey_windows.dll" }
 icacls build/x86/azookey_windows.dll /grant "*S-1-15-2-1:(RX)"
+if ($LASTEXITCODE -ne 0) { throw "icacls failed for build/x86/azookey_windows.dll" }
 """
 args = ["${@}"]
 

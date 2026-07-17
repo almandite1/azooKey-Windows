@@ -4,6 +4,10 @@
 
 #define MyAppName "Azookey"
 #define MyAppVersion "0.1.0-alpha.1"
+; must match "version" in frontend/src-tauri/tauri.conf.json — the Tauri
+; NSIS installer filename below is derived from it
+#define TauriAppVersion "0.1.0"
+#define TauriSetupExe "Azookey_" + TauriAppVersion + "_x64-setup.exe"
 #define MyAppPublisher "fkunn1326"
 #define MyAppURL "https://github.com/fkunn1326/azooKey-Windows/"
 
@@ -42,8 +46,10 @@ Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 [Files]
 Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit
 Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit
-Source: "../build/*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "../target/release/bundle/nsis/Azookey_0.1.0_x64-setup.exe"; Flags: dontcopy noencryption
+; exclude the installer's own output (OutputDir is also ../build): a stale
+; azookey-setup.exe would otherwise be bundled into — or clash with — the new one
+Source: "../build/*"; Excludes: "azookey-setup.exe"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "../target/release/bundle/nsis/{#TauriSetupExe}"; Flags: dontcopy noencryption
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
@@ -65,10 +71,10 @@ Filename: "schtasks"; \
 [Code]
 function InitializeSetup: Boolean;
 begin
-  ExtractTemporaryFile('Azookey_0.1.0_x64-setup.exe');
+  ExtractTemporaryFile('{#TauriSetupExe}');
   Dependency_AddVC2015To2022x64;
   Dependency_AddVC2015To2022x86;
-  Dependency_Add('Azookey_0.1.0_x64-setup.exe',
+  Dependency_Add('{#TauriSetupExe}',
     '/q',
     'Azookey',
     '', '', True, False);
