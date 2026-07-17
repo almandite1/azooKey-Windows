@@ -248,7 +248,10 @@ impl AzookeyService for MyAzookeyService {
     }
 }
 
-#[tokio::main]
+// The Swift engine keeps @MainActor global state and its FFI exports are not
+// thread-safe. A single-threaded runtime serializes every FFI call onto one
+// OS thread; the default multi-threaded runtime crashes inside dispatch.dll.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("AzookeyServer started");
     // get executable directory
