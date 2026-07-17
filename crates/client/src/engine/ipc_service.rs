@@ -94,26 +94,32 @@ impl IPCService {
 
     fn lazy_pipe_channel(pipe_name: &'static str) -> Result<Channel> {
         // the URI is a placeholder; the connector below opens a named pipe
-        Ok(Endpoint::try_from("http://[::]:50051")?
-            .connect_with_connector_lazy(service_fn(move |_| async move {
-                let client = loop {
-                    match ClientOptions::new().open(pipe_name) {
-                        Ok(client) => break client,
-                        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
-                        Err(e) => return Err(e),
-                    }
+        Ok(
+            Endpoint::try_from("http://[::]:50051")?.connect_with_connector_lazy(service_fn(
+                move |_| async move {
+                    let client = loop {
+                        match ClientOptions::new().open(pipe_name) {
+                            Ok(client) => break client,
+                            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
+                            Err(e) => return Err(e),
+                        }
 
-                    // retrying forever is fine here: the whole connection
-                    // attempt is bounded by RPC_TIMEOUT at the call site
-                    time::sleep(Duration::from_millis(50)).await;
-                };
+                        // retrying forever is fine here: the whole connection
+                        // attempt is bounded by RPC_TIMEOUT at the call site
+                        time::sleep(Duration::from_millis(50)).await;
+                    };
 
-                Ok::<_, std::io::Error>(TokioIo::new(client))
-            })))
+                    Ok::<_, std::io::Error>(TokioIo::new(client))
+                },
+            )),
+        )
     }
 
     /// Runs one RPC on the internal runtime with a hard deadline.
-    fn exec<T>(&self, fut: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>) -> Result<T> {
+    fn exec<T>(
+        &self,
+        fut: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    ) -> Result<T> {
         self.runtime.block_on(async {
             time::timeout(RPC_TIMEOUT, fut)
                 .await

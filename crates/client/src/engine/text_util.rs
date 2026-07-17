@@ -150,3 +150,35 @@ pub fn to_half_katakana(s: &str) -> String {
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hiragana_becomes_katakana() {
+        assert_eq!(to_katakana("かな"), "カナ");
+        assert_eq!(to_katakana("がぎゃんゔ"), "ガギャンヴ");
+    }
+
+    #[test]
+    fn katakana_conversion_passes_through_unmapped_chars() {
+        assert_eq!(to_katakana("カナ漢a1"), "カナ漢a1");
+        assert_eq!(to_katakana(""), "");
+    }
+
+    #[test]
+    fn hiragana_becomes_half_katakana() {
+        assert_eq!(to_half_katakana("かな"), "ｶﾅ");
+        // voiced/semi-voiced marks become separate halfwidth codepoints
+        assert_eq!(to_half_katakana("がぱ"), "ｶﾞﾊﾟ");
+    }
+
+    #[test]
+    fn half_katakana_converts_fullwidth_symbols_too() {
+        // characterization: the long-vowel mark is halfwidth-ized to "-"
+        // (not the halfwidth-kana "ｰ") by the current implementation
+        assert_eq!(to_half_katakana("らーめん"), "ﾗ-ﾒﾝ");
+        assert_eq!(to_half_katakana(""), "");
+    }
+}

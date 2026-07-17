@@ -61,7 +61,10 @@ async fn append_and_clear_roundtrip() {
         .expect("append_text failed")
         .into_inner();
     let composing = response.composing_text.expect("composing_text missing");
-    assert!(!composing.hiragana.is_empty(), "hiragana should not be empty");
+    assert!(
+        !composing.hiragana.is_empty(),
+        "hiragana should not be empty"
+    );
 
     let response = client
         .append_text(shared::proto::AppendTextRequest {
@@ -128,7 +131,10 @@ async fn hostile_inputs_do_not_kill_the_server() {
         .expect("server no longer responds")
         .into_inner();
     assert_eq!(
-        response.composing_text.expect("composing_text missing").hiragana,
+        response
+            .composing_text
+            .expect("composing_text missing")
+            .hiragana,
         "あ"
     );
 

@@ -166,3 +166,39 @@ pub fn to_fullwidth(s: &str, process_alphabet: bool) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbols_are_converted_to_fullwidth() {
+        assert_eq!(to_fullwidth("!?", false), "！？");
+        assert_eq!(to_fullwidth("-", false), "ー");
+        assert_eq!(to_fullwidth(",.", false), "、。");
+        assert_eq!(to_fullwidth("[]", false), "「」");
+    }
+
+    #[test]
+    fn alphabet_is_kept_halfwidth_unless_requested() {
+        // roman input is sent to the engine as halfwidth ASCII
+        assert_eq!(to_fullwidth("ka", false), "ka");
+        assert_eq!(to_fullwidth("ka", true), "ｋａ");
+    }
+
+    #[test]
+    fn unmapped_characters_pass_through() {
+        assert_eq!(to_fullwidth("あ漢1", false), "あ漢1");
+        assert_eq!(to_fullwidth("", false), "");
+        assert_eq!(to_halfwidth("あ漢A"), "あ漢A");
+        assert_eq!(to_halfwidth(""), "");
+    }
+
+    #[test]
+    fn halfwidth_reverses_fullwidth_symbols() {
+        for half in ["!", "?", "(", ")", "[", "]", "-", ",", "."] {
+            let full = to_fullwidth(half, false);
+            assert_eq!(to_halfwidth(&full), half, "roundtrip failed for {half}");
+        }
+    }
+}

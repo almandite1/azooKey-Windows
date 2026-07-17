@@ -23,21 +23,19 @@ impl IPCService {
         // the settings app forever
         let server_channel = runtime.block_on(async {
             let endpoint = Endpoint::try_from("http://[::]:50051")?;
-            let connect = endpoint.connect_with_connector(
-                service_fn(|_| async {
-                    let client = loop {
-                        match ClientOptions::new().open(r"\\.\pipe\azookey_server") {
-                            Ok(client) => break client,
-                            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
-                            Err(e) => return Err(e),
-                        }
+            let connect = endpoint.connect_with_connector(service_fn(|_| async {
+                let client = loop {
+                    match ClientOptions::new().open(r"\\.\pipe\azookey_server") {
+                        Ok(client) => break client,
+                        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
+                        Err(e) => return Err(e),
+                    }
 
-                        time::sleep(Duration::from_millis(50)).await;
-                    };
+                    time::sleep(Duration::from_millis(50)).await;
+                };
 
-                    Ok::<_, std::io::Error>(TokioIo::new(client))
-                }),
-            );
+                Ok::<_, std::io::Error>(TokioIo::new(client))
+            }));
 
             time::timeout(Duration::from_secs(3), connect)
                 .await

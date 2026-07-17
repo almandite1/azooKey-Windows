@@ -121,8 +121,8 @@ async fn main() -> anyhow::Result<()> {
             } => *control_flow = ControlFlow::Exit,
             Event::UserEvent(script) => match script {
                 UserEvent::UpdateCandidates(candidates) => {
-                    if let Err(e) =
-                        candidate_webview.evaluate_script(&format!("updateCandidates({})", candidates))
+                    if let Err(e) = candidate_webview
+                        .evaluate_script(&format!("updateCandidates({})", candidates))
                     {
                         eprintln!("evaluate_script failed: {e}");
                     }
@@ -247,8 +247,7 @@ async fn main() -> anyhow::Result<()> {
                                 .send_event(UserEvent::UpdateCandidates(candidates));
                         }
                         WindowAction::SetSelection { index } => {
-                            let _ =
-                                event_loop_proxy.send_event(UserEvent::UpdateSelection(index));
+                            let _ = event_loop_proxy.send_event(UserEvent::UpdateSelection(index));
                         }
                         WindowAction::SetInputMode(input_method) => {
                             let _ = event_loop_proxy

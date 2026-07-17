@@ -67,9 +67,7 @@ impl AsyncWrite for TonicNamedPipeServer {
 }
 
 impl TonicNamedPipeServer {
-    pub fn new(
-        path: &str,
-    ) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>>> {
+    pub fn new(path: &str) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>>> {
         // set security attributes to allow ipc from sandboxed processes
         // see https://nathancorvussolis.blogspot.com/2018/05/windows-ime-security.html
 

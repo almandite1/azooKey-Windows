@@ -78,6 +78,12 @@ jobs:
     - name: Build
       run: cargo make build --release
 
+    # after Build so azookey-server.lib exists for linking the server's
+    # test harness; --ignored FFI smoke tests need a live server and are
+    # excluded by default
+    - name: Test
+      run: cargo test --workspace --release
+
     - name: Upload Setup Artifact
       uses: actions/upload-artifact@v4
       with:

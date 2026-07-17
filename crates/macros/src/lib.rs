@@ -35,7 +35,7 @@ fn extract_ok_type(return_type: &ReturnType) -> Result<&Type, TokenStream> {
 /// If the function returns `anyhow::Result<OkType>`, it will be converted to `windows::core::Result<OkType>`.
 ///
 ///
-/// ```rust
+/// ```ignore
 /// #[macros::anyhow]
 /// fn some_func() -> anyhow::Result<Sometype> {
 ///     Ok(Sometype)
