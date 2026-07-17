@@ -93,6 +93,10 @@ impl TonicNamedPipeServer {
             });
 
             Ok(stream! {
+                // startup failure is fatal (e.g. another instance already
+                // owns the pipe), but once serving, transient accept or
+                // instance-creation errors must not tear down the whole
+                // gRPC server — log and retry instead of yielding Err
                 let mut server = ServerOptions::new()
                     .first_pipe_instance(true)
                     .create_with_security_attributes_raw(
@@ -101,19 +105,28 @@ impl TonicNamedPipeServer {
                     )?;
 
                 loop {
-                    server.connect().await?;
+                    match server.connect().await {
+                        Ok(()) => {
+                            yield Ok(TonicNamedPipeServer { inner: server });
+                        }
+                        Err(e) => {
+                            eprintln!("named pipe accept failed: {e}");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
 
-                    let client = TonicNamedPipeServer {
-                        inner: server,
-                    };
-
-                    yield Ok(client);
-
-                    server = ServerOptions::new()
-                        .create_with_security_attributes_raw(
+                    server = loop {
+                        match ServerOptions::new().create_with_security_attributes_raw(
                             &name,
-                            addr_of_mut!(security_attributes) as *mut c_void
-                        )?;
+                            addr_of_mut!(security_attributes) as *mut c_void,
+                        ) {
+                            Ok(s) => break s,
+                            Err(e) => {
+                                eprintln!("failed to create next pipe instance: {e}");
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        }
+                    };
                 }
             })
         }

@@ -32,14 +32,22 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         dll_instance.add_ref();
 
         // initialize ipc_service
-        if let Ok(mut ipc_service) = ipc_service::IPCService::new() {
-            ipc_service.append_text("".to_string())?;
-            IMEState::get()?.ipc_service = Some(ipc_service);
-        } else {
-            // Activate() should not return an error
-            // if Activate() returns an error, the icon of the previously activated TextService will be displayed, which may confuse the user
-            tracing::error!("Failed to initialize IPC service");
-            return Ok(());
+        // Activate() should not return an error: if it does, the icon of the
+        // previously activated TextService is displayed, confusing the user.
+        match ipc_service::IPCService::new() {
+            Ok(mut ipc_service) => {
+                // warm up the lazy connection; if the server is not running
+                // yet this fails harmlessly and the channel reconnects on
+                // the next keystroke
+                if let Err(e) = ipc_service.append_text("".to_string()) {
+                    tracing::warn!("azookey server not reachable yet: {e}");
+                }
+                IMEState::get()?.ipc_service = Some(ipc_service);
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize IPC service: {e}");
+                return Ok(());
+            }
         }
 
         let mut text_service = self.borrow_mut()?;

@@ -327,7 +327,7 @@ impl TextServiceFactory {
                                 rect.left,
                                 rect.bottom,
                                 rect.right,
-                            )?;
+                            );
 
                             Ok(())
                         }

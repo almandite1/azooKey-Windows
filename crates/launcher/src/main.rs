@@ -1,7 +1,13 @@
 use shared::AppConfig;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 use std::{env, thread};
+
+/// give up when a child keeps crashing this many times within RESTART_WINDOW
+const MAX_RESTARTS_IN_WINDOW: usize = 5;
+const RESTART_WINDOW: Duration = Duration::from_secs(60);
+const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
 fn main() -> anyhow::Result<()> {
     let config = AppConfig::new();
@@ -24,18 +30,64 @@ fn main() -> anyhow::Result<()> {
     new_path = format!("{};{}", backend_path_str, new_path);
     env::set_var("PATH", &new_path);
 
-    let server_process = start_process("azookey-server.exe", "[server]");
-    let ui_process = start_process("ui.exe", "[ui]");
+    // a crashed server would otherwise leave the IME dead in every
+    // application until re-login, so both children are supervised and
+    // restarted with backoff
+    let server_handle = thread::spawn(|| supervise("azookey-server.exe", "[server]"));
+    let ui_handle = thread::spawn(|| supervise("ui.exe", "[ui]"));
 
-    if let (Some(mut server), Some(mut ui)) = (server_process, ui_process) {
-        let server_handle = thread::spawn(move || server.wait());
-        let ui_handle = thread::spawn(move || ui.wait());
-
-        let _ = server_handle.join();
-        let _ = ui_handle.join();
-    }
+    let _ = server_handle.join();
+    let _ = ui_handle.join();
 
     Ok(())
+}
+
+/// Keeps a child process running: restarts it when it exits abnormally,
+/// with exponential backoff, and gives up on a tight crash loop.
+fn supervise(exe: &str, prefix: &str) {
+    let mut recent_restarts: Vec<Instant> = Vec::new();
+    let mut backoff = Duration::from_secs(1);
+
+    loop {
+        let Some(mut child) = start_process(exe, prefix) else {
+            // spawn failure (e.g. missing binary) won't fix itself
+            eprintln!("{prefix} could not be started; giving up");
+            return;
+        };
+
+        let started_at = Instant::now();
+        match child.wait() {
+            Ok(status) if status.success() => {
+                println!("{prefix} exited normally");
+                return;
+            }
+            Ok(status) => eprintln!("{prefix} exited abnormally: {status}"),
+            Err(e) => {
+                eprintln!("{prefix} wait failed: {e}");
+                return;
+            }
+        }
+
+        // a stable stretch resets the backoff
+        if started_at.elapsed() >= RESTART_WINDOW {
+            backoff = Duration::from_secs(1);
+            recent_restarts.clear();
+        }
+
+        let now = Instant::now();
+        recent_restarts.retain(|t| now.duration_since(*t) < RESTART_WINDOW);
+        if recent_restarts.len() >= MAX_RESTARTS_IN_WINDOW {
+            eprintln!(
+                "{prefix} crashed {MAX_RESTARTS_IN_WINDOW} times within {RESTART_WINDOW:?}; giving up"
+            );
+            return;
+        }
+        recent_restarts.push(now);
+
+        eprintln!("{prefix} restarting in {backoff:?}");
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
 }
 
 fn start_process(exe: &str, prefix: &str) -> Option<Child> {

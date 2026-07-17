@@ -355,7 +355,7 @@ impl TextServiceFactory {
                 ClientAction::StartComposition => {
                     self.start_composition()?;
                     self.update_pos()?;
-                    ipc_service.show_window()?;
+                    ipc_service.show_window();
                 }
                 ClientAction::EndComposition => {
                     self.end_composition()?;
@@ -365,8 +365,8 @@ impl TextServiceFactory {
                     suffix.clear();
                     raw_input.clear();
                     raw_hiragana.clear();
-                    ipc_service.hide_window()?;
-                    ipc_service.set_candidates(vec![])?;
+                    ipc_service.hide_window();
+                    ipc_service.set_candidates(vec![]);
                     ipc_service.clear_text()?;
                 }
                 ClientAction::AppendText(text) => {
@@ -388,8 +388,8 @@ impl TextServiceFactory {
                     raw_hiragana = hiragana.clone();
 
                     self.set_text(&text, &sub_text)?;
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
+                    ipc_service.set_candidates(candidates.texts.clone());
+                    ipc_service.set_selection(selection_index as i32);
                 }
                 ClientAction::RemoveText => {
                     candidates = ipc_service.remove_text()?;
@@ -406,8 +406,8 @@ impl TextServiceFactory {
                     raw_hiragana = hiragana.clone();
 
                     self.set_text(&text, &sub_text)?;
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
+                    ipc_service.set_candidates(candidates.texts.clone());
+                    ipc_service.set_selection(selection_index as i32);
                 }
                 ClientAction::MoveCursor(_offset) => {
                     // TODO: I'll use azookey-kkc's composingText
@@ -429,7 +429,7 @@ impl TextServiceFactory {
                         InputMode::Kana => "あ",
                     };
 
-                    ipc_service.set_input_mode(mode)?;
+                    ipc_service.set_input_mode(mode);
 
                     selection_index = 0;
                     corresponding_count = 0;
@@ -458,7 +458,7 @@ impl TextServiceFactory {
                     }
                     .clamp(0, max(0, texts.len() as i32 - 1));
 
-                    ipc_service.set_selection(selection_index as i32)?;
+                    ipc_service.set_selection(selection_index as i32);
                     let (text, sub_text, count) = candidates.entry(selection_index as usize);
                     let hiragana = candidates.hiragana.clone();
                     corresponding_count = count;
@@ -494,8 +494,8 @@ impl TextServiceFactory {
                     suffix = sub_text.clone();
                     raw_hiragana = hiragana.clone();
 
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
+                    ipc_service.set_candidates(candidates.texts.clone());
+                    ipc_service.set_selection(selection_index as i32);
                     self.update_pos()?;
 
                     transition = CompositionState::Composing;

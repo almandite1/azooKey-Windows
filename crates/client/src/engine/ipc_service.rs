@@ -3,19 +3,24 @@ use hyper_util::rt::TokioIo;
 use shared::proto::{
     azookey_service_client::AzookeyServiceClient, window_service_client::WindowServiceClient,
 };
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 use tokio::{net::windows::named_pipe::ClientOptions, time};
-use tonic::transport::Endpoint;
+use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 use windows::Win32::Foundation::ERROR_PIPE_BUSY;
+
+/// Upper bound for a single IPC round trip. Every request is issued from the
+/// host application's UI thread via block_on, so a hung server must fail the
+/// request instead of freezing the host application forever.
+const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 // connect to kkc server
 #[derive(Debug, Clone)]
 pub struct IPCService {
     // kkc server client
-    azookey_client: AzookeyServiceClient<tonic::transport::channel::Channel>,
+    azookey_client: AzookeyServiceClient<Channel>,
     // candidate window server client
-    window_client: WindowServiceClient<tonic::transport::channel::Channel>,
+    window_client: WindowServiceClient<Channel>,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -42,54 +47,79 @@ impl Candidates {
     }
 }
 
+impl From<shared::proto::ComposingText> for Candidates {
+    fn from(composing_text: shared::proto::ComposingText) -> Self {
+        Candidates {
+            texts: composing_text
+                .suggestions
+                .iter()
+                .map(|s| s.text.clone())
+                .collect(),
+            sub_texts: composing_text
+                .suggestions
+                .iter()
+                .map(|s| s.subtext.clone())
+                .collect(),
+            hiragana: composing_text.hiragana,
+            corresponding_count: composing_text
+                .suggestions
+                .iter()
+                .map(|s| s.corresponding_count)
+                .collect(),
+        }
+    }
+}
+
 impl IPCService {
     pub fn new() -> Result<Self> {
         let runtime = tokio::runtime::Runtime::new()?;
 
-        let server_channel = runtime.block_on(
-            Endpoint::try_from("http://[::]:50051")?.connect_with_connector(service_fn(
-                |_| async {
-                    let client = loop {
-                        match ClientOptions::new().open(r"\\.\pipe\azookey_server") {
-                            Ok(client) => break client,
-                            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
-                            Err(e) => return Err(e),
-                        }
-
-                        time::sleep(Duration::from_millis(50)).await;
-                    };
-
-                    Ok::<_, std::io::Error>(TokioIo::new(client))
-                },
-            )),
-        )?;
-
-        let ui_channel = runtime.block_on(
-            Endpoint::try_from("http://[::]:50052")?.connect_with_connector(service_fn(
-                |_| async {
-                    let client = loop {
-                        match ClientOptions::new().open(r"\\.\pipe\azookey_ui") {
-                            Ok(client) => break client,
-                            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
-                            Err(e) => return Err(e),
-                        }
-
-                        time::sleep(Duration::from_millis(50)).await;
-                    };
-
-                    Ok::<_, std::io::Error>(TokioIo::new(client))
-                },
-            )),
-        )?;
+        // lazy channels: no connection is attempted here. Each RPC connects
+        // on demand and tonic re-establishes the connection after transport
+        // failures, so the IME recovers automatically when the server or UI
+        // process restarts — without re-activating the text service.
+        let server_channel = Self::lazy_pipe_channel(r"\\.\pipe\azookey_server")?;
+        let ui_channel = Self::lazy_pipe_channel(r"\\.\pipe\azookey_ui")?;
 
         let azookey_client = AzookeyServiceClient::new(server_channel);
         let window_client = WindowServiceClient::new(ui_channel);
-        tracing::debug!("Connected to server: {:?}", azookey_client);
+        tracing::debug!("Created lazy IPC channels: {:?}", azookey_client);
 
         Ok(Self {
             azookey_client,
             window_client,
             runtime: Arc::new(runtime),
+        })
+    }
+
+    fn lazy_pipe_channel(pipe_name: &'static str) -> Result<Channel> {
+        // the URI is a placeholder; the connector below opens a named pipe
+        Ok(Endpoint::try_from("http://[::]:50051")?
+            .connect_with_connector_lazy(service_fn(move |_| async move {
+                let client = loop {
+                    match ClientOptions::new().open(pipe_name) {
+                        Ok(client) => break client,
+                        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
+                        Err(e) => return Err(e),
+                    }
+
+                    // retrying forever is fine here: the whole connection
+                    // attempt is bounded by RPC_TIMEOUT at the call site
+                    time::sleep(Duration::from_millis(50)).await;
+                };
+
+                Ok::<_, std::io::Error>(TokioIo::new(client))
+            })))
+    }
+
+    /// Runs one RPC on the internal runtime with a hard deadline.
+    fn exec<T>(&self, fut: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>) -> Result<T> {
+        self.runtime.block_on(async {
+            time::timeout(RPC_TIMEOUT, fut)
+                .await
+                .map_err(|_| anyhow::anyhow!("IPC request timed out after {RPC_TIMEOUT:?}"))?
+                .map_err(anyhow::Error::from)
+                .map(|response| response.into_inner())
         })
     }
 }
@@ -98,208 +128,172 @@ impl IPCService {
 impl IPCService {
     #[tracing::instrument]
     pub fn append_text(&mut self, text: String) -> anyhow::Result<Candidates> {
-        let request = tonic::Request::new(shared::proto::AppendTextRequest {
-            text_to_append: text,
-        });
+        let mut client = self.azookey_client.clone();
+        let response = self.exec(async move {
+            client
+                .append_text(tonic::Request::new(shared::proto::AppendTextRequest {
+                    text_to_append: text,
+                }))
+                .await
+        })?;
 
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.append_text(request))?;
-        let composing_text = response.into_inner().composing_text;
-
-        let candidates = if let Some(composing_text) = composing_text {
-            Candidates {
-                texts: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.text.clone())
-                    .collect(),
-                sub_texts: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.subtext.clone())
-                    .collect(),
-                hiragana: composing_text.hiragana,
-                corresponding_count: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.corresponding_count)
-                    .collect(),
-            }
-        } else {
-            anyhow::bail!("composing_text is None");
-        };
-
-        Ok(candidates)
+        response
+            .composing_text
+            .map(Candidates::from)
+            .ok_or_else(|| anyhow::anyhow!("composing_text is None"))
     }
 
     #[tracing::instrument]
     pub fn remove_text(&mut self) -> anyhow::Result<Candidates> {
-        let request = tonic::Request::new(shared::proto::RemoveTextRequest {});
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.remove_text(request))?;
-        let composing_text = response.into_inner().composing_text;
+        let mut client = self.azookey_client.clone();
+        let response = self.exec(async move {
+            client
+                .remove_text(tonic::Request::new(shared::proto::RemoveTextRequest {}))
+                .await
+        })?;
 
-        let candidates = if let Some(composing_text) = composing_text {
-            Candidates {
-                texts: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.text.clone())
-                    .collect(),
-                sub_texts: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.subtext.clone())
-                    .collect(),
-                hiragana: composing_text.hiragana,
-                corresponding_count: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.corresponding_count)
-                    .collect(),
-            }
-        } else {
-            anyhow::bail!("composing_text is None");
-        };
-
-        Ok(candidates)
+        response
+            .composing_text
+            .map(Candidates::from)
+            .ok_or_else(|| anyhow::anyhow!("composing_text is None"))
     }
 
     #[tracing::instrument]
     pub fn clear_text(&mut self) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::ClearTextRequest {});
-        let _response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.clear_text(request))?;
+        let mut client = self.azookey_client.clone();
+        self.exec(async move {
+            client
+                .clear_text(tonic::Request::new(shared::proto::ClearTextRequest {}))
+                .await
+        })?;
 
         Ok(())
     }
 
     #[tracing::instrument]
     pub fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
-        let request = tonic::Request::new(shared::proto::ShrinkTextRequest { offset });
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.shrink_text(request))?;
-        let composing_text = response.into_inner().composing_text;
+        let mut client = self.azookey_client.clone();
+        let response = self.exec(async move {
+            client
+                .shrink_text(tonic::Request::new(shared::proto::ShrinkTextRequest {
+                    offset,
+                }))
+                .await
+        })?;
 
-        let candidates = if let Some(composing_text) = composing_text {
-            Candidates {
-                texts: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.text.clone())
-                    .collect(),
-                sub_texts: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.subtext.clone())
-                    .collect(),
-                hiragana: composing_text.hiragana,
-                corresponding_count: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.corresponding_count)
-                    .collect(),
-            }
-        } else {
-            anyhow::bail!("composing_text is None");
-        };
-
-        Ok(candidates)
+        response
+            .composing_text
+            .map(Candidates::from)
+            .ok_or_else(|| anyhow::anyhow!("composing_text is None"))
     }
 
     pub fn set_context(&mut self, context: String) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::SetContextRequest { context });
-        let _response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.set_context(request))?;
+        let mut client = self.azookey_client.clone();
+        self.exec(async move {
+            client
+                .set_context(tonic::Request::new(shared::proto::SetContextRequest {
+                    context,
+                }))
+                .await
+        })?;
 
         Ok(())
     }
 }
 
-// implement methods to interact with candidate window server
+// implement methods to interact with the candidate window server.
+// window RPCs are cosmetic: a dead or slow UI process must not break text
+// input, so failures are logged and swallowed instead of propagated.
 impl IPCService {
     #[tracing::instrument]
-    pub fn show_window(&mut self) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::EmptyResponse {});
-        self.runtime
-            .clone()
-            .block_on(self.window_client.show_window(request))?;
-
-        Ok(())
-    }
-
-    #[tracing::instrument]
-    pub fn hide_window(&mut self) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::EmptyResponse {});
-        self.runtime
-            .clone()
-            .block_on(self.window_client.hide_window(request))?;
-
-        Ok(())
-    }
-
-    #[tracing::instrument]
-    pub fn set_window_position(
-        &mut self,
-        top: i32,
-        left: i32,
-        bottom: i32,
-        right: i32,
-    ) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::SetPositionRequest {
-            position: Some(shared::proto::WindowPosition {
-                top,
-                left,
-                bottom,
-                right,
-            }),
+    pub fn show_window(&mut self) {
+        let mut client = self.window_client.clone();
+        let result = self.exec(async move {
+            client
+                .show_window(tonic::Request::new(shared::proto::EmptyResponse {}))
+                .await
         });
-        self.runtime
-            .clone()
-            .block_on(self.window_client.set_window_position(request))?;
-
-        Ok(())
+        if let Err(e) = result {
+            tracing::warn!("show_window failed: {e}");
+        }
     }
 
     #[tracing::instrument]
-    pub fn set_candidates(&mut self, candidates: Vec<String>) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::SetCandidateRequest { candidates });
-        self.runtime
-            .clone()
-            .block_on(self.window_client.set_candidate(request))?;
-
-        Ok(())
-    }
-
-    #[tracing::instrument]
-    pub fn set_selection(&mut self, index: i32) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::SetSelectionRequest { index });
-        self.runtime
-            .clone()
-            .block_on(self.window_client.set_selection(request))?;
-
-        Ok(())
-    }
-
-    #[tracing::instrument]
-    pub fn set_input_mode(&mut self, mode: &str) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::SetInputModeRequest {
-            mode: mode.to_string(),
+    pub fn hide_window(&mut self) {
+        let mut client = self.window_client.clone();
+        let result = self.exec(async move {
+            client
+                .hide_window(tonic::Request::new(shared::proto::EmptyResponse {}))
+                .await
         });
-        self.runtime
-            .clone()
-            .block_on(self.window_client.set_input_mode(request))?;
+        if let Err(e) = result {
+            tracing::warn!("hide_window failed: {e}");
+        }
+    }
 
-        Ok(())
+    #[tracing::instrument]
+    pub fn set_window_position(&mut self, top: i32, left: i32, bottom: i32, right: i32) {
+        let mut client = self.window_client.clone();
+        let result = self.exec(async move {
+            client
+                .set_window_position(tonic::Request::new(shared::proto::SetPositionRequest {
+                    position: Some(shared::proto::WindowPosition {
+                        top,
+                        left,
+                        bottom,
+                        right,
+                    }),
+                }))
+                .await
+        });
+        if let Err(e) = result {
+            tracing::warn!("set_window_position failed: {e}");
+        }
+    }
+
+    #[tracing::instrument]
+    pub fn set_candidates(&mut self, candidates: Vec<String>) {
+        let mut client = self.window_client.clone();
+        let result = self.exec(async move {
+            client
+                .set_candidate(tonic::Request::new(shared::proto::SetCandidateRequest {
+                    candidates,
+                }))
+                .await
+        });
+        if let Err(e) = result {
+            tracing::warn!("set_candidates failed: {e}");
+        }
+    }
+
+    #[tracing::instrument]
+    pub fn set_selection(&mut self, index: i32) {
+        let mut client = self.window_client.clone();
+        let result = self.exec(async move {
+            client
+                .set_selection(tonic::Request::new(shared::proto::SetSelectionRequest {
+                    index,
+                }))
+                .await
+        });
+        if let Err(e) = result {
+            tracing::warn!("set_selection failed: {e}");
+        }
+    }
+
+    #[tracing::instrument]
+    pub fn set_input_mode(&mut self, mode: &str) {
+        let mut client = self.window_client.clone();
+        let mode = mode.to_string();
+        let result = self.exec(async move {
+            client
+                .set_input_mode(tonic::Request::new(shared::proto::SetInputModeRequest {
+                    mode,
+                }))
+                .await
+        });
+        if let Err(e) = result {
+            tracing::warn!("set_input_mode failed: {e}");
+        }
     }
 }
