@@ -8,6 +8,8 @@ use crate::extension::StringExt as _;
 #[cfg(not(debug_assertions))]
 use windows::{core::PCWSTR, Win32::System::Diagnostics::Debug::OutputDebugStringW};
 
+// debug-only: file logging (and its folder) exist only in debug builds
+#[cfg(debug_assertions)]
 fn log_folder() -> Option<std::path::PathBuf> {
     // %LOCALAPPDATA%\Azookey\logs — never a hardcoded dev-machine path
     let base = std::env::var_os("LOCALAPPDATA")?;
