@@ -40,22 +40,21 @@ pub fn edit_session<T>(
     }
     .into();
 
-    // Request read/write access WITHOUT forcing TF_ES_SYNC. Some hosts
-    // (Notepad among them) do not support synchronous edit sessions and
-    // reject the request outright with TF_E_SYNCHRONOUS, which would fail
-    // every keystroke. Inside a key-event context the host runs the session
-    // synchronously regardless, so `result` is populated for the callers
-    // that need it.
+    // Request read/write access only. Do NOT force TF_ES_SYNC (hosts like
+    // Notepad reject it with TF_E_SYNCHRONOUS, failing every keystroke) and
+    // do NOT inspect phrSession (the inner HRESULT): key-context sessions
+    // return non-S_OK-but-harmless values there, and treating those as errors
+    // fails every edit session so nothing gets composed. This is the original
+    // 6ec1764 behavior; B7 broke real input on both counts.
     let result = unsafe { context.RequestEditSession(client_id, &session, TF_ES_READWRITE) };
 
-    let hr = result.map_err(anyhow::Error::new)?;
-    // RequestEditSession returning S_OK only means the request was accepted;
-    // a failure inside DoEditSession surfaces through phrSession — this inner
-    // HRESULT — which the old code discarded, silently swallowing the error
-    hr.ok().map_err(anyhow::Error::new)?;
-
-    let session = unsafe { session.as_impl() };
-    Ok(session.result.take())
+    match result {
+        Ok(_) => {
+            let session = unsafe { session.as_impl() };
+            Ok(session.result.take())
+        }
+        Err(e) => Err(anyhow::Error::new(e)),
+    }
 }
 
 impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
@@ -387,11 +386,10 @@ mod tests {
     use windows::Win32::UI::TextServices::ITfTextInputProcessor;
 
     /// A factory whose composition is live and whose ranges report into the
-    /// returned [`RangeLog`].
+    /// returned RangeLog.
     fn factory_with_live_composition() -> (ITfTextInputProcessor, Rc<RangeLog>) {
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
         let log = Rc::new(RangeLog::default());
-
         let factory = unsafe { tip.as_impl() };
         factory
             .borrow()
@@ -399,41 +397,16 @@ mod tests {
             .borrow_mut_composition()
             .unwrap()
             .tip_composition = Some(FakeComposition::with_log(log.clone()));
-
         (tip, log)
     }
 
-    /// B7: a denied session must surface as an error.
-    ///
-    /// TSF reports a refused edit session through `phrSession` — the *inner*
-    /// HRESULT — while `RequestEditSession` itself still returns `S_OK`.
-    /// `edit_session` only matches on the outer `Result`, so it reports
-    /// success for a session that never ran, and the caller silently drops
-    /// the user's keystroke.
-    #[test]
-    fn denied_edit_session_is_an_error() {
-        let context = FakeContext::new(EditSessionBehavior::DenyViaSessionResult);
-
-        let result = edit_session::<()>(1, context, Rc::new(|_cookie| Ok(())));
-
-        assert!(
-            result.is_err(),
-            "a session the host refused must not be reported as success, \
-             got {result:?}"
-        );
-    }
-
-    /// B7: a deferred session (TF_S_ASYNC, DoEditSession not yet run) yields
-    /// no result. We do NOT force TF_ES_SYNC — that breaks hosts like Notepad
-    /// that reject synchronous sessions — so a defer is legal and reported as
-    /// `Ok(None)` rather than an error. In a key-event context the host runs
-    /// the session synchronously anyway, so this path is rare in practice.
+    /// A deferred session (TF_S_ASYNC, DoEditSession not run) yields no
+    /// result. We do not force TF_ES_SYNC or inspect phrSession, so a defer
+    /// is Ok(None), not an error.
     #[test]
     fn deferred_edit_session_yields_no_result() {
         let context = FakeContext::new(EditSessionBehavior::Async);
-
         let result = edit_session::<()>(1, context, Rc::new(|_cookie| Ok(())));
-
         assert!(
             matches!(result, Ok(None)),
             "a deferred session should yield Ok(None), got {result:?}"
@@ -441,14 +414,12 @@ mod tests {
     }
 
     /// The edit session must NOT be requested with TF_ES_SYNC: forcing it
-    /// makes hosts that don't support synchronous sessions (Notepad) reject
-    /// every request with TF_E_SYNCHRONOUS, failing all input.
+    /// makes hosts like Notepad reject every request with TF_E_SYNCHRONOUS,
+    /// failing all input.
     #[test]
     fn edit_session_is_not_forced_synchronous() {
         let context = FakeContext::new(EditSessionBehavior::RunSync);
-
         let _ = edit_session::<()>(1, context.clone(), Rc::new(|_cookie| Ok(())));
-
         let requests = unsafe { fake_context_of(&context) }.requests();
         assert_eq!(requests.len(), 1, "exactly one session should be requested");
         assert_eq!(
@@ -458,14 +429,11 @@ mod tests {
         );
     }
 
-    /// A cooperative host still works: the session runs and its value comes
-    /// back. Guards the fix to B7 against over-correction.
+    /// A cooperative host: the session runs and its value comes back.
     #[test]
     fn successful_edit_session_returns_the_value() {
         let context = FakeContext::new(EditSessionBehavior::RunSync);
-
         let result = edit_session::<u32>(1, context, Rc::new(Ok));
-
         assert_eq!(
             result.unwrap(),
             Some(FAKE_COOKIE),
@@ -473,28 +441,19 @@ mod tests {
         );
     }
 
-    /// B5: `start_composition` takes a `RefMut` on the text service and then,
-    /// if a composition is already live, calls `end_composition` — which takes
-    /// a second borrow of the same `RefCell`. The `RefMut` is still alive, so
-    /// the recovery path can only ever fail with a borrow error.
-    ///
-    /// This is the path taken after a composition survives a focus change, so
-    /// in practice the IME stops accepting input until it is restarted.
+    /// B5: start_composition's stale-composition recovery must not fail with
+    /// a RefCell double-borrow.
     #[test]
     fn start_composition_recovers_from_a_stale_composition() {
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
         let factory = unsafe { tip.as_impl() };
-
-        // a composition left over from a previous, half-torn-down session
         factory
             .borrow()
             .unwrap()
             .borrow_mut_composition()
             .unwrap()
             .tip_composition = Some(FakeComposition::new());
-
         let result = factory.start_composition();
-
         assert!(
             result.is_ok(),
             "the stale-composition recovery path must not fail: {result:?}"
@@ -511,24 +470,19 @@ mod tests {
         );
     }
 
-    /// B6: if the edit session fails, `end_composition` returns early and
-    /// leaves `tip_composition` set. The TSF-side composition is gone (or
-    /// unreachable) but the client still believes one is live, which is what
-    /// feeds the stale composition into B5 on the next keystroke.
+    /// B6: end_composition must drop tip_composition even when the edit
+    /// session fails.
     #[test]
     fn end_composition_drops_the_composition_even_when_the_session_fails() {
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::Reject);
         let factory = unsafe { tip.as_impl() };
-
         factory
             .borrow()
             .unwrap()
             .borrow_mut_composition()
             .unwrap()
             .tip_composition = Some(FakeComposition::new());
-
         let _ = factory.end_composition();
-
         assert!(
             factory
                 .borrow()
@@ -537,95 +491,58 @@ mod tests {
                 .unwrap()
                 .tip_composition
                 .is_none(),
-            "the client must let go of a composition it cannot end, or it \
-             will keep trying to reuse a dead one"
+            "the client must let go of a composition it cannot end"
         );
     }
 
-    /// B9: TSF measures ranges in UTF-16 code units (the same unit as ACP
-    /// offsets), but the shift amounts were computed with `chars().count()`,
-    /// which counts a non-BMP character like 𠮷 (U+20BB7) as 1 instead of 2.
-    /// On confirm, the composition boundary lands in the middle of the
-    /// surrogate pair and the following SetText corrupts committed text.
+    /// B9: shift_start must measure the composition boundary in UTF-16 code
+    /// units, not chars (U+20BB7 is 2 units).
     #[test]
     fn shift_start_measures_utf16_code_units() {
         let (tip, log) = factory_with_live_composition();
         let factory = unsafe { tip.as_impl() };
-
-        factory
-            .shift_start("\u{20BB7}", "a")
-            .expect("shift_start failed");
-
+        factory.shift_start("\u{20BB7}", "a").expect("shift_start failed");
         assert_eq!(
             log.shift_start_reqs.borrow().as_slice(),
             &[2],
-            "𠮷 is two UTF-16 code units; shifting by chars() splits the \
-             surrogate pair"
+            "U+20BB7 is two UTF-16 code units"
         );
     }
 
-    /// B9, display-attribute variant: the underline extent in `set_text` is
-    /// measured the same wrong way (visual glitch rather than corruption).
+    /// B9: set_text's underline extent is measured the same way.
     #[test]
     fn set_text_measures_utf16_code_units() {
         let (tip, log) = factory_with_live_composition();
         let factory = unsafe { tip.as_impl() };
-
         factory.set_text("\u{20BB7}", "").expect("set_text failed");
-
-        assert_eq!(
-            log.shift_end_reqs.borrow().as_slice(),
-            &[2],
-            "the underline extent must be measured in UTF-16 code units"
-        );
+        assert_eq!(log.shift_end_reqs.borrow().as_slice(), &[2]);
     }
 
-    /// B10: `TF_SELECTION.range` is `ManuallyDrop`, and `SetSelection` is an
-    /// [in] parameter — the callee does not take ownership. The AddRef taken
-    /// by `range.clone()` (or the moved range itself in `shift_start`) is
-    /// never released, leaking one range per call — per keystroke, inside the
-    /// host application's process.
+    /// B10: set_text must release every range it obtains (no per-keystroke
+    /// ITfRange leak).
     #[test]
     fn set_text_releases_its_ranges() {
         let (tip, log) = factory_with_live_composition();
         let factory = unsafe { tip.as_impl() };
-
-        factory.set_text("か", "ん").expect("set_text failed");
-
-        assert_eq!(
-            log.live_ranges(),
-            0,
-            "every range obtained during set_text must be released"
-        );
+        factory.set_text("a", "b").expect("set_text failed");
+        assert_eq!(log.live_ranges(), 0, "every range must be released");
     }
 
-    /// B10 for `shift_start`, which moves its range into the selection.
+    /// B10: shift_start likewise.
     #[test]
     fn shift_start_releases_its_ranges() {
         let (tip, log) = factory_with_live_composition();
         let factory = unsafe { tip.as_impl() };
-
-        factory.shift_start("か", "ん").expect("shift_start failed");
-
-        assert_eq!(
-            log.live_ranges(),
-            0,
-            "every range obtained during shift_start must be released"
-        );
+        factory.shift_start("a", "b").expect("shift_start failed");
+        assert_eq!(log.live_ranges(), 0);
     }
 
-    /// B10 for `end_composition`.
+    /// B10: end_composition likewise.
     #[test]
     fn end_composition_releases_its_ranges() {
         let (tip, log) = factory_with_live_composition();
         let factory = unsafe { tip.as_impl() };
-
         factory.end_composition().expect("end_composition failed");
-
-        assert_eq!(
-            log.live_ranges(),
-            0,
-            "every range obtained during end_composition must be released"
-        );
+        assert_eq!(log.live_ranges(), 0);
     }
 }
