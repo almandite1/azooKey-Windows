@@ -74,16 +74,14 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                 &ITfThreadMgrEventSink::IID,
                 &self.this::<ITfThreadMgrEventSink>()?,
             )?;
-            IMEState::get()?
-                .cookies
-                .insert(ITfThreadMgrEventSink::IID, cookie);
+            text_service.cookies.insert(ITfThreadMgrEventSink::IID, cookie);
         };
 
         // initialize text layout sink
         tracing::debug!("AdviseTextLayoutSink");
         let doc_mgr = unsafe { thread_mgr.GetFocus() };
         if let Ok(doc_mgr) = doc_mgr {
-            self.advise_text_layout_sink(doc_mgr)?;
+            self.advise_text_layout_sink(&mut text_service, doc_mgr)?;
         }
 
         // initialize display attribute
@@ -151,14 +149,14 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // remove thread manager event sink
         tracing::debug!("UnadviseThreadMgrEventSink");
         unsafe {
-            if let Some(cookie) = IMEState::get()?.cookies.remove(&ITfThreadMgrEventSink::IID) {
+            if let Some(cookie) = text_service.cookies.remove(&ITfThreadMgrEventSink::IID) {
                 thread_mgr.cast::<ITfSource>()?.UnadviseSink(cookie)?;
             }
         };
 
         // remove text layout sink
         tracing::debug!("UnadviseTextLayoutSink");
-        self.unadvise_text_layout_sink()?;
+        self.unadvise_text_layout_sink(&mut text_service)?;
 
         // clear display attribute
         text_service.display_attribute_atom.clear();
@@ -221,13 +219,12 @@ mod tests {
         let _ = DLL_INSTANCE.set(Mutex::new(DllModule::new()));
     }
 
-    /// Fresh IMEState so one test's leftover ipc_service/cookies can't leak
-    /// into the next.
+    /// Fresh IMEState so one test's leftover ipc_service can't leak into the
+    /// next. (Sink cookies and the layout context are per-TextService now, so
+    /// they die with each test's TIP instance.)
     fn reset_ime_state() {
         if let Ok(mut state) = IMEState::get() {
             state.ipc_service = None;
-            state.cookies.clear();
-            state.context = None;
         }
     }
 
@@ -244,6 +241,48 @@ mod tests {
         let thread_mgr = FakeThreadMgr::new(log.clone());
         unsafe { tip.Activate(Some(&thread_mgr), 1) }.expect("first Activate must succeed");
         (tip, thread_mgr, log)
+    }
+
+    /// B14: two TIP instances (one per UI thread in a real host) must not
+    /// share sink bookkeeping. With the old process-global cookie map, B's
+    /// Activate overwrote A's thread-mgr-sink cookie, so A's Deactivate
+    /// unadvised B's cookie on A's thread manager — leaking A's sink and
+    /// making B's un-removable.
+    #[test]
+    fn deactivating_one_tip_does_not_disturb_anothers_cookie() {
+        let _guard = LIFECYCLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ensure_dll_module();
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        reset_ime_state();
+
+        // distinguishable cookie ranges: A hands out 101.., B hands out 201..
+        let log_a = Rc::new(ThreadMgrLog::with_cookie_base(100));
+        let log_b = Rc::new(ThreadMgrLog::with_cookie_base(200));
+        let tm_a = FakeThreadMgr::new(log_a.clone());
+        let tm_b = FakeThreadMgr::new(log_b.clone());
+        let tip_a = TextServiceFactory::create::<ITfTextInputProcessor>()
+            .expect("failed to create TIP A");
+        let tip_b = TextServiceFactory::create::<ITfTextInputProcessor>()
+            .expect("failed to create TIP B");
+
+        unsafe { tip_a.Activate(Some(&tm_a), 1) }.expect("Activate A must succeed");
+        unsafe { tip_b.Activate(Some(&tm_b), 2) }.expect("Activate B must succeed");
+
+        unsafe { tip_a.Deactivate() }.expect("Deactivate A must succeed");
+        assert_eq!(
+            log_a.unadvise_cookies.borrow().as_slice(),
+            log_a.advise_cookies.borrow().as_slice(),
+            "A must unadvise exactly the cookie its own thread manager issued, \
+             not one belonging to another instance"
+        );
+
+        unsafe { tip_b.Deactivate() }.expect("Deactivate B must succeed");
+        assert_eq!(
+            log_b.unadvise_cookies.borrow().as_slice(),
+            log_b.advise_cookies.borrow().as_slice(),
+            "B's cookie must survive A's lifecycle and be unadvised on B"
+        );
+        reset_ime_state();
     }
 
     /// R4: Activate must return Ok even though the engine is unreachable in a

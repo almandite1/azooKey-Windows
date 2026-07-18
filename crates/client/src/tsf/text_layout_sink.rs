@@ -8,9 +8,8 @@ use windows::{
 
 use anyhow::Result;
 
-use crate::engine::state::IMEState;
-
 use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
+use super::text_service::TextService;
 
 impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
     // This function is called when the text display position changes when the IME is enabled.
@@ -45,38 +44,40 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
     }
 }
 
-// These live on the factory (not TextService) because they need the COM
-// object for the sink QI; they touch only the global IMEState, never the
-// TextService fields, so no RefCell borrow is involved.
+// These live on the factory (they need the COM object for the sink QI) but
+// take the caller's `&mut TextService` explicitly: every caller already
+// holds the RefMut, so borrowing again here would double-borrow. The cookie
+// and context now live in the per-instance TextService (B14) — one TIP per
+// UI thread, no cross-thread sharing.
 impl TextServiceFactory {
-    pub fn advise_text_layout_sink(&self, doc_mgr: ITfDocumentMgr) -> Result<()> {
-        if IMEState::get()?.context.is_some() {
-            self.unadvise_text_layout_sink()?;
+    pub fn advise_text_layout_sink(
+        &self,
+        text_service: &mut TextService,
+        doc_mgr: ITfDocumentMgr,
+    ) -> Result<()> {
+        if text_service.layout_context.is_some() {
+            self.unadvise_text_layout_sink(text_service)?;
         }
 
         unsafe {
             let context = doc_mgr.GetTop()?;
 
-            IMEState::get()?.context = Some(context.clone());
+            text_service.layout_context = Some(context.clone());
 
             let cookie = context
                 .cast::<ITfSource>()?
                 .AdviseSink(&ITfTextLayoutSink::IID, &self.this::<ITfTextLayoutSink>()?)?;
 
-            IMEState::get()?
-                .cookies
-                .insert(ITfTextLayoutSink::IID, cookie);
+            text_service.cookies.insert(ITfTextLayoutSink::IID, cookie);
 
             Ok(())
         }
     }
 
-    pub fn unadvise_text_layout_sink(&self) -> Result<()> {
+    pub fn unadvise_text_layout_sink(&self, text_service: &mut TextService) -> Result<()> {
         unsafe {
-            let mut state = IMEState::get()?;
-
-            if let Some(context) = state.context.take() {
-                if let Some(cookie) = state.cookies.remove(&ITfTextLayoutSink::IID) {
+            if let Some(context) = text_service.layout_context.take() {
+                if let Some(cookie) = text_service.cookies.remove(&ITfTextLayoutSink::IID) {
                     context.cast::<ITfSource>()?.UnadviseSink(cookie)?;
                 }
             }

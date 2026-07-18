@@ -70,6 +70,17 @@ pub struct TextService {
     pub tid: u32,
     pub thread_mgr: Option<ITfThreadMgr>,
     pub context: Option<ITfContext>,
+    /// Advise cookies for this activation's sinks (thread-mgr event sink,
+    /// text layout sink). Per-instance on purpose: TSF activates one TIP per
+    /// UI thread, and keeping these in the process-global IMEState let one
+    /// thread overwrite (and later unadvise with) another thread's cookie
+    /// (B14).
+    pub cookies: HashMap<GUID, u32>,
+    /// The document context the text layout sink is advised on. Distinct
+    /// from `context` (the key-input context set per keystroke). Also
+    /// per-instance: a global slot made one thread Unadvise another
+    /// thread's context across COM apartments (B14).
+    pub layout_context: Option<ITfContext>,
     pub composition: RefCell<Composition>,
     pub update_pos_state: UpdatePosState,
     pub display_attribute_atom: HashMap<GUID, u32>,

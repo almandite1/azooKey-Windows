@@ -621,6 +621,19 @@ pub struct ThreadMgrLog {
     next_cookie: Cell<u32>,
 }
 
+impl ThreadMgrLog {
+    /// A log whose cookies are handed out starting above `base`, so two fake
+    /// thread managers' cookies are distinguishable in cross-instance tests
+    /// (e.g. proving one TIP's Deactivate doesn't unadvise with another's
+    /// cookie).
+    pub fn with_cookie_base(base: u32) -> Self {
+        Self {
+            next_cookie: Cell::new(base),
+            ..Self::default()
+        }
+    }
+}
+
 /// A fake `ITfThreadMgr` that answers just enough of TSF for the TIP's
 /// `Activate`/`Deactivate` to run end to end in a unit test, and records the
 /// advise/unadvise traffic. `GetFocus` deliberately reports no focus so the
