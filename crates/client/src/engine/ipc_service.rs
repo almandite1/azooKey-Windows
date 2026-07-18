@@ -71,6 +71,17 @@ impl IPCService {
     pub fn new() -> Result<Self> {
         let runtime = tokio::runtime::Runtime::new()?;
 
+        // Enter the runtime context before building the channels. tonic's
+        // connect_with_connector_lazy installs the channel's connection task
+        // and needs an ambient Tokio reactor; this runs on the host app's UI
+        // thread, which has no runtime otherwise. Without this guard,
+        // IPCService::new panics inside Activate with "there is no reactor
+        // running", the panic is caught and turned into E_FAIL, and the TIP
+        // never activates (the previously active IME's icon stays). The guard
+        // is dropped at the end of new(); RPCs later run via runtime.block_on,
+        // which enters the context on their own.
+        let _guard = runtime.enter();
+
         // lazy channels: no connection is attempted here. Each RPC connects
         // on demand and tonic re-establishes the connection after transport
         // failures, so the IME recovers automatically when the server or UI
