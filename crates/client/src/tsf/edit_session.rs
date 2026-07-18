@@ -6,8 +6,8 @@ use windows::{
         UI::TextServices::{
             ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
             ITfEditSession_Impl, ITfInsertAtSelection, ITfRange, GUID_PROP_ATTRIBUTE, TF_AE_NONE,
-            TF_ANCHOR_END, TF_ANCHOR_START, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY,
-            TF_SELECTION, TF_SELECTIONSTYLE, TF_ST_CORRECTION, TF_TF_MOVESTART,
+            TF_ANCHOR_END, TF_ANCHOR_START, TF_ES_READWRITE, TF_IAS_QUERYONLY, TF_SELECTION,
+            TF_SELECTIONSTYLE, TF_ST_CORRECTION, TF_TF_MOVESTART,
         },
     },
 };
@@ -40,23 +40,22 @@ pub fn edit_session<T>(
     }
     .into();
 
-    // key handling is synchronous: the caller needs the session's outcome
-    // before it returns to the host, so an asynchronous grant is useless
-    let result =
-        unsafe { context.RequestEditSession(client_id, &session, TF_ES_SYNC | TF_ES_READWRITE) };
+    // Request read/write access WITHOUT forcing TF_ES_SYNC. Some hosts
+    // (Notepad among them) do not support synchronous edit sessions and
+    // reject the request outright with TF_E_SYNCHRONOUS, which would fail
+    // every keystroke. Inside a key-event context the host runs the session
+    // synchronously regardless, so `result` is populated for the callers
+    // that need it.
+    let result = unsafe { context.RequestEditSession(client_id, &session, TF_ES_READWRITE) };
 
     let hr = result.map_err(anyhow::Error::new)?;
-    // RequestEditSession succeeding only means the request was delivered;
-    // the session's own outcome comes back through phrSession
+    // RequestEditSession returning S_OK only means the request was accepted;
+    // a failure inside DoEditSession surfaces through phrSession — this inner
+    // HRESULT — which the old code discarded, silently swallowing the error
     hr.ok().map_err(anyhow::Error::new)?;
 
     let session = unsafe { session.as_impl() };
-    match session.result.take() {
-        Some(value) => Ok(Some(value)),
-        // a success HRESULT with no result means the host deferred the
-        // session (TF_S_ASYNC) and DoEditSession never ran
-        None => anyhow::bail!("edit session was accepted but did not run synchronously"),
-    }
+    Ok(session.result.take())
 }
 
 impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
@@ -385,7 +384,7 @@ mod tests {
         factory_with_fake_context, fake_context_of, EditSessionBehavior, FakeComposition,
         FakeContext, RangeLog, FAKE_COOKIE,
     };
-    use windows::Win32::UI::TextServices::{ITfTextInputProcessor, TF_ES_SYNC};
+    use windows::Win32::UI::TextServices::ITfTextInputProcessor;
 
     /// A factory whose composition is live and whose ranges report into the
     /// returned [`RangeLog`].
@@ -424,38 +423,38 @@ mod tests {
         );
     }
 
-    /// B7: a deferred session must surface as an error rather than a silent
-    /// `None`. The host may only defer because the TIP does not ask for
-    /// `TF_ES_SYNC` (see `sync_edit_session_is_requested`).
+    /// B7: a deferred session (TF_S_ASYNC, DoEditSession not yet run) yields
+    /// no result. We do NOT force TF_ES_SYNC — that breaks hosts like Notepad
+    /// that reject synchronous sessions — so a defer is legal and reported as
+    /// `Ok(None)` rather than an error. In a key-event context the host runs
+    /// the session synchronously anyway, so this path is rare in practice.
     #[test]
-    fn deferred_edit_session_is_an_error() {
+    fn deferred_edit_session_yields_no_result() {
         let context = FakeContext::new(EditSessionBehavior::Async);
 
         let result = edit_session::<()>(1, context, Rc::new(|_cookie| Ok(())));
 
         assert!(
-            result.is_err(),
-            "a session the host deferred produced no result, so it must not \
-             be reported as success, got {result:?}"
+            matches!(result, Ok(None)),
+            "a deferred session should yield Ok(None), got {result:?}"
         );
     }
 
-    /// B7: keystroke handling is synchronous, so the edit session must be
-    /// requested synchronously. Without `TF_ES_SYNC` the host is free to
-    /// defer, which is what makes `deferred_edit_session_is_an_error`
-    /// reachable in the first place.
+    /// The edit session must NOT be requested with TF_ES_SYNC: forcing it
+    /// makes hosts that don't support synchronous sessions (Notepad) reject
+    /// every request with TF_E_SYNCHRONOUS, failing all input.
     #[test]
-    fn sync_edit_session_is_requested() {
+    fn edit_session_is_not_forced_synchronous() {
         let context = FakeContext::new(EditSessionBehavior::RunSync);
 
         let _ = edit_session::<()>(1, context.clone(), Rc::new(|_cookie| Ok(())));
 
         let requests = unsafe { fake_context_of(&context) }.requests();
         assert_eq!(requests.len(), 1, "exactly one session should be requested");
-        assert!(
-            requests[0].flags.0 & TF_ES_SYNC.0 != 0,
-            "the edit session must be requested with TF_ES_SYNC, got {:?}",
-            requests[0].flags
+        assert_eq!(
+            requests[0].flags,
+            TF_ES_READWRITE,
+            "the session must be requested read/write only, not synchronous"
         );
     }
 
