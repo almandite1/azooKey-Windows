@@ -82,8 +82,27 @@ impl TryFrom<usize> for UserAction {
                     key_state
                 };
                 let unicode = {
+                    // Bit 2 = "do not change keyboard state" (Win10 1607+;
+                    // ignored and harmless on older builds). Without it,
+                    // ToUnicode consumes kernel dead-key state — and this
+                    // path runs TWICE per keystroke (OnTestKeyDown and
+                    // OnKeyDown both call process_key), so on layouts with
+                    // dead keys (e.g. US-International) the state was
+                    // double-consumed and output garbled (B17). Known,
+                    // pre-existing limitations left as-is: the return value
+                    // is ignored (-1 dead key / 2+ chars are not handled)
+                    // and the 1-unit buffer cannot represent non-BMP output.
+                    const TOUNICODE_NO_KBD_STATE_CHANGE: u32 = 0x4;
                     let mut unicode = [0u16; 1];
-                    unsafe { ToUnicode(key_code as u32, 0, Some(&key_state), &mut unicode, 0) };
+                    unsafe {
+                        ToUnicode(
+                            key_code as u32,
+                            0,
+                            Some(&key_state),
+                            &mut unicode,
+                            TOUNICODE_NO_KBD_STATE_CHANGE,
+                        )
+                    };
                     unicode[0]
                 };
 
