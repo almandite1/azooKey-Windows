@@ -1,11 +1,10 @@
-use std::cmp::max;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use azookey_server::TonicNamedPipeServer;
 use ipc::{WindowAction, WindowController, WindowService};
 use shared::proto::window_service_server::WindowServiceServer;
-use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::platform::windows::{EventLoopBuilderExtWindows, WindowExtWindows};
 use tao::{
     event::{Event, StartCause, WindowEvent},
@@ -193,8 +192,13 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 UserEvent::UpdateHeight(height) => {
-                    let width = candidate_window.inner_size().width as i32;
-                    candidate_window.set_inner_size(LogicalSize::new(width, height));
+                    // the webview reports CSS px (logical); the width must be
+                    // logical too. Feeding the PHYSICAL inner width into a
+                    // LogicalSize grew the window by the scale factor on
+                    // every resize at high DPI (B20).
+                    let scale = candidate_window.scale_factor();
+                    let width = candidate_window.inner_size().to_logical::<f64>(scale).width;
+                    candidate_window.set_inner_size(LogicalSize::new(width, height as f64));
                 }
                 UserEvent::Heartbeat => {
                     // test hook: simulate a stalled event loop (inert unless
@@ -281,10 +285,11 @@ async fn main() -> anyhow::Result<()> {
                                 );
                             }
                             candidate_window.set_outer_position(PhysicalPosition::new(x, y));
-                            indicator_window.set_outer_position(PhysicalPosition::new(
-                                (left - 45) as f64,
-                                bottom as f64,
-                            ));
+                            // clamp the indicator into the work area too — it
+                            // used to hang off-screen near screen edges (B20)
+                            let (ix, iy) =
+                                utils::get_indicator_position(left, bottom, &indicator_window);
+                            indicator_window.set_outer_position(PhysicalPosition::new(ix, iy));
                         }
                         WindowAction::SetCandidate { candidates } => {
                             let max_len = candidates
@@ -293,10 +298,16 @@ async fn main() -> anyhow::Result<()> {
                                 .max()
                                 .unwrap_or(0) as u32;
 
-                            let height = candidate_window.inner_size().height as i32;
-                            candidate_window.set_inner_size(PhysicalSize::new(
-                                max(225, 120 + max_len * 18),
-                                height as u32,
+                            // logical (CSS px) size: the webview lays out in
+                            // CSS px, so a physical-px window stayed too
+                            // small at high DPI and clipped the candidate
+                            // text (B20)
+                            let scale = candidate_window.scale_factor();
+                            let height =
+                                candidate_window.inner_size().to_logical::<f64>(scale).height;
+                            candidate_window.set_inner_size(LogicalSize::new(
+                                utils::candidate_window_logical_width(max_len) as f64,
+                                height,
                             ));
 
                             // Vec<String> serialization cannot fail; fall back
