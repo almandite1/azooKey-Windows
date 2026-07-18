@@ -83,12 +83,25 @@ impl CLSIDMgr {
 
     pub fn unregister() -> anyhow::Result<()> {
         let clsid_key = CLSID_PREFIX.to_owned() + &GUID_TEXT_SERVICE.to_string();
-        let inproc_key = clsid_key.clone() + INPROC_SUFFIX;
 
-        HKEY_CLASSES_ROOT.delete_tree(&clsid_key)?;
-        HKEY_CLASSES_ROOT.delete_tree(&inproc_key)?;
+        // RegDeleteTreeW removes the whole subtree, InProcServer32 included —
+        // a second delete of the subkey would fail with "not found" and made
+        // regsvr32 /u always report 0x80040201. Tolerating "not found" also
+        // makes /u idempotent (running it twice must succeed).
+        ok_if_not_found(HKEY_CLASSES_ROOT.delete_tree(&clsid_key))?;
 
         Ok(())
+    }
+}
+
+/// Unregistration must be idempotent: deleting something that is already gone
+/// is success, while every other error (e.g. access denied without admin
+/// rights) must still surface.
+fn ok_if_not_found(result: windows::core::Result<()>) -> windows::core::Result<()> {
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    match result {
+        Err(e) if e.code() == ERROR_FILE_NOT_FOUND.to_hresult() => Ok(()),
+        other => other,
     }
 }
 
@@ -129,5 +142,33 @@ impl CategoryMgr {
 
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, E_ACCESSDENIED};
+
+    /// An already-deleted key is success — regsvr32 /u must be idempotent.
+    #[test]
+    fn not_found_is_tolerated() {
+        let result = ok_if_not_found(Err(windows::core::Error::from_hresult(
+            ERROR_FILE_NOT_FOUND.to_hresult(),
+        )));
+        assert!(result.is_ok(), "not-found must be treated as success");
+    }
+
+    /// A real failure (e.g. regsvr32 /u without admin rights) must surface.
+    #[test]
+    fn other_errors_still_surface() {
+        let result = ok_if_not_found(Err(windows::core::Error::from_hresult(E_ACCESSDENIED)));
+        assert_eq!(result.unwrap_err().code(), E_ACCESSDENIED);
+    }
+
+    #[test]
+    fn success_passes_through() {
+        assert!(ok_if_not_found(Ok(())).is_ok());
     }
 }

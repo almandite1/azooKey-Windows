@@ -153,13 +153,25 @@ pub extern "system" fn DllUnregisterServer() -> HRESULT {
     // Called when the DLL is unregistered using regsvr32
     tracing::debug!("DllUnregisterServer");
 
-    let result: anyhow::Result<()> = (|| {
-        ProfileMgr::unregister()?;
-        CLSIDMgr::unregister()?;
-        CategoryMgr::unregister()?;
+    // Best-effort: attempt all three unregistrations even if one fails, so a
+    // single failure (e.g. a key already gone) doesn't leave the others
+    // behind — the old short-circuit skipped CategoryMgr cleanup entirely.
+    let mut errors: Vec<String> = Vec::new();
+    if let Err(e) = ProfileMgr::unregister() {
+        errors.push(format!("profile: {e:#}"));
+    }
+    if let Err(e) = CLSIDMgr::unregister() {
+        errors.push(format!("clsid: {e:#}"));
+    }
+    if let Err(e) = CategoryMgr::unregister() {
+        errors.push(format!("category: {e:#}"));
+    }
 
+    let result: anyhow::Result<()> = if errors.is_empty() {
         Ok(())
-    })();
+    } else {
+        Err(anyhow::anyhow!(errors.join("; ")))
+    };
 
     check_err!(result, SELFREG_E_CLASS)
 }
