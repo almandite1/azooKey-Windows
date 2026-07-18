@@ -273,6 +273,11 @@ impl ITfInsertAtSelection_Impl for FakeContext_Impl {
 pub struct RangeLog {
     pub shift_start_reqs: RefCell<Vec<i32>>,
     pub shift_end_reqs: RefCell<Vec<i32>>,
+    /// The backing text `GetText` serves (UTF-16). Empty by default, so the
+    /// old cch=0 behavior is preserved for tests that don't care about text.
+    pub text: RefCell<Vec<u16>>,
+    /// Every payload `SetText` received, in call order.
+    pub set_texts: RefCell<Vec<Vec<u16>>>,
     live: Cell<isize>,
 }
 
@@ -308,17 +313,32 @@ impl ITfRange_Impl for FakeRange_Impl {
         &self,
         _ec: u32,
         _dwflags: u32,
-        _pchtext: PWSTR,
-        _cchmax: u32,
+        pchtext: PWSTR,
+        cchmax: u32,
         pcch: *mut u32,
     ) -> WinResult<()> {
+        // Serve up to cchmax units of the configured backing text, like a
+        // real host: a full buffer tells the caller there may be more.
+        // (Serving from the start on every call matches the TIP's
+        // fresh-clone-per-attempt read; MOVESTART is not modeled.)
+        let text = self.log.text.borrow();
+        let served = text.len().min(cchmax as usize);
+        if !pchtext.is_null() && served > 0 {
+            unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), pchtext.0, served) };
+        }
         if !pcch.is_null() {
-            unsafe { *pcch = 0 };
+            unsafe { *pcch = served as u32 };
         }
         Ok(())
     }
 
-    fn SetText(&self, _ec: u32, _dwflags: u32, _pchtext: &PCWSTR, _cch: i32) -> WinResult<()> {
+    fn SetText(&self, _ec: u32, _dwflags: u32, pchtext: &PCWSTR, cch: i32) -> WinResult<()> {
+        let received = if pchtext.is_null() || cch <= 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(pchtext.0, cch as usize) }.to_vec()
+        };
+        self.log.set_texts.borrow_mut().push(received);
         Ok(())
     }
 

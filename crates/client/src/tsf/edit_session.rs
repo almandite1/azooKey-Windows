@@ -151,14 +151,37 @@ impl TextServiceFactory {
                             // clear display attribute first
                             let range: ITfRange = composition.GetRange()?;
 
-                            // set existing text to the composition
-                            let mut text = vec![0; 1024];
-                            let mut text_len = 1024;
+                            // Read the FULL composition text. GetText fills at
+                            // most the buffer, so a full buffer means "maybe
+                            // more" — retry from a fresh clone with a larger
+                            // one (B23: a fixed 1024 buffer silently truncated
+                            // longer compositions on commit). cch < capacity
+                            // proves completeness.
+                            const MAX_COMPOSITION_UNITS: usize = 1 << 20;
+                            let mut capacity: usize = 1024;
+                            let text = loop {
+                                let mut buf = vec![0u16; capacity];
+                                let mut cch: u32 = 0;
 
-                            let range_new = range.Clone()?;
-                            range_new.GetText(cookie, TF_TF_MOVESTART, &mut text, &mut text_len)?;
+                                // fresh clone each attempt: TF_TF_MOVESTART
+                                // moves the previous clone's start anchor
+                                let probe = range.Clone()?;
+                                probe.GetText(cookie, TF_TF_MOVESTART, &mut buf, &mut cch)?;
 
-                            text = text[..text_len as usize].to_vec();
+                                if (cch as usize) < capacity {
+                                    buf.truncate(cch as usize);
+                                    break buf;
+                                }
+                                if capacity >= MAX_COMPOSITION_UNITS {
+                                    tracing::warn!(
+                                        "composition text exceeds {MAX_COMPOSITION_UNITS} \
+                                         UTF-16 units; committing truncated"
+                                    );
+                                    buf.truncate(cch as usize);
+                                    break buf;
+                                }
+                                capacity *= 4;
+                            };
                             range.SetText(cookie, TF_ST_CORRECTION, &text)?;
 
                             let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
@@ -560,6 +583,41 @@ mod tests {
         let (tip, log) = factory_with_live_composition();
         let factory = unsafe { tip.as_impl() };
         factory.end_composition().expect("end_composition failed");
+        assert_eq!(log.live_ranges(), 0);
+    }
+
+    /// B23: a composition longer than the old fixed 1024-unit buffer must be
+    /// written back in full on commit, not silently truncated.
+    #[test]
+    fn end_composition_preserves_text_longer_than_1024_units() {
+        let (tip, log) = factory_with_live_composition();
+        let long: Vec<u16> = "あ".encode_utf16().collect::<Vec<u16>>()
+            .into_iter().cycle().take(3000).collect();
+        *log.text.borrow_mut() = long.clone();
+
+        let factory = unsafe { tip.as_impl() };
+        factory.end_composition().expect("end_composition failed");
+
+        assert_eq!(
+            log.set_texts.borrow().last().expect("SetText was never called"),
+            &long,
+            "the full composition text must reach SetText"
+        );
+        assert_eq!(log.live_ranges(), 0, "every retry clone must be released");
+    }
+
+    /// B23 boundary: exactly 1024 units looks like "maybe more" (cch ==
+    /// cchMax), so one retry must confirm completeness and commit all 1024.
+    #[test]
+    fn end_composition_handles_exactly_1024_units() {
+        let (tip, log) = factory_with_live_composition();
+        let text: Vec<u16> = vec!['a' as u16; 1024];
+        *log.text.borrow_mut() = text.clone();
+
+        let factory = unsafe { tip.as_impl() };
+        factory.end_composition().expect("end_composition failed");
+
+        assert_eq!(log.set_texts.borrow().last().expect("SetText was never called"), &text);
         assert_eq!(log.live_ranges(), 0);
     }
 
