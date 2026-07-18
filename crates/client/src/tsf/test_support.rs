@@ -31,8 +31,8 @@ use windows::{
             ITfContext_Impl, ITfDocumentMgr, ITfEditSession, ITfInsertAtSelection,
             ITfInsertAtSelection_Impl, ITfProperty, ITfPropertyStore, ITfProperty_Impl, ITfRange,
             ITfRangeBackup, ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl,
-            INSERT_TEXT_AT_SELECTION_FLAGS, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_HALTCOND, TF_S_ASYNC,
-            TS_STATUS,
+            INSERT_TEXT_AT_SELECTION_FLAGS, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_E_SYNCHRONOUS,
+            TF_ES_SYNC, TF_HALTCOND, TF_S_ASYNC, TS_STATUS,
         },
     },
 };
@@ -56,6 +56,12 @@ pub enum EditSessionBehavior {
     Async,
     /// The request itself fails.
     Reject,
+    /// A Notepad-like host that does not support synchronous edit sessions:
+    /// a request carrying `TF_ES_SYNC` is rejected with `TF_E_SYNCHRONOUS`,
+    /// while an ordinary (async-capable) request runs inline. This is the
+    /// host behavior that B7 tripped over — forcing `TF_ES_SYNC` made every
+    /// keystroke fail here. The TIP must keep requesting read/write only.
+    RejectSyncRequests,
 }
 
 /// One `RequestEditSession` call, as the fake saw it.
@@ -110,6 +116,17 @@ impl ITfContext_Impl for FakeContext_Impl {
             EditSessionBehavior::DenyViaSessionResult => Ok(E_FAIL),
             EditSessionBehavior::Async => Ok(TF_S_ASYNC),
             EditSessionBehavior::Reject => Err(windows::core::Error::from_hresult(E_FAIL)),
+            EditSessionBehavior::RejectSyncRequests => {
+                if (dwflags.0 & TF_ES_SYNC.0) != 0 {
+                    Err(windows::core::Error::from_hresult(TF_E_SYNCHRONOUS))
+                } else {
+                    let session = pes.ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
+                    Ok(match unsafe { session.DoEditSession(FAKE_COOKIE) } {
+                        Ok(()) => S_OK,
+                        Err(e) => e.code(),
+                    })
+                }
+            }
         }
     }
 

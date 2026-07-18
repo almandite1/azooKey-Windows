@@ -288,3 +288,47 @@ impl IPCService {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for the reactor-context panic fixed in 70d367c.
+    ///
+    /// `IPCService::new` builds tonic channels via
+    /// `connect_with_connector_lazy`, which needs an ambient Tokio reactor.
+    /// In production it runs on the host application's UI thread, which has
+    /// no runtime — exactly like this `#[test]`, which the test harness runs
+    /// on a plain thread with no ambient runtime. The `runtime.enter()` guard
+    /// inside `new` supplies the context. If that guard is ever removed, this
+    /// call panics with "there is no reactor running, must be called from the
+    /// context of a Tokio 1.x runtime", the panic is turned into E_FAIL in
+    /// Activate, and the TIP never activates (the previous IME's icon stays).
+    ///
+    /// Note: this must NOT be a `#[tokio::test]` — that would install an
+    /// ambient runtime and mask the very regression it guards against.
+    #[test]
+    fn new_does_not_need_an_ambient_runtime() {
+        let service = IPCService::new();
+        assert!(
+            service.is_ok(),
+            "IPCService::new must succeed without an ambient Tokio runtime \
+             (channels are lazy, so no connection is attempted): {:?}",
+            service.err()
+        );
+    }
+
+    /// Activate runs on every IME switch, so `new` is called repeatedly over a
+    /// session. Each call stands up its own runtime and lazy channels; none of
+    /// them may depend on a runtime left over from a previous call.
+    #[test]
+    fn new_can_be_called_repeatedly() {
+        for i in 0..3 {
+            assert!(
+                IPCService::new().is_ok(),
+                "IPCService::new failed on call {i}"
+            );
+        }
+    }
+}

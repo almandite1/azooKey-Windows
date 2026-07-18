@@ -441,6 +441,23 @@ mod tests {
         );
     }
 
+    /// B7 regression (behavioral): on a Notepad-like host that rejects
+    /// synchronous requests with TF_E_SYNCHRONOUS, the edit session must still
+    /// succeed — because the TIP requests read/write only, never TF_ES_SYNC.
+    /// `edit_session_is_not_forced_synchronous` proves the flag is absent;
+    /// this proves the *consequence*, so reintroducing TF_ES_SYNC fails here
+    /// (the fake would answer TF_E_SYNCHRONOUS and the callback never runs).
+    #[test]
+    fn edit_session_succeeds_on_a_host_that_rejects_sync() {
+        let context = FakeContext::new(EditSessionBehavior::RejectSyncRequests);
+        let result = edit_session::<u32>(1, context, Rc::new(Ok));
+        assert_eq!(
+            result.unwrap(),
+            Some(FAKE_COOKIE),
+            "a host that only rejects TF_ES_SYNC should still run the session"
+        );
+    }
+
     /// B5: start_composition's stale-composition recovery must not fail with
     /// a RefCell double-borrow.
     #[test]
