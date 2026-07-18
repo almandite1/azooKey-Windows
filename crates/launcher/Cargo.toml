@@ -19,3 +19,5 @@ features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ]
+[dev-dependencies]
+serde_json = "1.0"
