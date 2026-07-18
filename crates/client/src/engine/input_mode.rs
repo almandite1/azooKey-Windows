@@ -23,11 +23,11 @@ impl TextServiceFactory {
         unsafe {
             thread_mgr
                 .cast::<ITfLangBarItemMgr>()?
-                .RemoveItem(&text_service.this::<ITfLangBarItemButton>()?)?;
+                .RemoveItem(&self.this::<ITfLangBarItemButton>()?)?;
 
             thread_mgr
                 .cast::<ITfLangBarItemMgr>()?
-                .AddItem(&text_service.this::<ITfLangBarItemButton>()?)?;
+                .AddItem(&self.this::<ITfLangBarItemButton>()?)?;
         };
 
         Ok(())

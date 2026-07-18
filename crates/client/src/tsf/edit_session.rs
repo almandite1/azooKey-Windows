@@ -111,7 +111,7 @@ impl TextServiceFactory {
         let text_service = self.borrow_mut()?;
         let context = text_service.context()?;
         let context_composition = text_service.context::<ITfContextComposition>()?;
-        let sink = text_service.this::<ITfCompositionSink>()?;
+        let sink = self.this::<ITfCompositionSink>()?;
         let insert = text_service.context::<ITfInsertAtSelection>()?;
 
         let composition = edit_session::<ITfComposition>(
@@ -561,5 +561,34 @@ mod tests {
         let factory = unsafe { tip.as_impl() };
         factory.end_composition().expect("end_composition failed");
         assert_eq!(log.live_ranges(), 0);
+    }
+
+    /// B15: when the host releases its last interface reference, the whole
+    /// TextService (and everything it owns) must actually be freed. The old
+    /// stored `this` self-reference kept the COM refcount above zero forever,
+    /// leaking one TextService + its ITfContext per profile switch. The
+    /// Rc<RangeLog> sentinel inside the composition dies iff the COM box is
+    /// dropped, which is exactly what the weak handle observes.
+    #[test]
+    fn tip_is_freed_when_the_host_releases_its_last_reference() {
+        let (tip, context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let log = Rc::new(RangeLog::default());
+        let sentinel = Rc::downgrade(&log);
+        {
+            let factory = unsafe { tip.as_impl() };
+            factory
+                .borrow()
+                .unwrap()
+                .borrow_mut_composition()
+                .unwrap()
+                .tip_composition = Some(FakeComposition::with_log(log));
+        }
+        drop(context);
+        drop(tip); // the host's last Release
+        assert!(
+            sentinel.upgrade().is_none(),
+            "the TextService must reach refcount 0 when the host lets go \
+             (B15: a stored self-reference keeps it alive forever)"
+        );
     }
 }

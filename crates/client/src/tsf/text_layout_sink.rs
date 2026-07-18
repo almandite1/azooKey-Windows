@@ -10,7 +10,7 @@ use anyhow::Result;
 
 use crate::engine::state::IMEState;
 
-use super::{factory::TextServiceFactory_Impl, text_service::TextService};
+use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 
 impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
     // This function is called when the text display position changes when the IME is enabled.
@@ -45,8 +45,11 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
     }
 }
 
-impl TextService {
-    pub fn advise_text_layout_sink(&mut self, doc_mgr: ITfDocumentMgr) -> Result<()> {
+// These live on the factory (not TextService) because they need the COM
+// object for the sink QI; they touch only the global IMEState, never the
+// TextService fields, so no RefCell borrow is involved.
+impl TextServiceFactory {
+    pub fn advise_text_layout_sink(&self, doc_mgr: ITfDocumentMgr) -> Result<()> {
         if IMEState::get()?.context.is_some() {
             self.unadvise_text_layout_sink()?;
         }
@@ -68,7 +71,7 @@ impl TextService {
         }
     }
 
-    pub fn unadvise_text_layout_sink(&mut self) -> Result<()> {
+    pub fn unadvise_text_layout_sink(&self) -> Result<()> {
         unsafe {
             let mut state = IMEState::get()?;
 

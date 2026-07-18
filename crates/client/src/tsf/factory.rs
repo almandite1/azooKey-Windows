@@ -4,7 +4,7 @@ use std::{
 };
 
 use windows::{
-    core::{implement, AsImpl, IUnknown, Interface, GUID},
+    core::{implement, IUnknown, Interface, GUID},
     Win32::{
         Foundation::{BOOL, E_NOINTERFACE},
         System::Com::{IClassFactory, IClassFactory_Impl},
@@ -102,11 +102,24 @@ impl TextServiceFactory {
             text_service: RefCell::new(TextService::default()),
         };
 
+        // Moving into the interface places the factory in its COM heap
+        // allocation; no stored self-reference (see `this()` below).
         let this = ITfTextInputProcessor::from(factory);
-        let factory = unsafe { this.as_impl() };
-        factory.borrow_mut()?.this = Some(this.clone());
+        this.cast::<I>().map_err(anyhow::Error::new)
+    }
 
-        unsafe { factory.cast::<I>().map_err(anyhow::Error::new) }
+    /// QueryInterface on the containing COM object. Replaces the old stored
+    /// `TextService.this` self-reference, which kept the refcount above zero
+    /// forever and leaked one TextService per profile switch (B15). Both
+    /// paths are a QI on the same COM identity, so the sink pointers handed
+    /// to TSF are unchanged.
+    ///
+    /// SAFETY invariant: every `TextServiceFactory` is moved into its COM
+    /// allocation (via `ITfTextInputProcessor::from` / `IUnknown::from` in
+    /// `create()` and `CreateInstance`) before any method is called on it;
+    /// no bare stack instance ever calls `this()`.
+    pub fn this<I: Interface>(&self) -> Result<I> {
+        unsafe { self.cast::<I>().map_err(anyhow::Error::new) }
     }
 
     pub fn borrow_mut(&self) -> Result<RefMut<'_, TextService>> {

@@ -27,7 +27,7 @@ impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
 
         // if focus is changed, the text layout sink should be updated
         if let Some(focus) = focus {
-            self.borrow_mut()?.advise_text_layout_sink(focus.clone())?;
+            self.advise_text_layout_sink(focus.clone())?;
         }
 
         let actions = vec![ClientAction::EndComposition];

@@ -6,7 +6,7 @@ use std::{
 
 use windows::{
     core::{Interface, GUID},
-    Win32::UI::TextServices::{ITfContext, ITfTextInputProcessor, ITfThreadMgr},
+    Win32::UI::TextServices::{ITfContext, ITfThreadMgr},
 };
 
 use anyhow::{Context, Result};
@@ -74,18 +74,13 @@ pub struct TextService {
     pub update_pos_state: UpdatePosState,
     pub display_attribute_atom: HashMap<GUID, u32>,
     pub mode: InputMode,
-    pub this: Option<ITfTextInputProcessor>,
+    // NOTE: no `this` self-reference here. The COM object is reachable from
+    // any TSF callback via TextServiceFactory::this() (a QueryInterface on
+    // the containing allocation); storing a strong interface pointer in the
+    // object itself created a refcount cycle that leaked every instance (B15).
 }
 
 impl TextService {
-    pub fn this<I: Interface>(&self) -> Result<I> {
-        if let Some(this) = self.this.as_ref() {
-            Ok(this.cast()?)
-        } else {
-            anyhow::bail!("this is null");
-        }
-    }
-
     pub fn thread_mgr(&self) -> Result<ITfThreadMgr> {
         self.thread_mgr.clone().context("Thread manager is null")
     }

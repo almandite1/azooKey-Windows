@@ -62,7 +62,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         unsafe {
             thread_mgr.cast::<ITfKeystrokeMgr>()?.AdviseKeyEventSink(
                 tid,
-                &text_service.this::<ITfKeyEventSink>()?,
+                &self.this::<ITfKeyEventSink>()?,
                 BOOL::from(true),
             )?;
         };
@@ -72,7 +72,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         unsafe {
             let cookie = thread_mgr.cast::<ITfSource>()?.AdviseSink(
                 &ITfThreadMgrEventSink::IID,
-                &text_service.this::<ITfThreadMgrEventSink>()?,
+                &self.this::<ITfThreadMgrEventSink>()?,
             )?;
             IMEState::get()?
                 .cookies
@@ -83,7 +83,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         tracing::debug!("AdviseTextLayoutSink");
         let doc_mgr = unsafe { thread_mgr.GetFocus() };
         if let Ok(doc_mgr) = doc_mgr {
-            text_service.advise_text_layout_sink(doc_mgr)?;
+            self.advise_text_layout_sink(doc_mgr)?;
         }
 
         // initialize display attribute
@@ -105,7 +105,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         unsafe {
             thread_mgr
                 .cast::<ITfLangBarItemMgr>()?
-                .AddItem(&text_service.this::<ITfLangBarItemButton>()?)?;
+                .AddItem(&self.this::<ITfLangBarItemButton>()?)?;
         };
 
         tracing::debug!("Activate success");
@@ -141,7 +141,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             unsafe {
                 thread_mgr
                     .cast::<ITfLangBarItemMgr>()?
-                    .RemoveItem(&text_service.this::<ITfLangBarItemButton>()?)
+                    .RemoveItem(&self.this::<ITfLangBarItemButton>()?)
             }?;
         }
 
@@ -158,19 +158,22 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
 
         // remove text layout sink
         tracing::debug!("UnadviseTextLayoutSink");
-        text_service.unadvise_text_layout_sink()?;
+        self.unadvise_text_layout_sink()?;
 
         // clear display attribute
         text_service.display_attribute_atom.clear();
 
         text_service.tid = 0;
         text_service.thread_mgr = None;
-        // NOTE: do NOT clear `this` here. TSF reuses the same TextService
-        // object across Deactivate/Activate cycles (every IME switch), and
-        // `this` is only ever set once in create(). Clearing it makes the
-        // NEXT Activate fail at `this::<ITfKeyEventSink>()`, leaving the IME
-        // unselectable (the previous IME's icon stays). The self-reference
-        // leak this once tried to fix must be solved another way (weak ref).
+        // Also let go of the last document's context: handle_key re-sets it
+        // on every keystroke after the next Activate, and end_composition()
+        // above already ran, so nothing dereferences it in between. Keeping
+        // it would pin the host's ITfContext while the TIP is deactivated.
+        // (The old `this` self-reference is gone entirely — TSF reuses this
+        // object across Deactivate/Activate cycles, and every callback now
+        // reaches its COM interfaces via TextServiceFactory::this(), a QI on
+        // the containing allocation, so there is nothing to clear or restore.)
+        text_service.context = None;
 
         tracing::debug!("Deactivate success");
 
