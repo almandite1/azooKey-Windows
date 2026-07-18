@@ -22,7 +22,7 @@ impl IPCService {
 
         // lazy: no connection is attempted until the first RPC, and tonic
         // reconnects automatically after the server restarts
-        let server_channel = shared::pipe::lazy_pipe_channel(shared::pipe::SERVER_PIPE)?;
+        let server_channel = shared::pipe::lazy_pipe_channel(shared::pipe::server_pipe())?;
         let azookey_client = AzookeyServiceClient::new(server_channel);
 
         Ok(Self {

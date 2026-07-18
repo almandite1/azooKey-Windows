@@ -86,8 +86,8 @@ impl IPCService {
         // on demand and tonic re-establishes the connection after transport
         // failures, so the IME recovers automatically when the server or UI
         // process restarts — without re-activating the text service.
-        let server_channel = shared::pipe::lazy_pipe_channel(shared::pipe::SERVER_PIPE)?;
-        let ui_channel = shared::pipe::lazy_pipe_channel(shared::pipe::UI_PIPE)?;
+        let server_channel = shared::pipe::lazy_pipe_channel(shared::pipe::server_pipe())?;
+        let ui_channel = shared::pipe::lazy_pipe_channel(shared::pipe::ui_pipe())?;
 
         let azookey_client = AzookeyServiceClient::new(server_channel);
         let window_client = WindowServiceClient::new(ui_channel);

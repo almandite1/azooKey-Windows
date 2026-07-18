@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // start grpc server
-    let incoming = TonicNamedPipeServer::new("azookey_ui")?;
+    let incoming = TonicNamedPipeServer::new(&shared::pipe::ui_pipe_base())?;
     // health service for the launcher's watchdog. The reported status
     // follows the EVENT LOOP's liveness (via the heartbeat below), so a
     // stalled window loop turns the whole process NOT_SERVING even while

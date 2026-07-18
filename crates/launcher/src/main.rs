@@ -190,10 +190,12 @@ async fn main() -> anyhow::Result<()> {
     init_log_file();
 
     // single-instance guard: the scheduled task and a manual start can race,
-    // and two launchers would fight over the (machine-global) pipe names —
-    // the loser's server dies on first_pipe_instance and burns through its
-    // restart budget. Global\ namespace matches the pipes' global scope.
-    match another_instance_running(w!("Global\\AzookeyLauncherSingleton")) {
+    // and two launchers would fight over this session's pipe names — the
+    // loser's server dies on first_pipe_instance and burns through its
+    // restart budget. Local\ = one launcher PER SESSION, matching the
+    // session-scoped pipe names (B19): another user's session runs its own
+    // whole stack instead of being locked out by this one.
+    match another_instance_running(w!("Local\\AzookeyLauncherSingleton")) {
         Ok(true) => {
             log_err("another azooKey launcher is already running; exiting");
             return Ok(());
@@ -235,9 +237,9 @@ async fn main() -> anyhow::Result<()> {
     let server_handle = tokio::spawn(run_supervisor(
         "azookey-server.exe",
         "[server]",
-        shared::pipe::SERVER_PIPE,
+        shared::pipe::server_pipe(),
     ));
-    let ui_handle = tokio::spawn(run_supervisor("ui.exe", "[ui]", shared::pipe::UI_PIPE));
+    let ui_handle = tokio::spawn(run_supervisor("ui.exe", "[ui]", shared::pipe::ui_pipe()));
 
     let _ = server_handle.await;
     let _ = ui_handle.await;
@@ -254,8 +256,8 @@ async fn main() -> anyhow::Result<()> {
 /// that mutex (letting a fresh launch recover) and, via the job's
 /// KILL_ON_JOB_CLOSE, tears down the other child so it can't linger and hold
 /// the pipe names.
-async fn run_supervisor(exe: &'static str, prefix: &'static str, pipe_name: &'static str) {
-    if supervise(exe, prefix, pipe_name).await == SuperviseOutcome::GaveUp {
+async fn run_supervisor(exe: &'static str, prefix: &'static str, pipe_name: String) {
+    if supervise(exe, prefix, &pipe_name).await == SuperviseOutcome::GaveUp {
         log_err(&format!(
             "{prefix} is unrecoverable; exiting the launcher so a fresh start can take over"
         ));
@@ -277,11 +279,7 @@ enum SuperviseOutcome {
 /// Keeps a child process running: restarts it when it exits abnormally or
 /// stops answering health checks, with exponential backoff, and gives up on
 /// a tight crash/hang loop.
-async fn supervise(
-    exe: &'static str,
-    prefix: &'static str,
-    pipe_name: &'static str,
-) -> SuperviseOutcome {
+async fn supervise(exe: &'static str, prefix: &'static str, pipe_name: &str) -> SuperviseOutcome {
     let mut recent_restarts: Vec<Instant> = Vec::new();
     let mut backoff = Duration::from_secs(1);
     let mut consecutive_watchdog_kills: u32 = 0;
@@ -365,8 +363,8 @@ async fn supervise(
 
 /// Resolves only when the peer is declared hung. Sets `saw_healthy` as soon
 /// as one health check succeeds.
-async fn watchdog(pipe_name: &'static str, prefix: &'static str, saw_healthy: Arc<AtomicBool>) {
-    let Ok(channel) = shared::pipe::lazy_pipe_channel(pipe_name) else {
+async fn watchdog(pipe_name: &str, prefix: &'static str, saw_healthy: Arc<AtomicBool>) {
+    let Ok(channel) = shared::pipe::lazy_pipe_channel(pipe_name.to_string()) else {
         // cannot even build a channel: run without hang detection rather
         // than killing a possibly-fine child
         log_err(&format!(
