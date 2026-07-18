@@ -20,19 +20,23 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use windows::{
-    core::{implement, IUnknown, Result as WinResult, GUID, PCWSTR, PWSTR, VARIANT},
+    core::{implement, BSTR, IUnknown, Result as WinResult, GUID, PCWSTR, PWSTR, VARIANT},
     Win32::{
-        Foundation::{BOOL, E_FAIL, E_NOTIMPL, S_OK},
+        Foundation::{BOOL, E_FAIL, E_NOTIMPL, HWND, LPARAM, RECT, S_OK, WPARAM},
         System::Com::IDataObject,
         UI::TextServices::{
-            IEnumITfCompositionView, IEnumTfContextViews, IEnumTfProperties, IEnumTfRanges,
+            IEnumITfCompositionView, IEnumTfContextViews, IEnumTfDocumentMgrs,
+            IEnumTfFunctionProviders, IEnumTfLangBarItems, IEnumTfProperties, IEnumTfRanges,
             ITfComposition, ITfCompositionSink, ITfCompositionView, ITfComposition_Impl,
-            ITfContext, ITfContextComposition, ITfContextComposition_Impl, ITfContextView,
-            ITfContext_Impl, ITfDocumentMgr, ITfEditSession, ITfInsertAtSelection,
-            ITfInsertAtSelection_Impl, ITfProperty, ITfPropertyStore, ITfProperty_Impl, ITfRange,
-            ITfRangeBackup, ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl,
-            INSERT_TEXT_AT_SELECTION_FLAGS, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_E_SYNCHRONOUS,
-            TF_ES_SYNC, TF_HALTCOND, TF_S_ASYNC, TS_STATUS,
+            ITfCompartmentMgr, ITfContext, ITfContextComposition, ITfContextComposition_Impl,
+            ITfContextView, ITfContext_Impl, ITfDocumentMgr, ITfEditSession, ITfFunctionProvider,
+            ITfInsertAtSelection, ITfInsertAtSelection_Impl, ITfKeyEventSink, ITfKeystrokeMgr,
+            ITfKeystrokeMgr_Impl, ITfLangBarItem, ITfLangBarItemMgr, ITfLangBarItemMgr_Impl,
+            ITfLangBarItemSink, ITfProperty, ITfPropertyStore, ITfProperty_Impl, ITfRange,
+            ITfRangeBackup, ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl, ITfSource,
+            ITfSource_Impl, ITfThreadMgr, ITfThreadMgr_Impl, INSERT_TEXT_AT_SELECTION_FLAGS,
+            TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_E_SYNCHRONOUS, TF_ES_SYNC, TF_HALTCOND,
+            TF_LANGBARITEMINFO, TF_PRESERVEDKEY, TF_S_ASYNC, TS_STATUS,
         },
     },
 };
@@ -574,6 +578,247 @@ impl ITfComposition_Impl for FakeComposition_Impl {
 
     fn EndComposition(&self, _ecwrite: u32) -> WinResult<()> {
         Ok(())
+    }
+}
+
+/// What a [`FakeThreadMgr`] recorded while a TIP activated and deactivated
+/// against it. Lets a test prove the sinks the TIP advised on Activate are
+/// exactly the ones it unadvises on Deactivate — no leak, no double-advise.
+#[derive(Default)]
+pub struct ThreadMgrLog {
+    /// One entry per `AdviseKeyEventSink`; `true` means a live sink was
+    /// passed. A `false` (or a missing entry) is the B15 regression: with
+    /// `this` cleared, the TIP cannot produce its key sink and Activate dies
+    /// before it ever reaches this call.
+    pub key_sink_advises: RefCell<Vec<bool>>,
+    pub key_sink_unadvises: Cell<u32>,
+    /// Cookies handed out from `ITfSource::AdviseSink` (the thread-manager
+    /// event sink), and the cookies later passed back to `UnadviseSink`.
+    pub advise_cookies: RefCell<Vec<u32>>,
+    pub unadvise_cookies: RefCell<Vec<u32>>,
+    pub langbar_adds: Cell<u32>,
+    pub langbar_removes: Cell<u32>,
+    next_cookie: Cell<u32>,
+}
+
+/// A fake `ITfThreadMgr` that answers just enough of TSF for the TIP's
+/// `Activate`/`Deactivate` to run end to end in a unit test, and records the
+/// advise/unadvise traffic. `GetFocus` deliberately reports no focus so the
+/// text-layout-sink path (which needs a real document manager) is skipped.
+#[implement(ITfThreadMgr, ITfKeystrokeMgr, ITfSource, ITfLangBarItemMgr)]
+pub struct FakeThreadMgr {
+    log: Rc<ThreadMgrLog>,
+}
+
+impl FakeThreadMgr {
+    pub fn new(log: Rc<ThreadMgrLog>) -> ITfThreadMgr {
+        FakeThreadMgr { log }.into()
+    }
+}
+
+impl ITfThreadMgr_Impl for FakeThreadMgr_Impl {
+    fn Activate(&self) -> WinResult<u32> {
+        Err(E_NOTIMPL.into())
+    }
+    fn Deactivate(&self) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn CreateDocumentMgr(&self) -> WinResult<ITfDocumentMgr> {
+        Err(E_NOTIMPL.into())
+    }
+    fn EnumDocumentMgrs(&self) -> WinResult<IEnumTfDocumentMgrs> {
+        Err(E_NOTIMPL.into())
+    }
+    fn GetFocus(&self) -> WinResult<ITfDocumentMgr> {
+        // No focus: the TIP's `if let Ok(doc_mgr)` skips advising the text
+        // layout sink, which would otherwise need a real document manager.
+        Err(E_FAIL.into())
+    }
+    fn SetFocus(&self, _pdimfocus: Option<&ITfDocumentMgr>) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn AssociateFocus(
+        &self,
+        _hwnd: HWND,
+        _pdimnew: Option<&ITfDocumentMgr>,
+    ) -> WinResult<ITfDocumentMgr> {
+        Err(E_NOTIMPL.into())
+    }
+    fn IsThreadFocus(&self) -> WinResult<BOOL> {
+        Err(E_NOTIMPL.into())
+    }
+    fn GetFunctionProvider(&self, _clsid: *const GUID) -> WinResult<ITfFunctionProvider> {
+        Err(E_NOTIMPL.into())
+    }
+    fn EnumFunctionProviders(&self) -> WinResult<IEnumTfFunctionProviders> {
+        Err(E_NOTIMPL.into())
+    }
+    fn GetGlobalCompartment(&self) -> WinResult<ITfCompartmentMgr> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
+impl ITfKeystrokeMgr_Impl for FakeThreadMgr_Impl {
+    fn AdviseKeyEventSink(
+        &self,
+        _tid: u32,
+        psink: Option<&ITfKeyEventSink>,
+        _fforeground: BOOL,
+    ) -> WinResult<()> {
+        self.log.key_sink_advises.borrow_mut().push(psink.is_some());
+        Ok(())
+    }
+    fn UnadviseKeyEventSink(&self, _tid: u32) -> WinResult<()> {
+        self.log
+            .key_sink_unadvises
+            .set(self.log.key_sink_unadvises.get() + 1);
+        Ok(())
+    }
+    fn GetForeground(&self) -> WinResult<GUID> {
+        Err(E_NOTIMPL.into())
+    }
+    fn TestKeyDown(&self, _wparam: WPARAM, _lparam: LPARAM) -> WinResult<BOOL> {
+        Err(E_NOTIMPL.into())
+    }
+    fn TestKeyUp(&self, _wparam: WPARAM, _lparam: LPARAM) -> WinResult<BOOL> {
+        Err(E_NOTIMPL.into())
+    }
+    fn KeyDown(&self, _wparam: WPARAM, _lparam: LPARAM) -> WinResult<BOOL> {
+        Err(E_NOTIMPL.into())
+    }
+    fn KeyUp(&self, _wparam: WPARAM, _lparam: LPARAM) -> WinResult<BOOL> {
+        Err(E_NOTIMPL.into())
+    }
+    fn GetPreservedKey(
+        &self,
+        _pic: Option<&ITfContext>,
+        _pprekey: *const TF_PRESERVEDKEY,
+    ) -> WinResult<GUID> {
+        Err(E_NOTIMPL.into())
+    }
+    fn IsPreservedKey(
+        &self,
+        _rguid: *const GUID,
+        _pprekey: *const TF_PRESERVEDKEY,
+    ) -> WinResult<BOOL> {
+        Err(E_NOTIMPL.into())
+    }
+    fn PreserveKey(
+        &self,
+        _tid: u32,
+        _rguid: *const GUID,
+        _prekey: *const TF_PRESERVEDKEY,
+        _pchdesc: &PCWSTR,
+        _cchdesc: u32,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn UnpreserveKey(
+        &self,
+        _rguid: *const GUID,
+        _pprekey: *const TF_PRESERVEDKEY,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn SetPreservedKeyDescription(
+        &self,
+        _rguid: *const GUID,
+        _pchdesc: &PCWSTR,
+        _cchdesc: u32,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn GetPreservedKeyDescription(&self, _rguid: *const GUID) -> WinResult<BSTR> {
+        Err(E_NOTIMPL.into())
+    }
+    fn SimulatePreservedKey(
+        &self,
+        _pic: Option<&ITfContext>,
+        _rguid: *const GUID,
+    ) -> WinResult<BOOL> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
+impl ITfSource_Impl for FakeThreadMgr_Impl {
+    fn AdviseSink(&self, _riid: *const GUID, punk: Option<&IUnknown>) -> WinResult<u32> {
+        if punk.is_none() {
+            return Err(E_FAIL.into());
+        }
+        let cookie = self.log.next_cookie.get() + 1;
+        self.log.next_cookie.set(cookie);
+        self.log.advise_cookies.borrow_mut().push(cookie);
+        Ok(cookie)
+    }
+    fn UnadviseSink(&self, dwcookie: u32) -> WinResult<()> {
+        self.log.unadvise_cookies.borrow_mut().push(dwcookie);
+        Ok(())
+    }
+}
+
+impl ITfLangBarItemMgr_Impl for FakeThreadMgr_Impl {
+    fn EnumItems(&self) -> WinResult<IEnumTfLangBarItems> {
+        Err(E_NOTIMPL.into())
+    }
+    fn GetItem(&self, _rguid: *const GUID) -> WinResult<ITfLangBarItem> {
+        Err(E_NOTIMPL.into())
+    }
+    fn AddItem(&self, _punk: Option<&ITfLangBarItem>) -> WinResult<()> {
+        self.log.langbar_adds.set(self.log.langbar_adds.get() + 1);
+        Ok(())
+    }
+    fn RemoveItem(&self, _punk: Option<&ITfLangBarItem>) -> WinResult<()> {
+        self.log
+            .langbar_removes
+            .set(self.log.langbar_removes.get() + 1);
+        Ok(())
+    }
+    fn AdviseItemSink(
+        &self,
+        _punk: Option<&ITfLangBarItemSink>,
+        _pdwcookie: *mut u32,
+        _rguiditem: *const GUID,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn UnadviseItemSink(&self, _dwcookie: u32) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn GetItemFloatingRect(&self, _dwthreadid: u32, _rguid: *const GUID) -> WinResult<RECT> {
+        Err(E_NOTIMPL.into())
+    }
+    fn GetItemsStatus(
+        &self,
+        _ulcount: u32,
+        _prgguid: *const GUID,
+        _pdwstatus: *mut u32,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn GetItemNum(&self) -> WinResult<u32> {
+        Ok(0)
+    }
+    fn GetItems(
+        &self,
+        _ulcount: u32,
+        _ppitem: *mut Option<ITfLangBarItem>,
+        _pinfo: *mut TF_LANGBARITEMINFO,
+        _pdwstatus: *mut u32,
+        _pcfetched: *mut u32,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn AdviseItemsSink(
+        &self,
+        _ulcount: u32,
+        _ppunk: *const Option<ITfLangBarItemSink>,
+        _pguiditem: *const GUID,
+        _pdwcookie: *mut u32,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn UnadviseItemsSink(&self, _ulcount: u32, _pdwcookie: *const u32) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
     }
 }
 
