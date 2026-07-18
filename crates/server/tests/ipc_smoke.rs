@@ -192,6 +192,93 @@ async fn long_composition_shrink_does_not_kill_the_server() {
 
 #[tokio::test]
 #[ignore = "requires a running azookey-server with its DLL environment"]
+async fn conversion_yields_the_expected_candidate() {
+    // The canonical end-to-end proof: the whole pipe -> gRPC -> Swift FFI ->
+    // kana-kanji conversion path is alive and returns real candidates. This
+    // is the "mizu -> 水" conversion the reactor-panic fix (70d367c) finally
+    // made work in a real app; if any link in that chain regresses, the
+    // roundtrip tests still pass but this one stops finding 水.
+    let mut client = connect().await;
+    client
+        .clear_text(shared::proto::ClearTextRequest {})
+        .await
+        .expect("clear_text failed");
+
+    let mut composing = None;
+    for key in ["m", "i", "z", "u"] {
+        composing = Some(
+            client
+                .append_text(shared::proto::AppendTextRequest {
+                    text_to_append: key.to_string(),
+                })
+                .await
+                .expect("append_text failed")
+                .into_inner()
+                .composing_text
+                .expect("composing_text missing"),
+        );
+    }
+    let composing = composing.expect("no keystrokes were sent");
+
+    assert_eq!(composing.hiragana, "みず", "roman 'mizu' should read みず");
+    let candidates: Vec<&str> = composing.suggestions.iter().map(|s| s.text.as_str()).collect();
+    assert!(
+        candidates.contains(&"水"),
+        "水 should be among the candidates for みず, got {candidates:?}"
+    );
+
+    client
+        .clear_text(shared::proto::ClearTextRequest {})
+        .await
+        .expect("clear_text failed");
+}
+
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment"]
+async fn server_accepts_a_reconnection_after_a_client_drops() {
+    // Recovery from the server's side: when a client process goes away, the
+    // server must free that session and keep accepting new connections. This
+    // is the automatable half of "the IME recovers when a peer restarts" —
+    // the client-side lazy reconnect after an engine restart still needs the
+    // manual checklist, since a test can't restart the server it depends on.
+    {
+        let mut first = connect().await;
+        let response = first
+            .append_text(shared::proto::AppendTextRequest {
+                text_to_append: "a".to_string(),
+            })
+            .await
+            .expect("append_text failed")
+            .into_inner();
+        assert_eq!(
+            response.composing_text.expect("composing_text missing").hiragana,
+            "あ"
+        );
+        // dropping `first` closes its pipe connection = the client "went away"
+    }
+
+    // a brand-new connection (new pipe, new session) must still be served
+    let mut second = connect().await;
+    let response = second
+        .append_text(shared::proto::AppendTextRequest {
+            text_to_append: "a".to_string(),
+        })
+        .await
+        .expect("server did not accept a reconnection after the first client dropped")
+        .into_inner();
+    assert_eq!(
+        response.composing_text.expect("composing_text missing").hiragana,
+        "あ"
+    );
+
+    second
+        .clear_text(shared::proto::ClearTextRequest {})
+        .await
+        .expect("clear_text failed");
+}
+
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment"]
 async fn hostile_inputs_do_not_kill_the_server() {
     let mut client = connect().await;
 
