@@ -165,12 +165,12 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
 
         text_service.tid = 0;
         text_service.thread_mgr = None;
-        // break the self-reference: `this` holds an ITfTextInputProcessor to
-        // our own object, so without this the TextService — and the
-        // ITfContext that `context` pins — never reaches refcount 0 and leaks
-        // on every profile switch
-        text_service.this = None;
-        text_service.context = None;
+        // NOTE: do NOT clear `this` here. TSF reuses the same TextService
+        // object across Deactivate/Activate cycles (every IME switch), and
+        // `this` is only ever set once in create(). Clearing it makes the
+        // NEXT Activate fail at `this::<ITfKeyEventSink>()`, leaving the IME
+        // unselectable (the previous IME's icon stays). The self-reference
+        // leak this once tried to fix must be solved another way (weak ref).
 
         tracing::debug!("Deactivate success");
 
