@@ -52,34 +52,39 @@ pub fn setup_logger() -> anyhow::Result<()> {
             .try_init();
         return Ok(());
     }
-    let Some(folder) = log_folder() else {
-        return Ok(());
-    };
-    if std::fs::create_dir_all(&folder).is_err() {
-        return Ok(());
+    // the cfg block keeps the debug-only path out of release builds without
+    // an unreachable-code warning after the early return above
+    #[cfg(debug_assertions)]
+    {
+        let Some(folder) = log_folder() else {
+            return Ok(());
+        };
+        if std::fs::create_dir_all(&folder).is_err() {
+            return Ok(());
+        }
+        // Plain per-process text log. The old ChromeLayer JSON writer corrupted
+        // its own output (duplicated ".json.json..." filenames, truncated/empty
+        // files), which made field diagnosis impossible. One appendable text
+        // file per PID is robust and greppable.
+        let path = folder.join(format!("client-{}.log", std::process::id()));
+        let Ok(file) = std::fs::File::create(&path) else {
+            return Ok(());
+        };
+
+        // ignore traces from other crates
+        let filter = Targets::new()
+            .with_target("azookey_windows", LevelFilter::DEBUG)
+            .with_default(LevelFilter::OFF);
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file));
+
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .try_init();
+
+        Ok(())
     }
-    // Plain per-process text log. The old ChromeLayer JSON writer corrupted
-    // its own output (duplicated ".json.json..." filenames, truncated/empty
-    // files), which made field diagnosis impossible. One appendable text
-    // file per PID is robust and greppable.
-    let path = folder.join(format!("client-{}.log", std::process::id()));
-    let Ok(file) = std::fs::File::create(&path) else {
-        return Ok(());
-    };
-
-    // ignore traces from other crates
-    let filter = Targets::new()
-        .with_target("azookey_windows", LevelFilter::DEBUG)
-        .with_default(LevelFilter::OFF);
-
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(std::sync::Mutex::new(file));
-
-    let _ = tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt_layer)
-        .try_init();
-
-    Ok(())
 }
