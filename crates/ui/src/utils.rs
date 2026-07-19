@@ -207,7 +207,10 @@ mod tests {
             clamp_indicator_position(1900, 1020, 90, 90, &WORK),
             (1830, 950)
         );
-        assert_eq!(clamp_indicator_position(100, 500, 90, 90, &WORK), (100, 500));
+        assert_eq!(
+            clamp_indicator_position(100, 500, 90, 90, &WORK),
+            (100, 500)
+        );
     }
 
     #[test]

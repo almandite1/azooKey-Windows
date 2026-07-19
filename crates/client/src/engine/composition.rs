@@ -13,7 +13,9 @@ use super::{
     ipc_service::Candidates,
     state::IMEState,
     text_util::{to_half_katakana, to_katakana},
-    transition::{transition, KeystrokeContext},
+    transition::{
+        is_modifier_key, shortcut_transition, transition, KeyDisposition, KeystrokeContext,
+    },
 };
 use windows::Win32::{
     Foundation::WPARAM,
@@ -86,23 +88,30 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
 }
 
 impl TextServiceFactory {
-    /// Impure shell around the pure transition table
-    /// (engine::transition::transition): reads the OS/COM state the table
-    /// needs, decodes the key, and adapts the result. New key bindings
-    /// belong in the table, not here.
+    /// Impure shell around the pure decision functions
+    /// (engine::transition): reads the OS/COM state they need, decodes the
+    /// key, and adapts the result. New key bindings belong in the
+    /// transition table, not here.
     #[tracing::instrument]
     pub fn process_key(
         &self,
         context: Option<&ITfContext>,
         wparam: WPARAM,
-    ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
+    ) -> Result<Option<(Vec<ClientAction>, CompositionState, KeyDisposition)>> {
         if context.is_none() {
             return Ok(None);
         };
 
-        // check shortcut keys
+        // a Ctrl chord is the host's shortcut: cancel any composition so
+        // the shortcut actually works (issue #5), and never eat the key
         if VK_CONTROL.is_pressed() {
-            return Ok(None);
+            let state = {
+                let text_service = self.borrow()?;
+                let state = text_service.borrow_composition()?.state.clone();
+                state
+            };
+            return Ok(shortcut_transition(&state, is_modifier_key(wparam.0))
+                .map(|(next_state, actions)| (actions, next_state, KeyDisposition::PassThrough)));
         }
 
         let ctx = {
@@ -118,7 +127,28 @@ impl TextServiceFactory {
 
         let action = UserAction::try_from(wparam.0)?;
 
-        Ok(transition(&ctx, action).map(|(next_state, actions)| (actions, next_state)))
+        Ok(transition(&ctx, action)
+            .map(|(next_state, actions)| (actions, next_state, KeyDisposition::Eat)))
+    }
+
+    /// Answers OnTestKeyDown. Pass-through actions (canceling the
+    /// composition on a shortcut) must run HERE: once we answer "not
+    /// eaten", the host processes the key itself and never calls
+    /// OnKeyDown. Canceling twice is harmless (a no-op without a live
+    /// composition), so a host that probes speculatively stays safe.
+    #[tracing::instrument]
+    pub fn test_key(&self, context: Option<&ITfContext>, wparam: WPARAM) -> Result<bool> {
+        match self.process_key(context, wparam)? {
+            None => Ok(false),
+            Some((actions, next_state, KeyDisposition::PassThrough)) => {
+                if let Some(context) = context {
+                    self.borrow_mut()?.context = Some(context.clone());
+                }
+                self.handle_action(&actions, next_state)?;
+                Ok(false)
+            }
+            Some((_, _, KeyDisposition::Eat)) => Ok(true),
+        }
     }
 
     #[tracing::instrument]
@@ -129,13 +159,12 @@ impl TextServiceFactory {
             return Ok(false);
         };
 
-        if let Some((actions, transition)) = self.process_key(context, wparam)? {
+        if let Some((actions, transition, disposition)) = self.process_key(context, wparam)? {
             self.handle_action(&actions, transition)?;
+            Ok(disposition == KeyDisposition::Eat)
         } else {
-            return Ok(false);
+            Ok(false)
         }
-
-        Ok(true)
     }
 
     #[tracing::instrument]

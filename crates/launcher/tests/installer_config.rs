@@ -167,8 +167,8 @@ fn build_glob_excludes_the_registered_dll() {
 /// bug the machine-wide move (297a054) fixed everywhere else.
 #[test]
 fn tauri_settings_app_installs_per_machine() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../frontend/src-tauri/tauri.conf.json");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/src-tauri/tauri.conf.json");
     let conf = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     let json: serde_json::Value = serde_json::from_str(&conf).expect("tauri.conf.json is JSON");
@@ -234,8 +234,8 @@ fn product_version_is_single_sourced() {
         "TauriAppVersion must not be hardcoded in Installer.iss"
     );
 
-    let tauri_conf_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../frontend/src-tauri/tauri.conf.json");
+    let tauri_conf_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/src-tauri/tauri.conf.json");
     let tauri_conf = std::fs::read_to_string(&tauri_conf_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", tauri_conf_path.display()));
     assert!(

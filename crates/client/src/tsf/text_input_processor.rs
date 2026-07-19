@@ -194,7 +194,7 @@ mod tests {
     use std::sync::Mutex;
 
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-    use windows::Win32::UI::TextServices::{ITfThreadMgr, ITfTextInputProcessor};
+    use windows::Win32::UI::TextServices::{ITfTextInputProcessor, ITfThreadMgr};
 
     use crate::engine::state::IMEState;
     use crate::globals::{DllModule, DLL_INSTANCE};
@@ -256,10 +256,10 @@ mod tests {
         let log_b = Rc::new(ThreadMgrLog::with_cookie_base(200));
         let tm_a = FakeThreadMgr::new(log_a.clone());
         let tm_b = FakeThreadMgr::new(log_b.clone());
-        let tip_a = TextServiceFactory::create::<ITfTextInputProcessor>()
-            .expect("failed to create TIP A");
-        let tip_b = TextServiceFactory::create::<ITfTextInputProcessor>()
-            .expect("failed to create TIP B");
+        let tip_a =
+            TextServiceFactory::create::<ITfTextInputProcessor>().expect("failed to create TIP A");
+        let tip_b =
+            TextServiceFactory::create::<ITfTextInputProcessor>().expect("failed to create TIP B");
 
         unsafe { tip_a.Activate(Some(&tm_a), 1) }.expect("Activate A must succeed");
         unsafe { tip_b.Activate(Some(&tm_b), 2) }.expect("Activate B must succeed");

@@ -71,7 +71,10 @@ pub fn handle_window_action(
             // physical-px window stayed too small at high DPI and clipped
             // the candidate text (B20)
             let scale = candidate_window.scale_factor();
-            let height = candidate_window.inner_size().to_logical::<f64>(scale).height;
+            let height = candidate_window
+                .inner_size()
+                .to_logical::<f64>(scale)
+                .height;
             candidate_window.set_inner_size(LogicalSize::new(
                 utils::candidate_window_logical_width(max_len) as f64,
                 height,

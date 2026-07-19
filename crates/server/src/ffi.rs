@@ -36,8 +36,7 @@ unsafe extern "C" {
         cursorPtr: *mut c_int,
     ) -> *mut c_char;
     pub(crate) fn RemoveText(session: c_int, cursorPtr: *mut c_int) -> *mut c_char;
-    pub(crate) fn MoveCursor(session: c_int, offset: c_int, cursorPtr: *mut c_int)
-        -> *mut c_char;
+    pub(crate) fn MoveCursor(session: c_int, offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
     pub(crate) fn ShrinkText(session: c_int, offset: c_int) -> *mut c_char;
     pub(crate) fn ClearText(session: c_int);
     pub(crate) fn GetComposedText(session: c_int, lengthPtr: *mut c_int) -> *mut *mut FFICandidate;

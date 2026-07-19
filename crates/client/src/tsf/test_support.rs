@@ -21,15 +21,15 @@ use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use windows::{
-    core::{implement, BSTR, IUnknown, Result as WinResult, GUID, PCWSTR, PWSTR, VARIANT},
+    core::{implement, IUnknown, Result as WinResult, BSTR, GUID, PCWSTR, PWSTR, VARIANT},
     Win32::{
         Foundation::{BOOL, E_FAIL, E_NOTIMPL, HWND, LPARAM, POINT, RECT, S_OK, WPARAM},
         System::Com::IDataObject,
         UI::TextServices::{
             IEnumITfCompositionView, IEnumTfContextViews, IEnumTfContexts, IEnumTfDocumentMgrs,
             IEnumTfFunctionProviders, IEnumTfLangBarItems, IEnumTfProperties, IEnumTfRanges,
-            ITfComposition, ITfCompositionSink, ITfCompositionView, ITfComposition_Impl,
-            ITfCompartmentMgr, ITfContext, ITfContextComposition, ITfContextComposition_Impl,
+            ITfCompartmentMgr, ITfComposition, ITfCompositionSink, ITfCompositionView,
+            ITfComposition_Impl, ITfContext, ITfContextComposition, ITfContextComposition_Impl,
             ITfContextView, ITfContextView_Impl, ITfContext_Impl, ITfDocumentMgr,
             ITfDocumentMgr_Impl, ITfEditSession, ITfFunctionProvider, ITfInsertAtSelection,
             ITfInsertAtSelection_Impl, ITfKeyEventSink, ITfKeystrokeMgr, ITfKeystrokeMgr_Impl,
@@ -37,7 +37,7 @@ use windows::{
             ITfProperty, ITfPropertyStore, ITfProperty_Impl, ITfRange, ITfRangeBackup,
             ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl, ITfSource,
             ITfSource_Impl, ITfThreadMgr, ITfThreadMgr_Impl, INSERT_TEXT_AT_SELECTION_FLAGS,
-            TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_E_SYNCHRONOUS, TF_ES_SYNC, TF_HALTCOND,
+            TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_SYNC, TF_E_SYNCHRONOUS, TF_HALTCOND,
             TF_LANGBARITEMINFO, TF_PRESERVEDKEY, TF_SELECTION, TF_S_ASYNC, TS_STATUS,
         },
     },
@@ -53,7 +53,8 @@ pub const FAKE_COOKIE: u32 = 0x1234;
 /// local locks cannot see each other across test modules.
 pub fn global_state_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// How the fake host answers `RequestEditSession`.
