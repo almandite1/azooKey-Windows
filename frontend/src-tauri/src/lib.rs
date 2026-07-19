@@ -25,11 +25,6 @@ impl AppState {
 }
 
 #[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
-#[tauri::command]
 fn get_config(state: tauri::State<AppState>) -> AppConfig {
     let config = state
         .settings
@@ -127,7 +122,6 @@ pub fn run() {
         .manage(app_state)
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            greet,
             get_config,
             update_config,
             check_capability
