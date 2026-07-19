@@ -49,6 +49,25 @@ pub struct Composition {
     pub tip_composition: Option<ITfComposition>,
 }
 
+/// Mirrors candidate entry `index` into the client-side composition
+/// fields. This is the single point where a selected candidate becomes
+/// the visible preview — the future hook for conversion-history learning
+/// to observe what the user actually picked.
+fn apply_selected_candidate(
+    candidates: &Candidates,
+    index: i32,
+    preview: &mut String,
+    suffix: &mut String,
+    raw_hiragana: &mut String,
+    corresponding_count: &mut i32,
+) {
+    let (text, sub_text, count) = candidates.entry(index as usize);
+    *corresponding_count = count;
+    *preview = text;
+    *suffix = sub_text;
+    *raw_hiragana = candidates.hiragana.clone();
+}
+
 impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnCompositionTerminated(
@@ -180,34 +199,36 @@ impl TextServiceFactory {
                         };
 
                         candidates = ipc_service.append_text(text.clone())?;
-                        let (text, sub_text, count) = candidates.entry(selection_index as usize);
-                        let hiragana = candidates.hiragana.clone();
+                        apply_selected_candidate(
+                            &candidates,
+                            selection_index,
+                            &mut preview,
+                            &mut suffix,
+                            &mut raw_hiragana,
+                            &mut corresponding_count,
+                        );
 
-                        corresponding_count = count;
-
-                        preview = text.clone();
-                        suffix = sub_text.clone();
-                        raw_hiragana = hiragana.clone();
-
-                        self.set_text(&text, &sub_text)?;
+                        self.set_text(&preview, &suffix)?;
                         ipc_service.set_candidates(candidates.texts.clone());
                         ipc_service.set_selection(selection_index);
                     }
                     ClientAction::RemoveText => {
                         candidates = ipc_service.remove_text()?;
-                        let (text, sub_text, count) = candidates.entry(selection_index as usize);
-                        let hiragana = candidates.hiragana.clone();
-                        corresponding_count = count;
+                        apply_selected_candidate(
+                            &candidates,
+                            selection_index,
+                            &mut preview,
+                            &mut suffix,
+                            &mut raw_hiragana,
+                            &mut corresponding_count,
+                        );
 
                         raw_input = raw_input
                             .chars()
                             .take(corresponding_count as usize)
                             .collect();
-                        preview = text.clone();
-                        suffix = sub_text.clone();
-                        raw_hiragana = hiragana.clone();
 
-                        self.set_text(&text, &sub_text)?;
+                        self.set_text(&preview, &suffix)?;
                         ipc_service.set_candidates(candidates.texts.clone());
                         ipc_service.set_selection(selection_index);
                     }
@@ -267,15 +288,16 @@ impl TextServiceFactory {
                         .clamp(0, max(0, texts.len() as i32 - 1));
 
                         ipc_service.set_selection(selection_index);
-                        let (text, sub_text, count) = candidates.entry(selection_index as usize);
-                        let hiragana = candidates.hiragana.clone();
-                        corresponding_count = count;
+                        apply_selected_candidate(
+                            &candidates,
+                            selection_index,
+                            &mut preview,
+                            &mut suffix,
+                            &mut raw_hiragana,
+                            &mut corresponding_count,
+                        );
 
-                        preview = text.clone();
-                        suffix = sub_text.clone();
-                        raw_hiragana = hiragana.clone();
-
-                        self.set_text(&text, &sub_text)?;
+                        self.set_text(&preview, &suffix)?;
                     }
                     ClientAction::ShrinkText(text) => {
                         // shrink text
@@ -293,14 +315,17 @@ impl TextServiceFactory {
                         candidates = ipc_service.append_text(text)?;
                         selection_index = 0;
 
-                        let (text, sub_text, count) = candidates.entry(selection_index as usize);
-                        let hiragana = candidates.hiragana.clone();
-                        self.shift_start(&preview, &text)?;
-
-                        corresponding_count = count;
-                        preview = text.clone();
-                        suffix = sub_text.clone();
-                        raw_hiragana = hiragana.clone();
+                        // shift_start needs the preview being replaced
+                        let previous_preview = preview.clone();
+                        apply_selected_candidate(
+                            &candidates,
+                            selection_index,
+                            &mut preview,
+                            &mut suffix,
+                            &mut raw_hiragana,
+                            &mut corresponding_count,
+                        );
+                        self.shift_start(&previous_preview, &preview)?;
 
                         ipc_service.set_candidates(candidates.texts.clone());
                         ipc_service.set_selection(selection_index);
