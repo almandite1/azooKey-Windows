@@ -12,6 +12,16 @@ pub fn candidate_window_logical_width(max_len: u32) -> u32 {
     std::cmp::max(225, 120 + max_len * 18)
 }
 
+/// Length of the longest candidate in CHARS, not bytes — a byte count would
+/// size the window 3x too wide for CJK candidates.
+pub fn max_candidate_chars(candidates: &[String]) -> u32 {
+    candidates
+        .iter()
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0) as u32
+}
+
 /// Work-area clamping for the candidate window, in physical px.
 ///
 /// `(x, y)` is the tentative top-left, `top` the caret top (used to flip the
@@ -198,5 +208,13 @@ mod tests {
             (1830, 950)
         );
         assert_eq!(clamp_indicator_position(100, 500, 90, 90, &WORK), (100, 500));
+    }
+
+    #[test]
+    fn candidate_length_is_measured_in_chars_not_bytes() {
+        let candidates = vec!["水".to_string(), "みずうみ".to_string(), "mizu".to_string()];
+        // みずうみ = 4 chars (12 UTF-8 bytes) — bytes would return 12
+        assert_eq!(max_candidate_chars(&candidates), 4);
+        assert_eq!(max_candidate_chars(&[]), 0);
     }
 }
