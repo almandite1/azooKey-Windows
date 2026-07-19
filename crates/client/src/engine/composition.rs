@@ -110,7 +110,7 @@ impl TextServiceFactory {
             let composition = text_service.borrow_composition()?;
             KeystrokeContext {
                 state: composition.state.clone(),
-                mode: IMEState::get()?.input_mode.clone(),
+                mode: text_service.input_mode.clone(),
                 preview_chars: composition.preview.chars().count(),
                 suffix_is_empty: composition.suffix.is_empty(),
             }
@@ -148,7 +148,7 @@ impl TextServiceFactory {
         let (composition, mode) = {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?.clone();
-            let mode = IMEState::get()?.input_mode.clone();
+            let mode = text_service.input_mode.clone();
             (composition, mode)
         };
 
@@ -244,11 +244,12 @@ impl TextServiceFactory {
                         self.update_pos()?;
                         self.end_composition()?;
 
-                        // scope the guard tightly: update_lang_bar re-enters
-                        // IMEState through AddItem -> GetIcon (a try_lock),
-                        // which fails outright if we still hold it here
+                        // scope the borrow tightly: update_lang_bar re-enters
+                        // the TextService RefCell through AddItem -> GetIcon
+                        // (a try_borrow), which fails outright if we still
+                        // hold the mutable borrow here
                         {
-                            IMEState::get()?.input_mode = mode.clone();
+                            self.borrow_mut()?.input_mode = mode.clone();
                         }
 
                         // update the language bar

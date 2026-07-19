@@ -11,7 +11,7 @@ use windows::{
 
 use anyhow::{Context, Result};
 
-use crate::engine::composition::Composition;
+use crate::engine::{composition::Composition, input_mode::InputMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpdatePosState {
@@ -84,6 +84,11 @@ pub struct TextService {
     pub composition: RefCell<Composition>,
     pub update_pos_state: UpdatePosState,
     pub display_attribute_atom: HashMap<GUID, u32>,
+    /// The current input mode (あ/A). Per-instance on purpose: the langbar
+    /// item, mode indicator, and conversion mode are all activation-scoped
+    /// (one TIP per UI thread) — this was the last activation-scoped field
+    /// left in the process-global IMEState.
+    pub input_mode: InputMode,
     // NOTE: no `this` self-reference here. The COM object is reachable from
     // any TSF callback via TextServiceFactory::this() (a QueryInterface on
     // the containing allocation); storing a strong interface pointer in the

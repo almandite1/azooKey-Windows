@@ -1,29 +1,25 @@
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use super::{input_mode::InputMode, ipc_service::IPCService};
+use super::ipc_service::IPCService;
 
 /// State shared across every UI thread of the host process.
 ///
-/// Only genuinely process-wide state lives here: the IPC connection (one
-/// server session per host process) and the input mode. Per-activation COM
-/// state — sink cookies and the layout-sink context — lives in the
-/// per-instance `TextService` instead: TSF activates one TIP per UI thread,
-/// and sharing those here made thread B overwrite thread A's cookie and let
-/// one thread call another thread's `ITfContext` across apartments (B14).
+/// Only genuinely process-wide state lives here — by now that is just the
+/// IPC connection (one server session per host process). Everything
+/// activation-scoped lives in the per-instance `TextService` instead: TSF
+/// activates one TIP per UI thread, and sharing per-activation state here
+/// made thread B overwrite thread A's (sink cookies/layout context, B14;
+/// the input mode moved out for the same reason).
 /// Everything stored here is naturally Send + Sync; do NOT add COM interface
 /// pointers (or `unsafe impl Send/Sync` to smuggle them past the compiler).
 #[derive(Debug)]
 pub struct IMEState {
     pub ipc_service: Option<IPCService>,
-    pub input_mode: InputMode,
 }
 
 pub static IME_STATE: LazyLock<Mutex<IMEState>> = LazyLock::new(|| {
     tracing::debug!("Creating IMEState");
-    Mutex::new(IMEState {
-        ipc_service: None,
-        input_mode: InputMode::default(),
-    })
+    Mutex::new(IMEState { ipc_service: None })
 });
 
 impl IMEState {
