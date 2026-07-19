@@ -314,12 +314,15 @@ name = "azookey-server"
 version = "0.1.0-alpha.1"
 dependencies = [
  "async-stream",
+ "chrono",
  "futures-core",
  "shared",
  "tokio",
  "tonic",
  "tonic-health",
  "tonic-reflection",
+ "tracing",
+ "tracing-subscriber",
  "windows",
 ]
 

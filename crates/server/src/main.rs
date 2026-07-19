@@ -1,6 +1,7 @@
 mod ffi;
 mod service;
 mod session;
+mod trace;
 mod wrappers;
 
 use azookey_server::TonicNamedPipeServer;
@@ -16,7 +17,8 @@ use service::MyAzookeyService;
 // OS thread; the default multi-threaded runtime crashes inside dispatch.dll.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("AzookeyServer started");
+    trace::setup_logger();
+    tracing::info!("AzookeyServer started");
     // get executable directory
     let current_exe = std::env::current_exe()?;
     let parent_dir = current_exe
@@ -44,15 +46,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
-        eprintln!("TEST MODE: runtime will hang after {secs}s");
+        tracing::warn!("TEST MODE: runtime will hang after {secs}s");
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            eprintln!("TEST MODE: blocking the runtime now");
+            tracing::warn!("TEST MODE: blocking the runtime now");
             std::thread::sleep(std::time::Duration::MAX);
         });
     }
 
-    println!("AzookeyServer listening");
+    tracing::info!("AzookeyServer listening");
 
     Server::builder()
         .add_service(health_service)

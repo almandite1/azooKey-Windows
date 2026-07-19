@@ -129,7 +129,7 @@ impl TonicNamedPipeServer {
                             });
                         }
                         Err(e) => {
-                            eprintln!("named pipe accept failed: {e}");
+                            tracing::warn!("named pipe accept failed: {e}");
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     }
@@ -141,7 +141,7 @@ impl TonicNamedPipeServer {
                         ) {
                             Ok(s) => break s,
                             Err(e) => {
-                                eprintln!("failed to create next pipe instance: {e}");
+                                tracing::warn!("failed to create next pipe instance: {e}");
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
                         }
