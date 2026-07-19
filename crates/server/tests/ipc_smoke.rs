@@ -15,7 +15,7 @@
 use shared::proto::azookey_service_client::AzookeyServiceClient;
 
 async fn connect() -> AzookeyServiceClient<tonic::transport::Channel> {
-    let channel = shared::pipe::lazy_pipe_channel(shared::pipe::SERVER_PIPE)
+    let channel = shared::pipe::lazy_pipe_channel(shared::pipe::server_pipe())
         .expect("failed to build pipe channel");
     let mut client = AzookeyServiceClient::new(channel);
 

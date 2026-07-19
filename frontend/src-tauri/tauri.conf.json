@@ -34,7 +34,8 @@
     "windows": {
       "nsis": {
         "template": "installer.nsi",
-        "languages": ["Japanese"]
+        "languages": ["Japanese"],
+        "installMode": "perMachine"
       }
     }
   }

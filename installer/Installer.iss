@@ -185,12 +185,17 @@ var
   UninstallString: string;
   Dummy: Integer;
 begin
-  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey', 'UninstallString', UninstallString) then
+  { The settings app installs perMachine (tauri.conf.json installMode), so
+    its NSIS uninstall key lives in HKLM. HKCU remains as a fallback for
+    installs made before the perMachine switch (those landed in the
+    elevating admin's HKCU). The stored UninstallString is quoted, which
+    ShellExec's Filename does not accept (RemoveQuotes), and NSIS only runs
+    silently with /S - SW_HIDE alone still showed its window. }
+  if not RegQueryStringValue(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey', 'UninstallString', UninstallString) then
+    RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey', 'UninstallString', UninstallString);
+  if UninstallString <> '' then
   begin
-    if UninstallString <> '' then
-    begin
-      ShellExec('', UninstallString, '', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
-    end;
+    ShellExec('', RemoveQuotes(UninstallString), '/S', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
   end;
 end;
 

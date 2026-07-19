@@ -141,3 +141,55 @@ fn build_glob_excludes_the_registered_dll() {
         "the build/* glob must exclude azookey_windows.dll: got {glob_line}"
     );
 }
+
+/// B22: the Tauri settings app runs its NSIS from Inno's elevated context.
+/// Without perMachine it defaults to currentUser and lands in the elevating
+/// ADMIN's %LOCALAPPDATA%/HKCU — the logon user can't launch it, the exact
+/// bug the machine-wide move (297a054) fixed everywhere else.
+#[test]
+fn tauri_settings_app_installs_per_machine() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../frontend/src-tauri/tauri.conf.json");
+    let conf = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let json: serde_json::Value = serde_json::from_str(&conf).expect("tauri.conf.json is JSON");
+
+    assert_eq!(
+        json.pointer("/bundle/windows/nsis/installMode")
+            .and_then(|v| v.as_str()),
+        Some("perMachine"),
+        "the settings app must install perMachine, or it lands in the \
+         elevating admin's profile"
+    );
+}
+
+/// B22: the Inno uninstaller chains into the settings app's NSIS
+/// uninstaller. With perMachine its uninstall key is in HKLM (HKCU only as
+/// a legacy fallback), the stored quoted path must be unquoted for
+/// ShellExec's Filename, and NSIS is only silent with /S.
+#[test]
+fn uninstall_chains_the_settings_app_from_hklm_silently() {
+    let iss = read("Installer.iss");
+    let start = iss
+        .find("procedure UninstallAzookey")
+        .expect("Installer.iss should define UninstallAzookey");
+    let rest = &iss[start..];
+    let end = rest[1..]
+        .find("\nprocedure ")
+        .map(|i| i + 1)
+        .unwrap_or(rest.len());
+    let proc_body = &rest[..end];
+
+    assert!(
+        proc_body.contains("RegQueryStringValue(HKLM,"),
+        "UninstallAzookey must read the perMachine (HKLM) uninstall key"
+    );
+    assert!(
+        proc_body.contains("RemoveQuotes(UninstallString)"),
+        "the quoted UninstallString must be unquoted for ShellExec's Filename"
+    );
+    assert!(
+        proc_body.contains("'/S'"),
+        "the NSIS uninstaller must be passed /S to actually run silently"
+    );
+}

@@ -377,7 +377,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .register_encoded_file_descriptor_set(shared::proto::FILE_DESCRIPTOR_SET)
                 .build_v1()?,
         )
-        .serve_with_incoming(TonicNamedPipeServer::new("azookey_server")?)
+        .serve_with_incoming(TonicNamedPipeServer::new(&shared::pipe::server_pipe_base())?)
         .await?;
 
     Ok(())
