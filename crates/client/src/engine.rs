@@ -6,4 +6,5 @@ pub(super) mod ipc_service;
 pub(super) mod state;
 pub(super) mod text_util;
 pub(super) mod theme;
+pub(super) mod transition;
 pub(super) mod user_action;
