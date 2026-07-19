@@ -19,6 +19,9 @@ fn get_config_root() -> PathBuf {
 
 const SETTINGS_FILENAME: &str = "settings.json";
 
+/// Field names are mirrored by the Swift engine's `SettingsFile` decoder
+/// (server-swift/Sources/azookey-server/azookey_server.swift) — keep them
+/// in sync when adding settings the engine reads.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ZenzaiConfig {
     pub enable: bool,

@@ -34,29 +34,55 @@ struct SessionState {
 }
 
 @MainActor var execURL = URL(filePath: "")
-@MainActor var config: [String : Any] = [
-    "enable": false,
-    "profile": "",
-]
+
+// Typed mirror of the settings schema owned by the Rust side
+// (crates/shared/src/lib.rs: AppConfig / ZenzaiConfig) — keep the field
+// names in sync. Keys the engine does not read (version, zenzai.backend)
+// are simply not declared; JSONDecoder ignores extra JSON keys. Every
+// field is optional so a hand-edited or partial settings.json degrades
+// per-key instead of failing the whole parse.
+struct SettingsFile: Codable {
+    var zenzai: Zenzai?
+
+    struct Zenzai: Codable {
+        var enable: Bool?
+        var profile: String?
+    }
+}
+
+struct EngineConfig {
+    var zenzaiEnabled = false
+    var zenzaiProfile = ""
+}
+
+@MainActor var config = EngineConfig()
+
+// Fixed engine parameters, hoisted so they are visible in one place.
+// The ./test placeholder predates this refactor: with learningType
+// .nothing the memory/shared-container dirs are never written — they
+// become real, configurable paths when the learning feature lands.
+let emojiDictionaryFileName = "emoji_all_E15.1.txt"
+let placeholderDataDirectory = URL(filePath: "./test")
+let zenzaiInferenceLimit = 1
 
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
-    let zenzaiEnabled = (config["enable"] as? Bool) ?? false
-    let zenzaiProfile = (config["profile"] as? String) ?? ""
+    let zenzaiEnabled = config.zenzaiEnabled
+    let zenzaiProfile = config.zenzaiProfile
     return ConvertRequestOptions(
         requireJapanesePrediction: true,
         requireEnglishPrediction: false,
         keyboardLanguage: .ja_JP,
         learningType: .nothing,
         dictionaryResourceURL: execURL.appendingPathComponent("Dictionary"),
-        memoryDirectoryURL: URL(filePath: "./test"),
-        sharedContainerURL: URL(filePath: "./test"),
+        memoryDirectoryURL: placeholderDataDirectory,
+        sharedContainerURL: placeholderDataDirectory,
         textReplacer: .init {
-            return execURL.appendingPathComponent("EmojiDictionary").appendingPathComponent("emoji_all_E15.1.txt")
+            return execURL.appendingPathComponent("EmojiDictionary").appendingPathComponent(emojiDictionaryFileName)
         },
         // zenzai
         zenzaiMode: zenzaiEnabled ? .on(
             weight: execURL.appendingPathComponent("zenz.gguf"),
-            inferenceLimit: 1,
+            inferenceLimit: zenzaiInferenceLimit,
             requestRichCandidates: true,
             personalizationMode: nil,
             versionDependentMode: .v3(
@@ -94,15 +120,15 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
         do {
             let data = try Data(contentsOf: settingsPath)
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let zenzaiDict = json["zenzai"] as? [String: Any] {
-
-                if let enableValue = zenzaiDict["enable"] as? Bool {
-                    config["enable"] = enableValue
+            let settings = try JSONDecoder().decode(SettingsFile.self, from: data)
+            // only override keys that are present, matching the previous
+            // behavior: a partial file keeps the current values
+            if let zenzai = settings.zenzai {
+                if let enable = zenzai.enable {
+                    config.zenzaiEnabled = enable
                 }
-
-                if let profileValue = zenzaiDict["profile"] as? String {
-                    config["profile"] = profileValue
+                if let profile = zenzai.profile {
+                    config.zenzaiProfile = profile
                 }
             }
         } catch {
