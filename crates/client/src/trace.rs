@@ -71,8 +71,15 @@ pub fn setup_logger() -> anyhow::Result<()> {
         // Plain per-process text log. The old ChromeLayer JSON writer corrupted
         // its own output (duplicated ".json.json..." filenames, truncated/empty
         // files), which made field diagnosis impossible. One appendable text
-        // file per PID is robust and greppable.
-        let path = folder.join(format!("client-{}.log", std::process::id()));
+        // file per PID is robust and greppable. The host exe's name is part of
+        // the filename: a PID alone cannot be attributed once the process
+        // exits, which made per-host diagnosis (which app rejected the TIP?)
+        // impossible in the field.
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let path = folder.join(format!("client-{}-{}.log", exe, std::process::id()));
         let Ok(file) = std::fs::File::create(&path) else {
             return Ok(());
         };
@@ -84,6 +91,10 @@ pub fn setup_logger() -> anyhow::Result<()> {
 
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_ansi(false)
+            // log every instrumented call on entry (with its arguments):
+            // field diagnosis needs to see which TSF callbacks fired and
+            // with what key codes, not only the explicit debug! events
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
             .with_writer(std::sync::Mutex::new(file));
 
         let _ = tracing_subscriber::registry()
