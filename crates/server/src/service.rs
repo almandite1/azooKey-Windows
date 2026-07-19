@@ -13,11 +13,20 @@ use shared::proto::{
 use crate::session::session_of;
 use crate::wrappers::{
     add_text, clear_text, get_composed_text, load_config, move_cursor, remove_text, set_context,
-    shrink_text,
+    shrink_text, RawComposingText,
 };
 
 #[derive(Debug, Default)]
 pub struct MyAzookeyService;
+
+/// Builds the ComposingText payload every composing-text RPC returns: the
+/// current hiragana plus a fresh candidate fetch for the session.
+fn composed(session: i32, composing_text: RawComposingText) -> ComposingText {
+    ComposingText {
+        hiragana: composing_text.text,
+        suggestions: get_composed_text(session),
+    }
+}
 
 #[tonic::async_trait]
 impl AzookeyService for MyAzookeyService {
@@ -27,13 +36,9 @@ impl AzookeyService for MyAzookeyService {
     ) -> Result<Response<AppendTextResponse>, Status> {
         let session = session_of(&request);
         let input = request.into_inner().text_to_append;
-        let composing_text = add_text(session, &input);
 
         Ok(Response::new(AppendTextResponse {
-            composing_text: Some(ComposingText {
-                hiragana: composing_text.text,
-                suggestions: get_composed_text(session).to_vec(),
-            }),
+            composing_text: Some(composed(session, add_text(session, &input))),
         }))
     }
 
@@ -42,13 +47,9 @@ impl AzookeyService for MyAzookeyService {
         request: Request<RemoveTextRequest>,
     ) -> Result<Response<RemoveTextResponse>, Status> {
         let session = session_of(&request);
-        let composing_text = remove_text(session);
 
         Ok(Response::new(RemoveTextResponse {
-            composing_text: Some(ComposingText {
-                hiragana: composing_text.text,
-                suggestions: get_composed_text(session).to_vec(),
-            }),
+            composing_text: Some(composed(session, remove_text(session))),
         }))
     }
 
@@ -58,13 +59,9 @@ impl AzookeyService for MyAzookeyService {
     ) -> Result<Response<MoveCursorResponse>, Status> {
         let session = session_of(&request);
         let offset = request.into_inner().offset;
-        let composing_text = move_cursor(session, offset);
 
         Ok(Response::new(MoveCursorResponse {
-            composing_text: Some(ComposingText {
-                hiragana: composing_text.text,
-                suggestions: get_composed_text(session).to_vec(),
-            }),
+            composing_text: Some(composed(session, move_cursor(session, offset))),
         }))
     }
 
@@ -83,13 +80,9 @@ impl AzookeyService for MyAzookeyService {
     ) -> Result<Response<ShrinkTextResponse>, Status> {
         let session = session_of(&request);
         let offset = request.into_inner().offset;
-        let composing_text = shrink_text(session, offset);
 
         Ok(Response::new(ShrinkTextResponse {
-            composing_text: Some(ComposingText {
-                hiragana: composing_text.text,
-                suggestions: get_composed_text(session).to_vec(),
-            }),
+            composing_text: Some(composed(session, shrink_text(session, offset))),
         }))
     }
 
