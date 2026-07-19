@@ -463,7 +463,19 @@ fn another_instance_running(name: PCWSTR) -> windows::core::Result<bool> {
 }
 
 fn start_process(exe: &str, prefix: &str) -> Option<Child> {
-    let mut child = match Command::new(exe)
+    // Resolve the child against the launcher's OWN directory instead of
+    // relying on CreateProcess's search order, which also consults PATH — and
+    // the backend directory (llama_*) is prepended to PATH. Fall back to the
+    // bare name if the launcher path can't be determined.
+    let resolved = env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join(exe)));
+    let mut command = match &resolved {
+        Some(path) => Command::new(path),
+        None => Command::new(exe),
+    };
+
+    let mut child = match command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

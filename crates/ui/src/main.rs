@@ -160,7 +160,15 @@ async fn main() -> anyhow::Result<()> {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            } => *control_flow = ControlFlow::Exit,
+            } => {
+                // The candidate and indicator windows are overlays with no
+                // user-facing close affordance. Ignore CloseRequested (e.g. an
+                // external WM_CLOSE from Task Manager's "End task"): exiting
+                // here returns success, which the launcher's supervisor reads
+                // as a clean shutdown and stops restarting — leaving every app
+                // without a candidate window. The launcher owns ui.exe's
+                // lifecycle and tears it down via the job object when needed.
+            }
             Event::UserEvent(script) => match script {
                 UserEvent::UpdateCandidates(candidates) => {
                     if let Err(e) = candidate_webview
