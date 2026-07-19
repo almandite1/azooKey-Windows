@@ -183,11 +183,15 @@ impl TextServiceFactory {
         if tip_exists {
             // the leftover composition is likely dead (e.g. the host
             // disconnected mid-composition); failing to end it must not
-            // wedge the input path — letting go of it is what matters
+            // wedge the input path — letting go of it is what matters.
+            // Then fall through to start a FRESH composition: returning
+            // Ok here left the caller (the StartComposition arm) believing
+            // a composition already existed, so the following set_text
+            // no-op'd ("Composition is not started") and everything typed
+            // into that composition was invisible until the next recovery.
             if let Err(error) = self.end_composition() {
                 tracing::warn!("Failed to end a stale composition: {error:?}");
             }
-            return Ok(());
         }
 
         let text_service = self.borrow_mut()?;
@@ -559,7 +563,10 @@ mod tests {
     }
 
     /// B5: start_composition's stale-composition recovery must not fail with
-    /// a RefCell double-borrow.
+    /// a RefCell double-borrow. And after dropping the dead composition it
+    /// must start a FRESH one rather than returning early: returning left the
+    /// StartComposition caller thinking a composition existed, so set_text
+    /// no-op'd and the typing that followed was invisible.
     #[test]
     fn start_composition_recovers_from_a_stale_composition() {
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
@@ -582,8 +589,9 @@ mod tests {
                 .borrow_composition()
                 .unwrap()
                 .tip_composition
-                .is_none(),
-            "the stale composition should have been dropped"
+                .is_some(),
+            "recovery must leave a fresh live composition, not return early \
+             with none (which made the next set_text a silent no-op)"
         );
     }
 

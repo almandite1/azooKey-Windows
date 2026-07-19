@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    engine::{ipc_service, state::IMEState},
+    engine::{composition::Composition, ipc_service, state::IMEState},
     globals::{DllModule, GUID_DISPLAY_ATTRIBUTE},
 };
 
@@ -19,7 +19,7 @@ use windows::{
     },
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
@@ -50,58 +50,82 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             }
         }
 
-        let mut text_service = self.borrow_mut()?;
+        // resolve the thread manager up front; on null, release the dll ref
+        // taken above before bailing (the old code leaked it here)
+        let thread_mgr = match ptim {
+            Some(thread_mgr) => thread_mgr.clone(),
+            None => {
+                dll_instance.release();
+                return Err(anyhow::anyhow!("Thread manager is null"));
+            }
+        };
 
-        text_service.tid = tid;
-        let thread_mgr = ptim.context("Thread manager is null")?;
-        text_service.thread_mgr = Some(thread_mgr.clone());
+        // Wire the sinks. If any step fails partway, the sinks already
+        // advised must be unwound: otherwise they leak into the host and,
+        // worse, TSF can keep calling back into a half-activated TIP. The
+        // old code returned Err here leaving every prior advise in place.
+        let setup = (|| -> Result<()> {
+            let mut text_service = self.borrow_mut()?;
 
-        // initialize key event sink
-        tracing::debug!("AdviseKeyEventSink");
+            text_service.tid = tid;
+            text_service.thread_mgr = Some(thread_mgr.clone());
 
-        unsafe {
-            thread_mgr.cast::<ITfKeystrokeMgr>()?.AdviseKeyEventSink(
-                tid,
-                &self.this::<ITfKeyEventSink>()?,
-                BOOL::from(true),
+            // initialize key event sink
+            tracing::debug!("AdviseKeyEventSink");
+            unsafe {
+                thread_mgr.cast::<ITfKeystrokeMgr>()?.AdviseKeyEventSink(
+                    tid,
+                    &self.this::<ITfKeyEventSink>()?,
+                    BOOL::from(true),
+                )?;
+            };
+
+            // initialize thread manager event sink
+            tracing::debug!("AdviseThreadMgrEventSink");
+            self.advise_sink::<ITfThreadMgrEventSink>(
+                &thread_mgr.cast::<ITfSource>()?,
+                &mut text_service,
             )?;
-        };
 
-        // initialize thread manager event sink
-        tracing::debug!("AdviseThreadMgrEventSink");
-        self.advise_sink::<ITfThreadMgrEventSink>(
-            &thread_mgr.cast::<ITfSource>()?,
-            &mut text_service,
-        )?;
+            // initialize text layout sink
+            tracing::debug!("AdviseTextLayoutSink");
+            let doc_mgr = unsafe { thread_mgr.GetFocus() };
+            if let Ok(doc_mgr) = doc_mgr {
+                self.advise_text_layout_sink(&mut text_service, doc_mgr)?;
+            }
 
-        // initialize text layout sink
-        tracing::debug!("AdviseTextLayoutSink");
-        let doc_mgr = unsafe { thread_mgr.GetFocus() };
-        if let Ok(doc_mgr) = doc_mgr {
-            self.advise_text_layout_sink(&mut text_service, doc_mgr)?;
+            // initialize display attribute
+            tracing::debug!("Initialize display attribute");
+            let atom_map = unsafe {
+                let mut map = HashMap::new();
+                let category_mgr: ITfCategoryMgr =
+                    CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)?;
+
+                let atom = category_mgr.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE)?;
+                map.insert(GUID_DISPLAY_ATTRIBUTE, atom);
+                map
+            };
+
+            text_service.display_attribute_atom = atom_map;
+
+            // initialize langbar
+            tracing::debug!("Initialize langbar");
+            unsafe {
+                thread_mgr
+                    .cast::<ITfLangBarItemMgr>()?
+                    .AddItem(&self.this::<ITfLangBarItemButton>()?)?;
+            };
+
+            Ok(())
+        })();
+
+        if let Err(error) = setup {
+            tracing::error!("Activate failed, rolling back partial state: {error:?}");
+            self.rollback_activation(&thread_mgr, tid);
+            // balance the add_ref taken at the top of Activate
+            dll_instance.release();
+            return Err(error);
         }
-
-        // initialize display attribute
-        tracing::debug!("Initialize display attribute");
-        let atom_map = unsafe {
-            let mut map = HashMap::new();
-            let category_mgr: ITfCategoryMgr =
-                CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)?;
-
-            let atom = category_mgr.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE)?;
-            map.insert(GUID_DISPLAY_ATTRIBUTE, atom);
-            map
-        };
-
-        text_service.display_attribute_atom = atom_map;
-
-        // initialize langbar
-        tracing::debug!("Initialize langbar");
-        unsafe {
-            thread_mgr
-                .cast::<ITfLangBarItemMgr>()?
-                .AddItem(&self.this::<ITfLangBarItemButton>()?)?;
-        };
 
         tracing::debug!("Activate success");
 
@@ -117,61 +141,118 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         let mut dll_instance = DllModule::get()?;
         dll_instance.release();
 
-        {
-            let text_service = self.borrow()?;
-            let thread_mgr = text_service.thread_mgr()?;
+        // Best-effort teardown: every step below runs even if an earlier one
+        // fails. The old code chained the unadvises with `?`, so a single
+        // failing step (e.g. end_composition on a document being torn down
+        // during a profile switch) stranded the remaining unadvises — leaking
+        // a sink into the host or pinning its ITfContext. The first error is
+        // remembered and surfaced at the end.
+        fn record(slot: &mut Result<()>, result: Result<()>) {
+            if let Err(error) = result {
+                tracing::warn!("Deactivate step failed: {error:?}");
+                if slot.is_ok() {
+                    *slot = Err(error);
+                }
+            }
+        }
+        let mut first_error: Result<()> = Ok(());
 
-            // end composition
-            self.end_composition()?;
+        // end composition (releases the client-side handle even on failure)
+        record(&mut first_error, self.end_composition());
 
-            // remove key event sink
-            tracing::debug!("UnadviseKeyEventSink");
-            unsafe {
-                thread_mgr
-                    .cast::<ITfKeystrokeMgr>()?
-                    .UnadviseKeyEventSink(text_service.tid)?;
-            };
+        // key event sink + langbar removal need the thread manager
+        match self.borrow() {
+            Ok(text_service) => match text_service.thread_mgr() {
+                Ok(thread_mgr) => {
+                    tracing::debug!("UnadviseKeyEventSink");
+                    record(
+                        &mut first_error,
+                        (|| -> Result<()> {
+                            unsafe {
+                                thread_mgr
+                                    .cast::<ITfKeystrokeMgr>()?
+                                    .UnadviseKeyEventSink(text_service.tid)?;
+                            }
+                            Ok(())
+                        })(),
+                    );
 
-            tracing::debug!("Remove langbar");
-            unsafe {
-                thread_mgr
-                    .cast::<ITfLangBarItemMgr>()?
-                    .RemoveItem(&self.this::<ITfLangBarItemButton>()?)
-            }?;
+                    tracing::debug!("Remove langbar");
+                    record(
+                        &mut first_error,
+                        (|| -> Result<()> {
+                            unsafe {
+                                thread_mgr
+                                    .cast::<ITfLangBarItemMgr>()?
+                                    .RemoveItem(&self.this::<ITfLangBarItemButton>()?)?;
+                            }
+                            Ok(())
+                        })(),
+                    );
+                }
+                Err(error) => record(&mut first_error, Err(error)),
+            },
+            Err(error) => record(&mut first_error, Err(error)),
         }
 
-        let mut text_service = self.borrow_mut()?;
-        let thread_mgr = text_service.thread_mgr()?;
+        // thread-mgr event sink + text layout sink + field cleanup
+        match self.borrow_mut() {
+            Ok(mut text_service) => {
+                tracing::debug!("UnadviseThreadMgrEventSink");
+                match text_service.thread_mgr() {
+                    Ok(thread_mgr) => match thread_mgr.cast::<ITfSource>() {
+                        Ok(source) => record(
+                            &mut first_error,
+                            self.unadvise_sink::<ITfThreadMgrEventSink>(&source, &mut text_service),
+                        ),
+                        Err(error) => record(&mut first_error, Err(error.into())),
+                    },
+                    Err(error) => record(&mut first_error, Err(error)),
+                }
 
-        // remove thread manager event sink
-        tracing::debug!("UnadviseThreadMgrEventSink");
-        self.unadvise_sink::<ITfThreadMgrEventSink>(
-            &thread_mgr.cast::<ITfSource>()?,
-            &mut text_service,
-        )?;
+                tracing::debug!("UnadviseTextLayoutSink");
+                record(
+                    &mut first_error,
+                    self.unadvise_text_layout_sink(&mut text_service),
+                );
 
-        // remove text layout sink
-        tracing::debug!("UnadviseTextLayoutSink");
-        self.unadvise_text_layout_sink(&mut text_service)?;
+                // clear display attribute
+                text_service.display_attribute_atom.clear();
 
-        // clear display attribute
-        text_service.display_attribute_atom.clear();
+                text_service.tid = 0;
+                text_service.thread_mgr = None;
+                // Also let go of the last document's context: handle_key
+                // re-sets it on every keystroke after the next Activate, and
+                // end_composition() above already ran, so nothing dereferences
+                // it in between. Keeping it would pin the host's ITfContext
+                // while the TIP is deactivated. (The old `this` self-reference
+                // is gone entirely — TSF reuses this object across
+                // Deactivate/Activate cycles, and every callback reaches its
+                // COM interfaces via TextServiceFactory::this(), a QI on the
+                // containing allocation, so there is nothing to clear/restore.)
+                text_service.context = None;
+                text_service.layout_context = None;
 
-        text_service.tid = 0;
-        text_service.thread_mgr = None;
-        // Also let go of the last document's context: handle_key re-sets it
-        // on every keystroke after the next Activate, and end_composition()
-        // above already ran, so nothing dereferences it in between. Keeping
-        // it would pin the host's ITfContext while the TIP is deactivated.
-        // (The old `this` self-reference is gone entirely — TSF reuses this
-        // object across Deactivate/Activate cycles, and every callback now
-        // reaches its COM interfaces via TextServiceFactory::this(), a QI on
-        // the containing allocation, so there is nothing to clear or restore.)
-        text_service.context = None;
+                // Reset the engine composition. TSF reuses this TextService
+                // across Deactivate/Activate, so a leftover Composing state
+                // (and its reading) would otherwise resume after an in-app IME
+                // switch (Win+Space and back within the same app, which does
+                // NOT fire OnSetFocus): the first keystroke would land in the
+                // Composing arm with no live tip_composition, set_text would
+                // no-op, and the typing would be invisible.
+                match text_service.borrow_mut_composition() {
+                    Ok(mut composition) => *composition = Composition::default(),
+                    Err(error) => record(&mut first_error, Err(error)),
+                }
+            }
+            Err(error) => record(&mut first_error, Err(error)),
+        }
 
-        tracing::debug!("Deactivate success");
+        if first_error.is_ok() {
+            tracing::debug!("Deactivate success");
+        }
 
-        Ok(())
+        first_error
     }
 }
 
@@ -187,6 +268,59 @@ impl ITfTextInputProcessorEx_Impl for TextServiceFactory_Impl {
     }
 }
 
+impl TextServiceFactory_Impl {
+    /// Best-effort unwind of the sinks [`Activate`](TextServiceFactory_Impl::Activate)
+    /// may have advised before a later step failed. Each step no-ops if its
+    /// resource was never set up, so calling this after a partial Activate
+    /// leaves the TIP as if it had never activated — no sink stranded in the
+    /// host, no context pinned.
+    fn rollback_activation(&self, thread_mgr: &ITfThreadMgr, tid: u32) {
+        if let Err(error) = (|| -> Result<()> {
+            unsafe {
+                thread_mgr
+                    .cast::<ITfKeystrokeMgr>()?
+                    .UnadviseKeyEventSink(tid)?;
+            }
+            Ok(())
+        })() {
+            tracing::warn!("rollback: UnadviseKeyEventSink failed: {error:?}");
+        }
+
+        if let Ok(mut text_service) = self.borrow_mut() {
+            if let Ok(source) = thread_mgr.cast::<ITfSource>() {
+                if let Err(error) =
+                    self.unadvise_sink::<ITfThreadMgrEventSink>(&source, &mut text_service)
+                {
+                    tracing::warn!("rollback: unadvise thread-mgr sink failed: {error:?}");
+                }
+            }
+            if let Err(error) = self.unadvise_text_layout_sink(&mut text_service) {
+                tracing::warn!("rollback: unadvise text layout sink failed: {error:?}");
+            }
+
+            // AddItem is the last setup step; if it succeeded before another
+            // failure (there is none after it today) this removes it, and if
+            // it never ran RemoveItem simply reports no such item — harmless
+            if let Err(error) = (|| -> Result<()> {
+                unsafe {
+                    thread_mgr
+                        .cast::<ITfLangBarItemMgr>()?
+                        .RemoveItem(&self.this::<ITfLangBarItemButton>()?)?;
+                }
+                Ok(())
+            })() {
+                tracing::debug!("rollback: RemoveItem (langbar not added): {error:?}");
+            }
+
+            text_service.display_attribute_atom.clear();
+            text_service.tid = 0;
+            text_service.thread_mgr = None;
+            text_service.context = None;
+            text_service.layout_context = None;
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -196,12 +330,14 @@ mod tests {
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::TextServices::{ITfTextInputProcessor, ITfThreadMgr};
 
+    use crate::engine::composition::CompositionState;
     use crate::engine::state::IMEState;
     use crate::globals::{DllModule, DLL_INSTANCE};
     use crate::tsf::factory::TextServiceFactory;
     use crate::tsf::test_support::{
         fake_context_of, EditSessionBehavior, FakeContext, FakeThreadMgr, ThreadMgrLog,
     };
+    use windows::core::AsImpl as _;
 
     // Activate/Deactivate mutate the process-global IMEState and DllModule,
     // so every test here holds the crate-wide global_state_lock (shared with
@@ -377,6 +513,90 @@ mod tests {
             advised,
             "Deactivate must unadvise exactly the layout-sink cookie it advised"
         );
+        reset_ime_state();
+    }
+
+    /// Fix 4: when a late Activate step fails (here AddItem, the final step),
+    /// the TIP must unwind the sinks it already advised instead of stranding
+    /// them in the host. The old code returned Err leaving the key-event sink
+    /// and the thread-manager event sink advised.
+    #[test]
+    fn activate_rolls_back_advised_sinks_when_a_later_step_fails() {
+        let _guard = crate::tsf::test_support::global_state_lock();
+        ensure_dll_module();
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        reset_ime_state();
+
+        let log = Rc::new(ThreadMgrLog::default());
+        let thread_mgr = FakeThreadMgr::with_failing_langbar(log.clone());
+        let tip = TextServiceFactory::create::<ITfTextInputProcessor>()
+            .expect("failed to create the TIP");
+
+        let result = unsafe { tip.Activate(Some(&thread_mgr), 1) };
+        assert!(
+            result.is_err(),
+            "Activate must fail when its AddItem step fails"
+        );
+
+        assert_eq!(
+            log.key_sink_advises.borrow().as_slice(),
+            &[true],
+            "the key-event sink was advised before AddItem"
+        );
+        assert_eq!(
+            log.key_sink_unadvises.get(),
+            1,
+            "a failed Activate must unadvise the key-event sink it advised"
+        );
+        assert_eq!(
+            log.unadvise_cookies.borrow().as_slice(),
+            log.advise_cookies.borrow().as_slice(),
+            "a failed Activate must unadvise the thread-manager sink it advised"
+        );
+
+        // the partial state must be cleared so a later Activate starts clean
+        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        assert_eq!(
+            factory.borrow().unwrap().tid,
+            0,
+            "the rolled-back Activate must clear tid"
+        );
+        reset_ime_state();
+    }
+
+    /// Fix 2: TSF reuses one TextService across an in-app IME switch (Win+Space
+    /// and back), which does NOT fire OnSetFocus. Deactivate must reset the
+    /// engine composition, or the next Activate resumes a stale Composing state
+    /// and the first keystrokes land in the Composing arm with no live
+    /// composition — set_text no-ops and the typing is invisible.
+    #[test]
+    fn deactivate_resets_the_engine_composition() {
+        let _guard = crate::tsf::test_support::global_state_lock();
+        let (tip, _tm, _log) = activate_fresh_tip();
+        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Composing;
+            composition.raw_hiragana = "わたし".to_string();
+            composition.preview = "わたし".to_string();
+        }
+
+        unsafe { tip.Deactivate() }.expect("Deactivate must succeed");
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(
+            composition.state,
+            CompositionState::None,
+            "the composition state must be reset on Deactivate"
+        );
+        assert!(
+            composition.raw_hiragana.is_empty() && composition.preview.is_empty(),
+            "the leftover reading must be cleared so a re-Activate starts clean"
+        );
+        drop(composition);
+        drop(text_service);
         reset_ime_state();
     }
 }
