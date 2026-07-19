@@ -221,7 +221,11 @@ async fn conversion_yields_the_expected_candidate() {
     let composing = composing.expect("no keystrokes were sent");
 
     assert_eq!(composing.hiragana, "みず", "roman 'mizu' should read みず");
-    let candidates: Vec<&str> = composing.suggestions.iter().map(|s| s.text.as_str()).collect();
+    let candidates: Vec<&str> = composing
+        .suggestions
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect();
     assert!(
         candidates.contains(&"水"),
         "水 should be among the candidates for みず, got {candidates:?}"
@@ -251,7 +255,10 @@ async fn server_accepts_a_reconnection_after_a_client_drops() {
             .expect("append_text failed")
             .into_inner();
         assert_eq!(
-            response.composing_text.expect("composing_text missing").hiragana,
+            response
+                .composing_text
+                .expect("composing_text missing")
+                .hiragana,
             "あ"
         );
         // dropping `first` closes its pipe connection = the client "went away"
@@ -267,7 +274,10 @@ async fn server_accepts_a_reconnection_after_a_client_drops() {
         .expect("server did not accept a reconnection after the first client dropped")
         .into_inner();
     assert_eq!(
-        response.composing_text.expect("composing_text missing").hiragana,
+        response
+            .composing_text
+            .expect("composing_text missing")
+            .hiragana,
         "あ"
     );
 
@@ -407,7 +417,10 @@ async fn remove_text_drains_the_reading_one_kana_per_call() {
             .await
             .expect("append_text failed")
             .into_inner();
-        reading = response.composing_text.expect("composing_text missing").hiragana;
+        reading = response
+            .composing_text
+            .expect("composing_text missing")
+            .hiragana;
     }
     // a lone trailing n stays roman until a follow-up key resolves it
     assert_eq!(reading, "さいげんてじゅn");
@@ -419,7 +432,10 @@ async fn remove_text_drains_the_reading_one_kana_per_call() {
             .await
             .expect("remove_text failed")
             .into_inner();
-        let hiragana = response.composing_text.expect("composing_text missing").hiragana;
+        let hiragana = response
+            .composing_text
+            .expect("composing_text missing")
+            .hiragana;
         expected -= 1;
         assert_eq!(
             hiragana.chars().count(),
