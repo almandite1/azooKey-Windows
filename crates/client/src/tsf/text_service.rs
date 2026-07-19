@@ -11,7 +11,7 @@ use windows::{
 
 use anyhow::{Context, Result};
 
-use crate::engine::{composition::Composition, input_mode::InputMode};
+use crate::engine::composition::Composition;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpdatePosState {
@@ -84,7 +84,6 @@ pub struct TextService {
     pub composition: RefCell<Composition>,
     pub update_pos_state: UpdatePosState,
     pub display_attribute_atom: HashMap<GUID, u32>,
-    pub mode: InputMode,
     // NOTE: no `this` self-reference here. The COM object is reachable from
     // any TSF callback via TextServiceFactory::this() (a QueryInterface on
     // the containing allocation); storing a strong interface pointer in the

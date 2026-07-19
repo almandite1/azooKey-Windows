@@ -6,7 +6,7 @@ pub(super) mod language_bar;
 pub(super) mod surrounded_text;
 #[cfg(test)]
 pub(super) mod test_support;
-pub(super) mod text_input_proccesor;
+pub(super) mod text_input_processor;
 pub(super) mod text_layout_sink;
 pub(super) mod text_service;
 pub(super) mod thread_mgr_event_sink;

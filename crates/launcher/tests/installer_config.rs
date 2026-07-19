@@ -55,6 +55,25 @@ fn task_xml_triggers_for_all_users() {
     );
 }
 
+/// The launcher supervises the whole IME stack, so the startup task must
+/// keep running on battery power: with StopIfGoingOnBatteries=true, Task
+/// Scheduler kills the launcher (and with it server + UI, via the job
+/// object) the moment a laptop is unplugged, leaving the user without an
+/// IME until the next logon.
+#[test]
+fn task_xml_survives_switching_to_battery_power() {
+    let xml = read("Azookey Startup.xml");
+
+    assert!(
+        xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"),
+        "the startup task must not stop when the machine goes on battery"
+    );
+    assert!(
+        xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"),
+        "the startup task must start even when the machine is on battery"
+    );
+}
+
 /// The file is written and round-tripped (LoadStringFromFile /
 /// SaveStringToFile as AnsiString) as 8-bit text, so the XML declaration
 /// must not claim UTF-16 — MSXML may refuse the mismatch outright.

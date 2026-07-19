@@ -4,7 +4,6 @@ mod globals;
 mod macros;
 mod register;
 mod trace;
-mod tracing_chrome;
 mod tsf;
 
 use std::{ffi::c_void, sync::Mutex};
@@ -178,24 +177,8 @@ pub extern "system" fn DllUnregisterServer() -> HRESULT {
 
 #[no_mangle]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-    // let result: anyhow::Result<HRESULT> = (|| {
-    //     let dll_instance = DllModule::get()?;
-    //     if dll_instance.can_unload() {
-    //         Ok(S_OK)
-    //     } else {
-    //         Ok(S_FALSE)
-    //     }
-    // })();
-
-    // if let Ok(hr) = result {
-    //     hr
-    // } else {
-    //     E_FAIL
-    // }
-
-    // For now, always return S_FALSE
-    // This is a temporary solution until I implement the can_unload logic
-    // I need to check if all the COM objects are released
-
+    // Always refuse to unload: DllModule's ref count does not yet track every
+    // live COM object, so claiming S_OK could let the host unload the DLL
+    // while a TSF sink is still alive.
     S_FALSE
 }
