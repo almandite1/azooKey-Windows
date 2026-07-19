@@ -177,8 +177,17 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 UserEvent::UpdateInputMethod(input_method) => {
-                    if let Err(e) = indicator_webview
-                        .evaluate_script(&format!("updateInputMethod(\"{}\")", input_method))
+                    // Serialize through serde_json so the value becomes a
+                    // properly quoted/escaped JS string literal, exactly like
+                    // updateCandidates above. The mode string ("あ"/"A") comes
+                    // over the SetInputMode RPC, which any local process on the
+                    // pipe can call with an arbitrary payload; a raw `"{}"`
+                    // interpolation let a `"`/`\` break out of the string and
+                    // inject script into the (UIAccess) webview.
+                    let arg = serde_json::to_string(&input_method)
+                        .unwrap_or_else(|_| "\"\"".to_string());
+                    if let Err(e) =
+                        indicator_webview.evaluate_script(&format!("updateInputMethod({arg})"))
                     {
                         eprintln!("evaluate_script failed: {e}");
                     }
