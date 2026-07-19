@@ -20,9 +20,11 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<BOOL> {
-        // this function checks if the key event will be handled by "OnKeyUp" function
-        // so we need to return TRUE if we want to handle the key event
-        let result = self.process_key(pic, wparam)?.is_some();
+        // TRUE = we will handle this key in OnKeyDown. FALSE hands the key
+        // to the host — which then never calls OnKeyDown, so pass-through
+        // side effects (canceling the composition on a Ctrl shortcut,
+        // issue #5) run inside test_key before we answer.
+        let result = self.test_key(pic, wparam)?;
 
         Ok(result.into())
     }

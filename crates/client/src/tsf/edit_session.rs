@@ -142,11 +142,7 @@ fn apply_display_attribute(
 
 /// Places the caret at the end of `range` (collapse + select) — the common
 /// tail of every text-writing edit session.
-fn caret_to_end(
-    context: &ITfContext,
-    cookie: u32,
-    range: &ITfRange,
-) -> windows::core::Result<()> {
+fn caret_to_end(context: &ITfContext, cookie: u32, range: &ITfRange) -> windows::core::Result<()> {
     unsafe { range.Collapse(cookie, TF_ANCHOR_END)? };
     set_selection(context, cookie, range)
 }
@@ -495,8 +491,7 @@ mod tests {
         let requests = unsafe { fake_context_of(&context) }.requests();
         assert_eq!(requests.len(), 1, "exactly one session should be requested");
         assert_eq!(
-            requests[0].flags,
-            TF_ES_READWRITE,
+            requests[0].flags, TF_ES_READWRITE,
             "the session must be requested read/write only, not synchronous"
         );
     }
@@ -623,7 +618,9 @@ mod tests {
     fn shift_start_measures_utf16_code_units() {
         let (tip, log) = factory_with_live_composition();
         let factory = unsafe { tip.as_impl() };
-        factory.shift_start("\u{20BB7}", "a").expect("shift_start failed");
+        factory
+            .shift_start("\u{20BB7}", "a")
+            .expect("shift_start failed");
         assert_eq!(
             log.shift_start_reqs.borrow().as_slice(),
             &[2],
@@ -673,15 +670,23 @@ mod tests {
     #[test]
     fn end_composition_preserves_text_longer_than_1024_units() {
         let (tip, log) = factory_with_live_composition();
-        let long: Vec<u16> = "あ".encode_utf16().collect::<Vec<u16>>()
-            .into_iter().cycle().take(3000).collect();
+        let long: Vec<u16> = "あ"
+            .encode_utf16()
+            .collect::<Vec<u16>>()
+            .into_iter()
+            .cycle()
+            .take(3000)
+            .collect();
         *log.text.borrow_mut() = long.clone();
 
         let factory = unsafe { tip.as_impl() };
         factory.end_composition().expect("end_composition failed");
 
         assert_eq!(
-            log.set_texts.borrow().last().expect("SetText was never called"),
+            log.set_texts
+                .borrow()
+                .last()
+                .expect("SetText was never called"),
             &long,
             "the full composition text must reach SetText"
         );
@@ -699,7 +704,13 @@ mod tests {
         let factory = unsafe { tip.as_impl() };
         factory.end_composition().expect("end_composition failed");
 
-        assert_eq!(log.set_texts.borrow().last().expect("SetText was never called"), &text);
+        assert_eq!(
+            log.set_texts
+                .borrow()
+                .last()
+                .expect("SetText was never called"),
+            &text
+        );
         assert_eq!(log.live_ranges(), 0);
     }
 

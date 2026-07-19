@@ -31,6 +31,50 @@ pub struct KeystrokeContext {
     pub suffix_is_empty: bool,
 }
 
+/// What the host should be told about a keystroke after the TIP decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyDisposition {
+    /// The TIP consumed the key; the host must not process it.
+    Eat,
+    /// The key belongs to the host application. Any actions attached to
+    /// it (e.g. canceling the composition on a shortcut) run first.
+    PassThrough,
+}
+
+/// True for keydowns of the modifier keys themselves (Shift/Ctrl/Alt and
+/// their L/R variants). While Ctrl is held these arrive too — including
+/// Ctrl's own autorepeat — and must never be treated as "the shortcut's
+/// key": pressing bare Ctrl must not cancel anything.
+pub fn is_modifier_key(key_code: usize) -> bool {
+    // 0x10 VK_SHIFT, 0x11 VK_CONTROL, 0x12 VK_MENU,
+    // 0xA0..=0xA5 VK_LSHIFT/RSHIFT/LCONTROL/RCONTROL/LMENU/RMENU
+    matches!(key_code, 0x10..=0x12 | 0xA0..=0xA5)
+}
+
+/// Handling for a key pressed while Ctrl is held — a shortcut meant for
+/// the host application (upstream issue #5: Ctrl+A during a composition
+/// looked dead because the TIP passed it through with the composition
+/// still open, and hosts ignore shortcuts while composing).
+///
+/// During a composition the TIP cancels its input and hands the key to
+/// the host; outside a composition the key simply passes through. The
+/// disposition is always [`KeyDisposition::PassThrough`].
+pub fn shortcut_transition(
+    state: &CompositionState,
+    key_is_modifier: bool,
+) -> Option<(CompositionState, Vec<ClientAction>)> {
+    if key_is_modifier {
+        return None;
+    }
+    match state {
+        CompositionState::None => None,
+        CompositionState::Composing | CompositionState::Previewing => Some((
+            CompositionState::None,
+            vec![ClientAction::CancelComposition],
+        )),
+    }
+}
+
 /// Returns `None` when the keystroke is not handled (the host application
 /// should process it).
 pub fn transition(
@@ -105,13 +149,15 @@ pub fn transition(
                         )
                     }
                 }
-                UserAction::Escape => {
-                    (CompositionState::None, vec![ClientAction::CancelComposition])
-                }
+                UserAction::Escape => (
+                    CompositionState::None,
+                    vec![ClientAction::CancelComposition],
+                ),
                 UserAction::Navigation(direction) => match direction {
-                    Navigation::Right => {
-                        (CompositionState::Composing, vec![ClientAction::MoveCursor(1)])
-                    }
+                    Navigation::Right => (
+                        CompositionState::Composing,
+                        vec![ClientAction::MoveCursor(1)],
+                    ),
                     Navigation::Left => (
                         CompositionState::Composing,
                         vec![ClientAction::MoveCursor(-1)],
@@ -377,8 +423,7 @@ mod tests {
     #[test]
     fn space_and_tab_open_the_candidate_selection() {
         for action in [UserAction::Space, UserAction::Tab] {
-            let (next, actions) =
-                transition(&kana(CompositionState::Composing), action).unwrap();
+            let (next, actions) = transition(&kana(CompositionState::Composing), action).unwrap();
             assert_eq!(next, CompositionState::Previewing);
             assert_eq!(
                 actions,
@@ -389,8 +434,11 @@ mod tests {
 
     #[test]
     fn toggle_while_composing_ends_and_switches_to_latin() {
-        let (next, actions) =
-            transition(&kana(CompositionState::Composing), UserAction::ToggleInputMode).unwrap();
+        let (next, actions) = transition(
+            &kana(CompositionState::Composing),
+            UserAction::ToggleInputMode,
+        )
+        .unwrap();
         assert_eq!(next, CompositionState::None);
         assert_eq!(
             actions,
@@ -411,8 +459,11 @@ mod tests {
             (Function::Ten, SetTextType::HalfLatin),
         ];
         for (key, expected) in cases {
-            let (next, actions) =
-                transition(&kana(CompositionState::Composing), UserAction::Function(key)).unwrap();
+            let (next, actions) = transition(
+                &kana(CompositionState::Composing),
+                UserAction::Function(key),
+            )
+            .unwrap();
             assert_eq!(next, CompositionState::Previewing);
             assert_eq!(actions, vec![ClientAction::SetTextWithType(expected)]);
         }
@@ -421,5 +472,41 @@ mod tests {
     #[test]
     fn unknown_keys_are_passed_through_while_composing() {
         assert!(transition(&kana(CompositionState::Composing), UserAction::Unknown).is_none());
+    }
+
+    /// Upstream issue #5: a Ctrl shortcut during a composition must cancel
+    /// the input (so the host's shortcut actually works) — from both
+    /// Composing and Previewing.
+    #[test]
+    fn a_shortcut_during_a_composition_cancels_the_input() {
+        for state in [CompositionState::Composing, CompositionState::Previewing] {
+            let (next, actions) = shortcut_transition(&state, false).unwrap();
+            assert_eq!(next, CompositionState::None);
+            assert_eq!(actions, vec![ClientAction::CancelComposition]);
+        }
+    }
+
+    #[test]
+    fn a_shortcut_outside_a_composition_just_passes_through() {
+        assert!(shortcut_transition(&CompositionState::None, false).is_none());
+    }
+
+    /// Pressing (or autorepeating) a bare modifier key while Ctrl is held
+    /// must not cancel anything — only the shortcut's real key does.
+    #[test]
+    fn modifier_keydowns_never_count_as_the_shortcut_key() {
+        for state in [
+            CompositionState::None,
+            CompositionState::Composing,
+            CompositionState::Previewing,
+        ] {
+            assert!(shortcut_transition(&state, true).is_none());
+        }
+        for vk in [0x10, 0x11, 0x12, 0xA0, 0xA2, 0xA5] {
+            assert!(is_modifier_key(vk));
+        }
+        for vk in [0x41, 0x08, 0x0D, 0x20] {
+            assert!(!is_modifier_key(vk), "0x{vk:02X} is a real key");
+        }
     }
 }
