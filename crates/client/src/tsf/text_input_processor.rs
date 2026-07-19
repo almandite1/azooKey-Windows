@@ -60,71 +60,85 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             }
         };
 
-        // Wire the sinks. If any step fails partway, the sinks already
-        // advised must be unwound: otherwise they leak into the host and,
-        // worse, TSF can keep calling back into a half-activated TIP. The
-        // old code returned Err here leaving every prior advise in place.
-        let setup = (|| -> Result<()> {
-            let mut text_service = self.borrow_mut()?;
+        let mut text_service = self.borrow_mut()?;
+        text_service.tid = tid;
+        text_service.thread_mgr = Some(thread_mgr.clone());
 
-            text_service.tid = tid;
-            text_service.thread_mgr = Some(thread_mgr.clone());
-
-            // initialize key event sink
-            tracing::debug!("AdviseKeyEventSink");
+        // The key-event sink is the lifeline: without it NO keystroke reaches
+        // the TIP and nothing composes or converts. This is the ONLY step
+        // whose failure is fatal — undo tid/thread_mgr and the dll ref, and
+        // report it.
+        tracing::debug!("AdviseKeyEventSink");
+        if let Err(error) = (|| -> Result<()> {
             unsafe {
                 thread_mgr.cast::<ITfKeystrokeMgr>()?.AdviseKeyEventSink(
                     tid,
                     &self.this::<ITfKeyEventSink>()?,
                     BOOL::from(true),
                 )?;
-            };
+            }
+            Ok(())
+        })() {
+            tracing::error!("AdviseKeyEventSink failed; the TIP cannot receive keys: {error:?}");
+            text_service.tid = 0;
+            text_service.thread_mgr = None;
+            drop(text_service);
+            dll_instance.release();
+            return Err(error);
+        }
 
-            // initialize thread manager event sink
-            tracing::debug!("AdviseThreadMgrEventSink");
+        // Everything below is ADVISORY. A failure here must NOT abort Activate:
+        //   - returning Err leaves the previously active IME's icon up (the
+        //     user cannot select azooKey), and
+        //   - unwinding the key-event sink on such a failure stops conversion
+        //     entirely. A langbar AddItem failure taking typing down with it
+        //     was exactly the "cannot convert" regression.
+        // Warn and keep the key sink. Deactivate later unadvises whatever the
+        // per-instance cookie map recorded, so nothing that succeeded leaks.
+
+        tracing::debug!("AdviseThreadMgrEventSink");
+        if let Err(error) = (|| -> Result<()> {
             self.advise_sink::<ITfThreadMgrEventSink>(
                 &thread_mgr.cast::<ITfSource>()?,
                 &mut text_service,
-            )?;
+            )
+        })() {
+            tracing::warn!("AdviseThreadMgrEventSink failed (non-fatal): {error:?}");
+        }
 
-            // initialize text layout sink
-            tracing::debug!("AdviseTextLayoutSink");
-            let doc_mgr = unsafe { thread_mgr.GetFocus() };
-            if let Ok(doc_mgr) = doc_mgr {
-                self.advise_text_layout_sink(&mut text_service, doc_mgr)?;
+        tracing::debug!("AdviseTextLayoutSink");
+        if let Ok(doc_mgr) = unsafe { thread_mgr.GetFocus() } {
+            if let Err(error) = self.advise_text_layout_sink(&mut text_service, doc_mgr) {
+                tracing::warn!("AdviseTextLayoutSink failed (non-fatal): {error:?}");
             }
+        }
 
-            // initialize display attribute
-            tracing::debug!("Initialize display attribute");
-            let atom_map = unsafe {
-                let mut map = HashMap::new();
-                let category_mgr: ITfCategoryMgr =
-                    CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)?;
+        tracing::debug!("Initialize display attribute");
+        let atom_map: Result<HashMap<_, _>> = (|| {
+            let mut map = HashMap::new();
+            let category_mgr: ITfCategoryMgr =
+                unsafe { CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)? };
+            let atom = unsafe { category_mgr.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE)? };
+            map.insert(GUID_DISPLAY_ATTRIBUTE, atom);
+            Ok(map)
+        })();
+        match atom_map {
+            Ok(map) => text_service.display_attribute_atom = map,
+            Err(error) => {
+                tracing::warn!("display attribute registration failed (non-fatal): {error:?}")
+            }
+        }
 
-                let atom = category_mgr.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE)?;
-                map.insert(GUID_DISPLAY_ATTRIBUTE, atom);
-                map
-            };
-
-            text_service.display_attribute_atom = atom_map;
-
-            // initialize langbar
-            tracing::debug!("Initialize langbar");
+        tracing::debug!("Initialize langbar");
+        if let Err(error) = (|| -> Result<()> {
             unsafe {
                 thread_mgr
                     .cast::<ITfLangBarItemMgr>()?
                     .AddItem(&self.this::<ITfLangBarItemButton>()?)?;
-            };
-
+            }
             Ok(())
-        })();
-
-        if let Err(error) = setup {
-            tracing::error!("Activate failed, rolling back partial state: {error:?}");
-            self.rollback_activation(&thread_mgr, tid);
-            // balance the add_ref taken at the top of Activate
-            dll_instance.release();
-            return Err(error);
+        })() {
+            tracing::warn!("langbar AddItem failed (non-fatal): {error:?}");
         }
 
         tracing::debug!("Activate success");
@@ -265,59 +279,6 @@ impl ITfTextInputProcessorEx_Impl for TextServiceFactory_Impl {
         tracing::debug!("Activated(Ex) with tid: {tid}");
         self.Activate(ptim, tid)?;
         Ok(())
-    }
-}
-
-impl TextServiceFactory_Impl {
-    /// Best-effort unwind of the sinks [`Activate`](TextServiceFactory_Impl::Activate)
-    /// may have advised before a later step failed. Each step no-ops if its
-    /// resource was never set up, so calling this after a partial Activate
-    /// leaves the TIP as if it had never activated — no sink stranded in the
-    /// host, no context pinned.
-    fn rollback_activation(&self, thread_mgr: &ITfThreadMgr, tid: u32) {
-        if let Err(error) = (|| -> Result<()> {
-            unsafe {
-                thread_mgr
-                    .cast::<ITfKeystrokeMgr>()?
-                    .UnadviseKeyEventSink(tid)?;
-            }
-            Ok(())
-        })() {
-            tracing::warn!("rollback: UnadviseKeyEventSink failed: {error:?}");
-        }
-
-        if let Ok(mut text_service) = self.borrow_mut() {
-            if let Ok(source) = thread_mgr.cast::<ITfSource>() {
-                if let Err(error) =
-                    self.unadvise_sink::<ITfThreadMgrEventSink>(&source, &mut text_service)
-                {
-                    tracing::warn!("rollback: unadvise thread-mgr sink failed: {error:?}");
-                }
-            }
-            if let Err(error) = self.unadvise_text_layout_sink(&mut text_service) {
-                tracing::warn!("rollback: unadvise text layout sink failed: {error:?}");
-            }
-
-            // AddItem is the last setup step; if it succeeded before another
-            // failure (there is none after it today) this removes it, and if
-            // it never ran RemoveItem simply reports no such item — harmless
-            if let Err(error) = (|| -> Result<()> {
-                unsafe {
-                    thread_mgr
-                        .cast::<ITfLangBarItemMgr>()?
-                        .RemoveItem(&self.this::<ITfLangBarItemButton>()?)?;
-                }
-                Ok(())
-            })() {
-                tracing::debug!("rollback: RemoveItem (langbar not added): {error:?}");
-            }
-
-            text_service.display_attribute_atom.clear();
-            text_service.tid = 0;
-            text_service.thread_mgr = None;
-            text_service.context = None;
-            text_service.layout_context = None;
-        }
     }
 }
 
@@ -516,12 +477,14 @@ mod tests {
         reset_ime_state();
     }
 
-    /// Fix 4: when a late Activate step fails (here AddItem, the final step),
-    /// the TIP must unwind the sinks it already advised instead of stranding
-    /// them in the host. The old code returned Err leaving the key-event sink
-    /// and the thread-manager event sink advised.
+    /// Regression guard for the "cannot convert" bug: a failing *advisory*
+    /// Activate step (here the langbar AddItem, the last step) must NOT take
+    /// the key-event sink down with it. The key sink is the lifeline — without
+    /// it no keystroke reaches the TIP and nothing converts. An earlier
+    /// version rolled back every advised sink on any late failure, which
+    /// unadvised the key sink and broke all input whenever AddItem failed.
     #[test]
-    fn activate_rolls_back_advised_sinks_when_a_later_step_fails() {
+    fn a_failing_langbar_keeps_the_key_sink_and_activation_succeeds() {
         let _guard = crate::tsf::test_support::global_state_lock();
         ensure_dll_module();
         let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -534,33 +497,32 @@ mod tests {
 
         let result = unsafe { tip.Activate(Some(&thread_mgr), 1) };
         assert!(
-            result.is_err(),
-            "Activate must fail when its AddItem step fails"
+            result.is_ok(),
+            "a failing langbar is advisory — Activate must still succeed so \
+             the key sink stays live and typing works: {result:?}"
         );
 
         assert_eq!(
             log.key_sink_advises.borrow().as_slice(),
             &[true],
-            "the key-event sink was advised before AddItem"
+            "the key-event sink must be advised"
         );
         assert_eq!(
             log.key_sink_unadvises.get(),
-            1,
-            "a failed Activate must unadvise the key-event sink it advised"
-        );
-        assert_eq!(
-            log.unadvise_cookies.borrow().as_slice(),
-            log.advise_cookies.borrow().as_slice(),
-            "a failed Activate must unadvise the thread-manager sink it advised"
+            0,
+            "the key-event sink must NOT be unadvised when only the langbar \
+             fails (unadvising it is what stopped conversion)"
         );
 
-        // the partial state must be cleared so a later Activate starts clean
+        // the TIP is genuinely active: tid is set, so keystrokes are handled
         let factory: &TextServiceFactory = unsafe { tip.as_impl() };
         assert_eq!(
             factory.borrow().unwrap().tid,
-            0,
-            "the rolled-back Activate must clear tid"
+            1,
+            "a successful (advisory-degraded) Activate keeps the tid"
         );
+
+        unsafe { tip.Deactivate() }.expect("Deactivate must succeed");
         reset_ime_state();
     }
 
