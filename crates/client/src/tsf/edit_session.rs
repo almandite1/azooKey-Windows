@@ -402,9 +402,10 @@ impl TextServiceFactory {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::engine::ipc_service::IPCService;
     use crate::tsf::test_support::{
-        factory_with_fake_context, fake_context_of, EditSessionBehavior, FakeComposition,
-        FakeContext, RangeLog, FAKE_COOKIE,
+        factory_with_context, factory_with_fake_context, fake_context_of, global_state_lock,
+        EditSessionBehavior, FakeComposition, FakeContext, RangeLog, FAKE_COOKIE,
     };
     use windows::Win32::UI::TextServices::ITfTextInputProcessor;
 
@@ -450,6 +451,39 @@ mod tests {
             TF_ES_READWRITE,
             "the session must be requested read/write only, not synchronous"
         );
+    }
+
+    /// Drives update_pos end to end against the fake view: the composition
+    /// range must be measured on the context's active view (GetTextExt) and
+    /// every range involved must be released. This path was untestable
+    /// before the fake modeled GetActiveView.
+    #[test]
+    fn update_pos_measures_the_composition_via_the_active_view() {
+        let _guard = global_state_lock();
+        let log = Rc::new(RangeLog::default());
+        let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
+        let tip = factory_with_context(context.clone());
+        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        factory
+            .borrow()
+            .unwrap()
+            .borrow_mut_composition()
+            .unwrap()
+            .tip_composition = Some(FakeComposition::with_log(log.clone()));
+        // the rect is only measured when there is an IPC service to report
+        // it to; the send itself may fail (no UI process) and is logged only
+        IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
+
+        factory.update_pos().unwrap();
+
+        let view = unsafe { fake_context_of(&context) }.view_log();
+        assert_eq!(
+            view.get_text_ext_calls.get(),
+            1,
+            "the composition rect must be measured on the active view"
+        );
+        assert_eq!(log.live_ranges(), 0, "no range may leak from update_pos");
+        IMEState::get().unwrap().ipc_service = None;
     }
 
     /// A cooperative host: the session runs and its value comes back.

@@ -201,3 +201,50 @@ impl TextServiceFactory {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::rc::Rc;
+
+    use windows::core::AsImpl as _;
+
+    use crate::tsf::factory::TextServiceFactory;
+    use crate::tsf::test_support::{
+        factory_with_context, global_state_lock, EditSessionBehavior, FakeContext, RangeLog,
+    };
+
+    /// Drives update_context end to end against the fake host: the
+    /// preceding text is located by shifting the selection back — the fixed
+    /// 30-unit window, then forward past the preview — and the shift must be
+    /// in UTF-16 code units, not chars (B9's unit). Every range the host
+    /// handed out must be released (B10's leak).
+    #[test]
+    fn update_context_shifts_by_utf16_units_and_releases_the_ranges() {
+        let _guard = global_state_lock();
+        let log = Rc::new(RangeLog::default());
+        *log.text.borrow_mut() = "こんにちは".encode_utf16().collect();
+        let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
+        let tip = factory_with_context(context.clone());
+        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+
+        // 𠮷 is one char but two UTF-16 units — the difference that matters
+        factory.update_context("みず𠮷").unwrap();
+
+        assert_eq!(
+            log.shift_start_reqs.borrow().last(),
+            Some(&-30),
+            "the fixed 30-unit context window must be requested"
+        );
+        assert_eq!(
+            log.shift_end_reqs.borrow().last(),
+            Some(&-4),
+            "ShiftEnd must retreat by the preview's UTF-16 length (みず𠮷 = 4)"
+        );
+        assert_eq!(
+            log.live_ranges(),
+            0,
+            "every range the host handed out must be released"
+        );
+    }
+}
