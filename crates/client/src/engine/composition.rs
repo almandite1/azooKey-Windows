@@ -383,7 +383,6 @@ impl TextServiceFactory {
                         selection_index = match selection {
                             SetSelectionType::Up => selection_index - 1,
                             SetSelectionType::Down => selection_index + 1,
-                            SetSelectionType::Number(number) => *number,
                         }
                         .clamp(0, max(0, texts.len() as i32 - 1));
 

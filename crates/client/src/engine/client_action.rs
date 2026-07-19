@@ -21,7 +21,6 @@ pub enum ClientAction {
 pub enum SetSelectionType {
     Up,
     Down,
-    Number(i32),
 }
 
 #[derive(Debug, PartialEq)]
