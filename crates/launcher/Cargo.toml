@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0"
-chrono = "0.4.39"
-shared = { path = "../shared" }
-tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
-tonic = "0.12.3"
-tonic-health = "0.12.3"
+anyhow = { workspace = true }
+chrono = { workspace = true }
+shared = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
 
 [dependencies.windows]
-version = "0.58.0"
+workspace = true
 features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -20,4 +20,4 @@ features = [
     "Win32_System_Threading",
 ]
 [dev-dependencies]
-serde_json = "1.0"
+serde_json = { workspace = true }
