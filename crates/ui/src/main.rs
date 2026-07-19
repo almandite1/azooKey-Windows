@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use azookey_server::TonicNamedPipeServer;
 use ipc::{WindowAction, WindowController, WindowService};
 use shared::proto::window_service_server::WindowServiceServer;
-use tao::dpi::{LogicalSize, PhysicalPosition};
-use tao::platform::windows::{EventLoopBuilderExtWindows, WindowExtWindows};
+use tao::dpi::LogicalSize;
+use tao::platform::windows::EventLoopBuilderExtWindows;
 use tao::{
     event::{Event, StartCause, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
@@ -14,14 +14,6 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use uiaccess::prepare_uiaccess_token;
-use utils::get_candidate_window_position;
-use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
-};
-use windows::Win32::{
-    Foundation::HWND,
-    UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE},
-};
 
 pub mod candidate;
 pub mod indicator;
@@ -29,6 +21,7 @@ pub mod ipc;
 pub mod uiaccess;
 pub mod utils;
 pub mod window;
+pub mod window_actions;
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -162,8 +155,6 @@ async fn main() -> anyhow::Result<()> {
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
-        let indicator_hwnd = indicator_window.hwnd();
-
         match event {
             Event::NewEvents(StartCause::Init) => {}
             Event::WindowEvent {
@@ -213,144 +204,13 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
                 }
                 UserEvent::WindowAction(action) => {
-                    match action {
-                        WindowAction::Show => {
-                            // if mode indicator is already shown, hide it
-                            let mut task_guard = match task_guard.try_lock() {
-                                Ok(guard) => guard,
-                                Err(_) => {
-                                    eprintln!(
-                                        "Warning: Failed to lock task_guard, skipping cleanup"
-                                    );
-                                    return;
-                                }
-                            };
-                            if let Some(task) = task_guard.take() {
-                                task.abort();
-                                let _ = unsafe {
-                                    ShowWindow(
-                                        HWND(indicator_hwnd as *mut std::ffi::c_void),
-                                        SW_HIDE,
-                                    )
-                                };
-                            }
-
-                            let _ = unsafe {
-                                ShowWindow(
-                                    HWND(candidate_window.hwnd() as *mut std::ffi::c_void),
-                                    SW_SHOWNOACTIVATE,
-                                )
-                            };
-                        }
-                        WindowAction::Hide => {
-                            let _ = unsafe {
-                                ShowWindow(
-                                    HWND(candidate_window.hwnd() as *mut std::ffi::c_void),
-                                    SW_HIDE,
-                                )
-                            };
-                        }
-                        WindowAction::SetPosition {
-                            top,
-                            left,
-                            bottom,
-                            right,
-                        } => {
-                            let (x, y) = get_candidate_window_position(
-                                top,
-                                left,
-                                bottom,
-                                right,
-                                &candidate_window,
-                            );
-
-                            unsafe {
-                                let _ = SetWindowPos(
-                                    HWND(candidate_window.hwnd() as *mut std::ffi::c_void),
-                                    HWND_TOPMOST,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                                );
-
-                                let _ = SetWindowPos(
-                                    HWND(indicator_hwnd as *mut std::ffi::c_void),
-                                    HWND_TOPMOST,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                                );
-                            }
-                            candidate_window.set_outer_position(PhysicalPosition::new(x, y));
-                            // clamp the indicator into the work area too — it
-                            // used to hang off-screen near screen edges (B20)
-                            let (ix, iy) =
-                                utils::get_indicator_position(left, bottom, &indicator_window);
-                            indicator_window.set_outer_position(PhysicalPosition::new(ix, iy));
-                        }
-                        WindowAction::SetCandidate { candidates } => {
-                            let max_len = candidates
-                                .iter()
-                                .map(|s| s.chars().count())
-                                .max()
-                                .unwrap_or(0) as u32;
-
-                            // logical (CSS px) size: the webview lays out in
-                            // CSS px, so a physical-px window stayed too
-                            // small at high DPI and clipped the candidate
-                            // text (B20)
-                            let scale = candidate_window.scale_factor();
-                            let height =
-                                candidate_window.inner_size().to_logical::<f64>(scale).height;
-                            candidate_window.set_inner_size(LogicalSize::new(
-                                utils::candidate_window_logical_width(max_len) as f64,
-                                height,
-                            ));
-
-                            // Vec<String> serialization cannot fail; fall back
-                            // to an empty list rather than crash the UI
-                            let candidates = serde_json::to_string(&candidates)
-                                .unwrap_or_else(|_| "[]".to_string());
-
-                            let _ = event_loop_proxy
-                                .send_event(UserEvent::UpdateCandidates(candidates));
-                        }
-                        WindowAction::SetSelection { index } => {
-                            let _ = event_loop_proxy.send_event(UserEvent::UpdateSelection(index));
-                        }
-                        WindowAction::SetInputMode(input_method) => {
-                            let _ = event_loop_proxy
-                                .send_event(UserEvent::UpdateInputMethod(input_method));
-
-                            let task_guard = task_guard.try_lock();
-
-                            if let Ok(mut task_guard) = task_guard {
-                                if let Some(task) = task_guard.take() {
-                                    task.abort();
-                                }
-
-                                *task_guard = Some(tokio::spawn(async move {
-                                    let _ = unsafe {
-                                        ShowWindow(
-                                            HWND(indicator_hwnd as *mut std::ffi::c_void),
-                                            SW_SHOWNOACTIVATE,
-                                        )
-                                    };
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                    let _ = unsafe {
-                                        ShowWindow(
-                                            HWND(indicator_hwnd as *mut std::ffi::c_void),
-                                            SW_HIDE,
-                                        )
-                                    };
-                                }));
-                            }
-                        }
-                    }
+                    window_actions::handle_window_action(
+                        action,
+                        &candidate_window,
+                        &indicator_window,
+                        &task_guard,
+                        &event_loop_proxy,
+                    );
                 }
             },
             _ => (),

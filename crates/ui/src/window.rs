@@ -11,12 +11,37 @@ use tao::{
 use windows::Win32::{
     Foundation::HWND,
     UI::WindowsAndMessaging::{
-        SetWindowLongW, GWL_EXSTYLE, GWL_STYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_POPUP,
+        SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_TOPMOST,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     },
 };
 
 use crate::UserEvent;
+
+/// Shows or hides a window without activating it (the IME must never steal
+/// focus from the host application). Takes the raw HWND so callers off the
+/// UI thread — the indicator flash task — can use it too.
+pub fn set_visibility(hwnd: isize, visible: bool) {
+    let cmd = if visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
+    let _ = unsafe { ShowWindow(HWND(hwnd as *mut std::ffi::c_void), cmd) };
+}
+
+/// Re-asserts the window's place in the topmost band without moving,
+/// resizing, or activating it.
+pub fn pin_topmost(hwnd: isize) {
+    let _ = unsafe {
+        SetWindowPos(
+            HWND(hwnd as *mut std::ffi::c_void),
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
+}
 
 pub fn create_overlay_window(
     event_loop: &EventLoop<UserEvent>,
