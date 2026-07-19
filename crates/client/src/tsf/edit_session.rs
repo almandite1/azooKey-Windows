@@ -88,6 +88,69 @@ fn set_selection(context: &ITfContext, cookie: u32, range: &ITfRange) -> windows
     result
 }
 
+/// Reads the FULL text of `range`. GetText fills at most the buffer, so a
+/// full buffer means "maybe more" — retry from a fresh clone with a larger
+/// one (B23: a fixed 1024 buffer silently truncated longer compositions on
+/// commit). cch < capacity proves completeness.
+fn read_range_text(range: &ITfRange, cookie: u32) -> windows::core::Result<Vec<u16>> {
+    const MAX_COMPOSITION_UNITS: usize = 1 << 20;
+    let mut capacity: usize = 1024;
+    loop {
+        let mut buf = vec![0u16; capacity];
+        let mut cch: u32 = 0;
+
+        // fresh clone each attempt: TF_TF_MOVESTART moves the previous
+        // clone's start anchor
+        unsafe {
+            let probe = range.Clone()?;
+            probe.GetText(cookie, TF_TF_MOVESTART, &mut buf, &mut cch)?;
+        }
+
+        if (cch as usize) < capacity {
+            buf.truncate(cch as usize);
+            return Ok(buf);
+        }
+        if capacity >= MAX_COMPOSITION_UNITS {
+            tracing::warn!(
+                "composition text exceeds {MAX_COMPOSITION_UNITS} UTF-16 units; \
+                 committing truncated"
+            );
+            buf.truncate(cch as usize);
+            return Ok(buf);
+        }
+        capacity *= 4;
+    }
+}
+
+/// Marks `range` with the composition's display attribute (the conversion
+/// underline) when the atom was registered on Activate.
+fn apply_display_attribute(
+    context: &ITfContext,
+    cookie: u32,
+    range: &ITfRange,
+    display_attribute_atom: &std::collections::HashMap<windows::core::GUID, u32>,
+) -> windows::core::Result<()> {
+    if let Some(atom) = display_attribute_atom.get(&GUID_DISPLAY_ATTRIBUTE) {
+        let pvar = VARIANT::from(*atom as i32);
+        unsafe {
+            let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+            prop.SetValue(cookie, range, &pvar)?;
+        }
+    }
+    Ok(())
+}
+
+/// Places the caret at the end of `range` (collapse + select) — the common
+/// tail of every text-writing edit session.
+fn caret_to_end(
+    context: &ITfContext,
+    cookie: u32,
+    range: &ITfRange,
+) -> windows::core::Result<()> {
+    unsafe { range.Collapse(cookie, TF_ANCHOR_END)? };
+    set_selection(context, cookie, range)
+}
+
 /// Fetches the host's current selection and takes ownership of its range.
 /// `GetSelection` is [out]: the range arrives AddRef'd inside a
 /// `ManuallyDrop`, so failing to take it leaked one host-side range per
@@ -171,48 +234,18 @@ impl TextServiceFactory {
                         let context = text_service.context::<ITfContext>()?;
 
                         move |cookie| unsafe {
-                            // clear display attribute first
                             let range: ITfRange = composition.GetRange()?;
 
-                            // Read the FULL composition text. GetText fills at
-                            // most the buffer, so a full buffer means "maybe
-                            // more" — retry from a fresh clone with a larger
-                            // one (B23: a fixed 1024 buffer silently truncated
-                            // longer compositions on commit). cch < capacity
-                            // proves completeness.
-                            const MAX_COMPOSITION_UNITS: usize = 1 << 20;
-                            let mut capacity: usize = 1024;
-                            let text = loop {
-                                let mut buf = vec![0u16; capacity];
-                                let mut cch: u32 = 0;
-
-                                // fresh clone each attempt: TF_TF_MOVESTART
-                                // moves the previous clone's start anchor
-                                let probe = range.Clone()?;
-                                probe.GetText(cookie, TF_TF_MOVESTART, &mut buf, &mut cch)?;
-
-                                if (cch as usize) < capacity {
-                                    buf.truncate(cch as usize);
-                                    break buf;
-                                }
-                                if capacity >= MAX_COMPOSITION_UNITS {
-                                    tracing::warn!(
-                                        "composition text exceeds {MAX_COMPOSITION_UNITS} \
-                                         UTF-16 units; committing truncated"
-                                    );
-                                    buf.truncate(cch as usize);
-                                    break buf;
-                                }
-                                capacity *= 4;
-                            };
+                            // re-write the full text without the composition's
+                            // display attribute (B23: read it whole, not the
+                            // first 1024 units)
+                            let text = read_range_text(&range, cookie)?;
                             range.SetText(cookie, TF_ST_CORRECTION, &text)?;
 
                             let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
                             prop.Clear(cookie, &range)?;
 
-                            // shift the start of the composition
-                            range.Collapse(cookie, TF_ANCHOR_END)?;
-                            set_selection(&context, cookie, &range)?;
+                            caret_to_end(&context, cookie, &range)?;
 
                             composition.EndComposition(cookie)?;
                             Ok(())
@@ -255,20 +288,20 @@ impl TextServiceFactory {
                         let range = composition.GetRange()?;
                         range.SetText(cookie, TF_ST_CORRECTION, &text)?;
 
-                        // first, set the display attribute to the "text" part
+                        // mark only the "text" part (not the subtext) with
+                        // the display attribute
                         let text_range = range.Clone()?;
                         text_range.Collapse(cookie, TF_ANCHOR_START)?;
                         let mut shifted: i32 = 0;
                         text_range.ShiftEnd(cookie, text_len, &mut shifted, std::ptr::null())?;
-                        let display_attribute = display_attribute_atom.get(&GUID_DISPLAY_ATTRIBUTE);
-                        if let Some(display_attribute) = display_attribute {
-                            let pvar = VARIANT::from(*display_attribute as i32);
-                            let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
-                            prop.SetValue(cookie, &text_range, &pvar)?;
-                        }
+                        apply_display_attribute(
+                            &context,
+                            cookie,
+                            &text_range,
+                            &display_attribute_atom,
+                        )?;
 
-                        range.Collapse(cookie, TF_ANCHOR_END)?;
-                        set_selection(&context, cookie, &range)?;
+                        caret_to_end(&context, cookie, &range)?;
 
                         Ok(())
                     }
@@ -312,20 +345,12 @@ impl TextServiceFactory {
 
                         composition.ShiftStart(cookie, &range)?;
 
-                        // then, set the display attribute
+                        // then, write the remaining subtext and re-mark it
                         let range = composition.GetRange()?;
-
                         range.SetText(cookie, TF_ST_CORRECTION, &subtext)?;
+                        apply_display_attribute(&context, cookie, &range, &display_attribute_atom)?;
 
-                        let display_attribute = display_attribute_atom.get(&GUID_DISPLAY_ATTRIBUTE);
-                        if let Some(display_attribute) = display_attribute {
-                            let pvar = VARIANT::from(*display_attribute as i32);
-                            let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
-                            prop.SetValue(cookie, &range, &pvar)?;
-                        }
-
-                        range.Collapse(cookie, TF_ANCHOR_END)?;
-                        set_selection(&context, cookie, &range)?;
+                        caret_to_end(&context, cookie, &range)?;
 
                         Ok(())
                     }
