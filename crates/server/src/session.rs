@@ -30,18 +30,28 @@ pub(crate) fn session_of<T>(request: &Request<T>) -> i32 {
 }
 
 fn touch_session(id: i32) {
-    let mut map = SESSION_LAST_USED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    map.insert(id, Instant::now());
+    // Collect and drop the expired ids from the map, then release the lock
+    // BEFORE calling into Swift. RemoveSession is an FFI call; running it
+    // while holding SESSION_LAST_USED would, if it ever hung or panicked,
+    // stall or poison the lock for every other request that needs it.
+    let expired: Vec<i32> = {
+        let mut map = SESSION_LAST_USED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        map.insert(id, Instant::now());
 
-    let expired: Vec<i32> = map
-        .iter()
-        .filter(|(sid, last)| **sid != id && last.elapsed() > SESSION_IDLE_TIMEOUT)
-        .map(|(sid, _)| *sid)
-        .collect();
+        let expired: Vec<i32> = map
+            .iter()
+            .filter(|(sid, last)| **sid != id && last.elapsed() > SESSION_IDLE_TIMEOUT)
+            .map(|(sid, _)| *sid)
+            .collect();
+        for sid in &expired {
+            map.remove(sid);
+        }
+        expired
+    };
+
     for sid in expired {
-        map.remove(&sid);
         unsafe { RemoveSession(sid) };
     }
 }

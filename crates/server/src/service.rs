@@ -28,6 +28,17 @@ fn composed(session: i32, composing_text: RawComposingText) -> ComposingText {
     }
 }
 
+/// The engine wants the text immediately left of the caret on the current
+/// line as conversion context. Take the last non-empty line, splitting on BOTH
+/// `\r` and `\n`: splitting on `\r` alone left a leading `\n` on the segment in
+/// CRLF documents, feeding a stray newline into the engine's left-side context.
+fn last_line_context(context: &str) -> &str {
+    context
+        .split(['\r', '\n'])
+        .rfind(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
 #[tonic::async_trait]
 impl AzookeyService for MyAzookeyService {
     async fn append_text(
@@ -92,12 +103,8 @@ impl AzookeyService for MyAzookeyService {
     ) -> Result<Response<shared::proto::SetContextResponse>, Status> {
         let session = session_of(&request);
         let context = request.into_inner().context;
-        let trimmed_context = context
-            .split('\r')
-            .rfind(|s| !s.is_empty())
-            .unwrap_or_default();
 
-        set_context(session, trimmed_context);
+        set_context(session, last_line_context(&context));
         Ok(Response::new(shared::proto::SetContextResponse {}))
     }
 
@@ -107,5 +114,25 @@ impl AzookeyService for MyAzookeyService {
     ) -> Result<Response<shared::proto::UpdateConfigResponse>, Status> {
         load_config();
         Ok(Response::new(shared::proto::UpdateConfigResponse {}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::last_line_context;
+
+    #[test]
+    fn last_line_context_takes_the_final_nonempty_line() {
+        assert_eq!(last_line_context("前の行\r\n現在の行"), "現在の行");
+        assert_eq!(last_line_context("前の行\n現在の行"), "現在の行");
+        assert_eq!(last_line_context("前の行\r現在の行"), "現在の行");
+        // no stray newline survives on a CRLF boundary
+        assert_eq!(last_line_context("a\r\nb"), "b");
+        // trailing newlines fall back to the previous non-empty line
+        assert_eq!(last_line_context("最後\r\n"), "最後");
+        // single line and empty input
+        assert_eq!(last_line_context("ただ一行"), "ただ一行");
+        assert_eq!(last_line_context(""), "");
+        assert_eq!(last_line_context("\r\n\r\n"), "");
     }
 }
