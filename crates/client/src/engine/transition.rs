@@ -20,9 +20,12 @@ use super::{
 pub struct KeystrokeContext {
     pub state: CompositionState,
     pub mode: InputMode,
-    /// `preview.chars().count()`: Backspace on the last remaining char
-    /// ends the composition instead of just removing text.
-    pub preview_chars: usize,
+    /// `raw_hiragana.chars().count()`: the reading's kana count — the unit
+    /// RemoveText actually deletes on the engine side. Backspace decisions
+    /// must use this, never the converted preview's length: a multi-kana
+    /// reading can have a single-char candidate (さい→際), and ending on
+    /// "preview == 1 char" committed the leftover reading (issue #35).
+    pub reading_chars: usize,
     /// `suffix.is_empty()`: Enter with nothing pending commits and ends;
     /// otherwise it commits the selected candidate and keeps composing.
     pub suffix_is_empty: bool,
@@ -81,7 +84,9 @@ pub fn transition(
                     vec![input_action(number.to_string())],
                 ),
                 UserAction::Backspace => {
-                    if ctx.preview_chars == 1 {
+                    // <=: an empty reading (nothing left to remove) must
+                    // also end rather than loop in Composing forever
+                    if ctx.reading_chars <= 1 {
                         (
                             CompositionState::None,
                             vec![ClientAction::RemoveText, ClientAction::EndComposition],
@@ -100,10 +105,9 @@ pub fn transition(
                         )
                     }
                 }
-                UserAction::Escape => (
-                    CompositionState::None,
-                    vec![ClientAction::RemoveText, ClientAction::EndComposition],
-                ),
+                UserAction::Escape => {
+                    (CompositionState::None, vec![ClientAction::CancelComposition])
+                }
                 UserAction::Navigation(direction) => match direction {
                     Navigation::Right => {
                         (CompositionState::Composing, vec![ClientAction::MoveCursor(1)])
@@ -171,7 +175,7 @@ mod tests {
         KeystrokeContext {
             state,
             mode,
-            preview_chars: 2,
+            reading_chars: 2,
             suffix_is_empty: true,
         }
     }
@@ -260,9 +264,9 @@ mod tests {
     }
 
     #[test]
-    fn backspace_on_the_last_char_ends_the_composition() {
+    fn backspace_on_the_last_kana_ends_the_composition() {
         let mut context = kana(CompositionState::Composing);
-        context.preview_chars = 1;
+        context.reading_chars = 1;
         let (next, actions) = transition(&context, UserAction::Backspace).unwrap();
         assert_eq!(next, CompositionState::None);
         assert_eq!(
@@ -277,6 +281,24 @@ mod tests {
             transition(&kana(CompositionState::Composing), UserAction::Backspace).unwrap();
         assert_eq!(next, CompositionState::Composing);
         assert_eq!(actions, vec![ClientAction::RemoveText]);
+    }
+
+    /// Upstream issue #35: さい converts to the single-char candidate 際,
+    /// so the converted preview hits 1 char while the reading still has 2
+    /// kana. RemoveText deletes ONE KANA — judging "last one" by the
+    /// preview ended (= committed!) the composition a keystroke early,
+    /// leaving 「さ」 behind. The reading is the only valid measure.
+    #[test]
+    fn backspace_judges_by_the_reading_not_the_converted_preview() {
+        let mut context = kana(CompositionState::Previewing);
+        context.reading_chars = 2; // さい — even though the preview 際 is 1 char
+        let (next, actions) = transition(&context, UserAction::Backspace).unwrap();
+        assert_eq!(next, CompositionState::Composing);
+        assert_eq!(
+            actions,
+            vec![ClientAction::RemoveText],
+            "the composition must keep going while the reading has kana left"
+        );
     }
 
     #[test]
@@ -296,15 +318,17 @@ mod tests {
         assert_eq!(actions, vec![ClientAction::ShrinkText("".to_string())]);
     }
 
+    /// Escape must discard the whole composition without committing
+    /// anything. The old [RemoveText, EndComposition] pair deleted one
+    /// kana and then COMMITTED the remainder (confirmed on hardware
+    /// alongside issue #35).
     #[test]
-    fn escape_discards_the_composition() {
-        let (next, actions) =
-            transition(&kana(CompositionState::Composing), UserAction::Escape).unwrap();
-        assert_eq!(next, CompositionState::None);
-        assert_eq!(
-            actions,
-            vec![ClientAction::RemoveText, ClientAction::EndComposition]
-        );
+    fn escape_discards_the_composition_without_committing() {
+        for state in [CompositionState::Composing, CompositionState::Previewing] {
+            let (next, actions) = transition(&kana(state), UserAction::Escape).unwrap();
+            assert_eq!(next, CompositionState::None);
+            assert_eq!(actions, vec![ClientAction::CancelComposition]);
+        }
     }
 
     #[test]

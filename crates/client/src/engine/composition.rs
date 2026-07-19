@@ -111,7 +111,7 @@ impl TextServiceFactory {
             KeystrokeContext {
                 state: composition.state.clone(),
                 mode: text_service.input_mode.clone(),
-                preview_chars: composition.preview.chars().count(),
+                reading_chars: composition.raw_hiragana.chars().count(),
                 suffix_is_empty: composition.suffix.is_empty(),
             }
         };
@@ -178,7 +178,13 @@ impl TextServiceFactory {
                         self.update_pos()?;
                         ipc_service.show_window();
                     }
-                    ClientAction::EndComposition => {
+                    ClientAction::EndComposition | ClientAction::CancelComposition => {
+                        // ending COMMITS whatever the range holds, so a
+                        // cancel must empty it first — Escape used to leave
+                        // the leftover reading committed (issue #35 family)
+                        if matches!(action, ClientAction::CancelComposition) {
+                            self.set_text("", "")?;
+                        }
                         self.end_composition()?;
                         selection_index = 0;
                         corresponding_count = 0;

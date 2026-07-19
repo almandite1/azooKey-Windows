@@ -381,3 +381,55 @@ async fn move_cursor_round_trips_without_breaking_the_composition() {
         .await
         .expect("clear_text failed");
 }
+
+/// The Backspace fix for upstream issue #35 relies on this engine
+/// contract: one RemoveText call deletes exactly one kana from the
+/// reading. The client predicts "this removal empties the composition"
+/// from the READING length (raw_hiragana) — never from the converted
+/// candidate's length, which can be shorter (さい → 際 is 1 char at 2
+/// kana) and used to make the client commit the leftover reading.
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment"]
+async fn remove_text_drains_the_reading_one_kana_per_call() {
+    let mut client = connect().await;
+
+    client
+        .clear_text(shared::proto::ClearTextRequest {})
+        .await
+        .expect("clear_text failed");
+
+    let mut reading = String::new();
+    for key in "saigentejun".chars() {
+        let response = client
+            .append_text(shared::proto::AppendTextRequest {
+                text_to_append: key.to_string(),
+            })
+            .await
+            .expect("append_text failed")
+            .into_inner();
+        reading = response.composing_text.expect("composing_text missing").hiragana;
+    }
+    // a lone trailing n stays roman until a follow-up key resolves it
+    assert_eq!(reading, "さいげんてじゅn");
+
+    let mut expected = reading.chars().count();
+    while expected > 0 {
+        let response = client
+            .remove_text(shared::proto::RemoveTextRequest {})
+            .await
+            .expect("remove_text failed")
+            .into_inner();
+        let hiragana = response.composing_text.expect("composing_text missing").hiragana;
+        expected -= 1;
+        assert_eq!(
+            hiragana.chars().count(),
+            expected,
+            "each RemoveText must delete exactly one kana (got {hiragana:?})"
+        );
+    }
+
+    client
+        .clear_text(shared::proto::ClearTextRequest {})
+        .await
+        .expect("clear_text failed");
+}
