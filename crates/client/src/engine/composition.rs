@@ -379,6 +379,19 @@ impl TextServiceFactory {
                         };
 
                         self.set_text(&text, "")?;
+
+                        // sync the written-back state with what is now on
+                        // screen: the whole reading converted, no suffix
+                        // left. A stale preview made the next ShrinkText's
+                        // shift_start commit only the first
+                        // `old_preview.len()` units of the converted text,
+                        // and a stale suffix sent Enter down the
+                        // pending-suffix path instead of ending
+                        preview = text;
+                        suffix.clear();
+                        // the conversion covers every input element typed so
+                        // far, so a following ShrinkText must drop them all
+                        corresponding_count = raw_input.chars().count() as i32;
                     }
                 }
             }
@@ -401,5 +414,74 @@ impl TextServiceFactory {
         composition.corresponding_count = corresponding_count;
 
         result
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::engine::client_action::SetTextType;
+    use crate::engine::ipc_service::IPCService;
+    use crate::tsf::test_support::{
+        factory_with_fake_context, global_state_lock, EditSessionBehavior,
+    };
+    use windows::core::AsImpl as _;
+
+    /// After F6–F10 (SetTextWithType) the written-back composition state must
+    /// describe what is actually on screen: the converted reading as the
+    /// preview, no pending suffix, and a corresponding_count covering every
+    /// input element. The old arm updated only the on-screen range; the stale
+    /// preview then made the next ShrinkText's shift_start commit just the
+    /// first `old_preview.len()` UTF-16 units of the converted text (e.g.
+    /// わたし → F7 →「ワタシ」, next keystroke committed only「ワ」), and a
+    /// stale non-empty suffix sent Enter down the "commit candidate, keep
+    /// composing" path instead of ending the composition.
+    #[test]
+    fn set_text_with_type_syncs_the_written_back_state_with_the_screen() {
+        let _guard = global_state_lock();
+        // handle_action requires a live-looking IPC service; the lazy
+        // channels never connect because this arm issues no RPC
+        IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = unsafe { tip.as_impl() };
+
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Previewing;
+            composition.preview = "私".to_string(); // the selected candidate
+            composition.suffix = "の".to_string(); // unconverted remainder
+            composition.raw_input = "watashino".to_string();
+            composition.raw_hiragana = "わたしの".to_string();
+            composition.corresponding_count = 7; // 私 ← "watashi"
+        }
+
+        factory
+            .handle_action(
+                &[ClientAction::SetTextWithType(SetTextType::Katakana)],
+                CompositionState::Previewing,
+            )
+            .unwrap();
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(
+            composition.preview, "ワタシノ",
+            "the preview must be the converted text now shown on screen"
+        );
+        assert_eq!(
+            composition.suffix, "",
+            "the conversion consumed the whole reading — Enter must commit \
+             and end, not take the pending-suffix path"
+        );
+        assert_eq!(
+            composition.corresponding_count, 9,
+            "all typed input elements (watashino) correspond to the shown \
+             text, so a following ShrinkText must drop them all"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
     }
 }
