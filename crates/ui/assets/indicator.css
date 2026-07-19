@@ -1,0 +1,7 @@
+main {
+    /* accent border on purpose — the indicator flashes the current mode */
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    justify-content: center;
+    align-items: center;
+}

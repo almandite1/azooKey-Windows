@@ -1,0 +1,55 @@
+/*
+ * Design tokens + shared window chrome for the candidate window and the
+ * mode indicator. This file is THE theming surface: the planned theme
+ * feature only needs to override these custom properties (and the frontend
+ * preview in frontend/src/index.css mirrors the same values — keep them in
+ * sync until themes are single-sourced).
+ */
+
+:root {
+    --window-bg: #FFFFFF;
+    --window-border: #E4E4E4;
+    --text: #000000;
+    --text-strong: #FFFFFF;
+    --text-muted: #636363;
+    --accent: #2CB5FF;
+    --selected-bg: #D4F0FF;
+    --selected-outline: #2CB5FF;
+    --scrollbar-thumb: #BCBCBC;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --window-bg: #1E1E1E;
+        --window-border: #424242;
+        --text: #E0E0E0;
+        --text-muted: #BDBDBD;
+        --accent: #5C6BC0;
+        --selected-bg: #3949AB;
+        --selected-outline: #5C6BC0;
+        --scrollbar-thumb: #757575;
+    }
+
+    body {
+        color: var(--text-strong);
+    }
+}
+
+/* shared window chrome */
+body, html {
+    overscroll-behavior: none;
+}
+
+body {
+    margin: 0;
+    padding: 7px;
+    filter: drop-shadow(3px 3px 3px rgba(0, 0, 0, 0.1));
+}
+
+main {
+    width: 100%;
+    height: 100%;
+    background-color: var(--window-bg);
+    box-sizing: border-box;
+    display: flex;
+}

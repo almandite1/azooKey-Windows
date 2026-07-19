@@ -28,6 +28,7 @@ pub mod indicator;
 pub mod ipc;
 pub mod uiaccess;
 pub mod utils;
+pub mod window;
 
 #[derive(Debug)]
 pub enum UserEvent {
