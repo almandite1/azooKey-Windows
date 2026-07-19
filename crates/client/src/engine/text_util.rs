@@ -131,10 +131,32 @@ pub fn to_katakana(s: &str) -> String {
     result
 }
 
+/// Full-width Japanese punctuation → its half-width katakana form. These marks
+/// enter the reading from kana-mode symbol input (e.g. `-` becomes `ー`), and
+/// half-width katakana output must use the half-width kana punctuation, not
+/// the ASCII forms `to_halfwidth` would produce (`ー` → `-`).
+static FULL_TO_HALFKANA_PUNCT: LazyLock<HashMap<char, &'static str>> = LazyLock::new(|| {
+    HashMap::from([
+        ('ー', "ｰ"),
+        ('、', "､"),
+        ('。', "｡"),
+        ('・', "･"),
+        ('「', "｢"),
+        ('」', "｣"),
+    ])
+});
+
 pub fn to_half_katakana(s: &str) -> String {
     let mut result = String::new();
 
     for c in s.chars() {
+        // Japanese punctuation has a dedicated half-width kana form; routing it
+        // through to_halfwidth would wrongly yield the ASCII source (ー → -)
+        if let Some(&half) = FULL_TO_HALFKANA_PUNCT.get(&c) {
+            result.push_str(half);
+            continue;
+        }
+
         // to_halfwidth maps one char to one char today, but guard against an
         // empty mapping rather than panicking inside a COM callback
         let c = to_halfwidth(&c.to_string()).chars().next().unwrap_or(c);
@@ -173,10 +195,12 @@ mod tests {
     }
 
     #[test]
-    fn half_katakana_converts_fullwidth_symbols_too() {
-        // characterization: the long-vowel mark is halfwidth-ized to "-"
-        // (not the halfwidth-kana "ｰ") by the current implementation
-        assert_eq!(to_half_katakana("らーめん"), "ﾗ-ﾒﾝ");
+    fn half_katakana_uses_halfwidth_kana_punctuation() {
+        // the long-vowel mark must become the halfwidth-kana "ｰ" (U+FF70),
+        // not the ASCII "-" the old to_halfwidth path produced
+        assert_eq!(to_half_katakana("らーめん"), "ﾗｰﾒﾝ");
+        // other Japanese punctuation that enters from kana-mode symbol input
+        assert_eq!(to_half_katakana("あ、い。「う」・え"), "ｱ､ｲ｡｢ｳ｣･ｴ");
         assert_eq!(to_half_katakana(""), "");
     }
 }
