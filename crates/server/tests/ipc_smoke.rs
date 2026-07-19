@@ -334,3 +334,50 @@ async fn hostile_inputs_do_not_kill_the_server() {
         .await
         .expect("clear_text failed");
 }
+
+/// MoveCursor is live end-to-end on the server side (proto → handler →
+/// Swift engine) but the TSF client does not call it yet: its
+/// ClientAction::MoveCursor interpreter arm is a deliberate no-op until
+/// the predictive-conversion feature wires it up. This test keeps the
+/// vertical slice from rotting in the meantime.
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment"]
+async fn move_cursor_round_trips_without_breaking_the_composition() {
+    let mut client = connect().await;
+
+    client
+        .clear_text(shared::proto::ClearTextRequest {})
+        .await
+        .expect("clear_text failed");
+
+    for key in ["m", "i", "z", "u"] {
+        client
+            .append_text(shared::proto::AppendTextRequest {
+                text_to_append: key.to_string(),
+            })
+            .await
+            .expect("append_text failed");
+    }
+
+    // moving the cursor must not change the composed text
+    let response = client
+        .move_cursor(shared::proto::MoveCursorRequest { offset: -1 })
+        .await
+        .expect("move_cursor failed")
+        .into_inner();
+    let composing = response.composing_text.expect("composing_text missing");
+    assert_eq!(composing.hiragana, "みず");
+
+    let response = client
+        .move_cursor(shared::proto::MoveCursorRequest { offset: 1 })
+        .await
+        .expect("move_cursor failed")
+        .into_inner();
+    let composing = response.composing_text.expect("composing_text missing");
+    assert_eq!(composing.hiragana, "みず");
+
+    client
+        .clear_text(shared::proto::ClearTextRequest {})
+        .await
+        .expect("clear_text failed");
+}

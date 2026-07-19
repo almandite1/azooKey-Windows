@@ -335,8 +335,11 @@ impl TextServiceFactory {
                         ipc_service.set_selection(selection_index);
                     }
                     ClientAction::MoveCursor(_offset) => {
-                        // TODO: I'll use azookey-kkc's composingText
-                        // self.set_cursor(offset)?;
+                        // Deliberate no-op for now: the MoveCursor RPC and the
+                        // Swift engine's cursor handling are live (kept green by
+                        // the move_cursor smoke test in crates/server), but the
+                        // client-side wiring is deferred to the predictive-
+                        // conversion feature, which needs cursor movement anyway.
                     }
                     ClientAction::SetIMEMode(mode) => {
                         self.start_composition()?;
