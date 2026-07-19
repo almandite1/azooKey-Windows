@@ -42,19 +42,21 @@ pub enum KeyDisposition {
 }
 
 /// True for keydowns of the modifier keys themselves (Shift/Ctrl/Alt and
-/// their L/R variants). While Ctrl is held these arrive too — including
-/// Ctrl's own autorepeat — and must never be treated as "the shortcut's
-/// key": pressing bare Ctrl must not cancel anything.
+/// their L/R variants). While Ctrl or Alt is held these arrive too —
+/// including the modifier's own autorepeat — and must never be treated as
+/// "the shortcut's key": pressing bare Ctrl or bare Alt (e.g. tapping Alt
+/// to reach the menu bar) must not cancel anything.
 pub fn is_modifier_key(key_code: usize) -> bool {
     // 0x10 VK_SHIFT, 0x11 VK_CONTROL, 0x12 VK_MENU,
     // 0xA0..=0xA5 VK_LSHIFT/RSHIFT/LCONTROL/RCONTROL/LMENU/RMENU
     matches!(key_code, 0x10..=0x12 | 0xA0..=0xA5)
 }
 
-/// Handling for a key pressed while Ctrl is held — a shortcut meant for
-/// the host application (upstream issue #5: Ctrl+A during a composition
-/// looked dead because the TIP passed it through with the composition
-/// still open, and hosts ignore shortcuts while composing).
+/// Handling for a key pressed while Ctrl or Alt is held — a shortcut
+/// meant for the host application (upstream issue #5: Ctrl+A during a
+/// composition looked dead because the TIP passed it through with the
+/// composition still open, and hosts ignore shortcuts while composing;
+/// Alt chords are menu accelerators and get the same treatment).
 ///
 /// During a composition the TIP cancels its input and hands the key to
 /// the host; outside a composition the key simply passes through. The

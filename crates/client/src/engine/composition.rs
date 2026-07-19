@@ -20,7 +20,7 @@ use super::{
 use windows::Win32::{
     Foundation::WPARAM,
     UI::{
-        Input::KeyboardAndMouse::VK_CONTROL,
+        Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU},
         TextServices::{ITfComposition, ITfCompositionSink_Impl, ITfContext},
     },
 };
@@ -102,9 +102,13 @@ impl TextServiceFactory {
             return Ok(None);
         };
 
-        // a Ctrl chord is the host's shortcut: cancel any composition so
-        // the shortcut actually works (issue #5), and never eat the key
-        if VK_CONTROL.is_pressed() {
+        // a Ctrl or Alt chord is the host's shortcut: cancel any composition
+        // so the shortcut actually works (issue #5), and never eat the key.
+        // Without the Alt check, Alt+letter fell through to the ToUnicode
+        // decoder, which translates it like a WM_SYSCHAR — the TIP ate the
+        // host's menu accelerator and turned it into composition input.
+        // (AltGr arrives as Ctrl+Alt, so it took this branch already.)
+        if VK_CONTROL.is_pressed() || VK_MENU.is_pressed() {
             let state = {
                 let text_service = self.borrow()?;
                 let state = text_service.borrow_composition()?.state.clone();
