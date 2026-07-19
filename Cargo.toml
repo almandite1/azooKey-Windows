@@ -10,6 +10,15 @@ members = [
   "frontend/src-tauri"
 ]
 
+# THE single source of the product version. Everything else derives from it:
+# crates inherit via version.workspace = true, the Tauri settings app falls
+# back to its Cargo.toml version (tauri.conf.json deliberately omits
+# "version"), the Inno installer gets installer/Version.iss generated from
+# this value by the build_installer task, and the settings UI shows it via
+# getVersion().
+[workspace.package]
+version = "0.1.0-alpha.1"
+
 # Single place to bump shared dependency versions. Crates opt in with
 # `dep.workspace = true` and may add crate-specific features on top.
 [workspace.dependencies]
