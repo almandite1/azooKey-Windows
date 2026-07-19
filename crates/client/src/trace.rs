@@ -37,26 +37,30 @@ impl std::io::Write for DebugOutputWriter {
     }
 }
 
+// Two cfg'd definitions instead of cfg blocks inside one body: with blocks,
+// whichever compiles last ends with a `return` that release clippy flags as
+// needless (the other block vanishes) — separate functions sidestep that.
+
+/// release: warnings and errors only to OutputDebugStringW, no file I/O
+#[cfg(not(debug_assertions))]
 pub fn setup_logger() -> anyhow::Result<()> {
-    #[cfg(not(debug_assertions))]
-    {
-        // release: warnings and errors only, no file I/O
-        let filter = Targets::new()
-            .with_target("azookey_windows", LevelFilter::WARN)
-            .with_default(LevelFilter::OFF);
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .without_time()
-            .with_writer(|| DebugOutputWriter);
-        let _ = tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
-            .try_init();
-        return Ok(());
-    }
-    // the cfg block keeps the debug-only path out of release builds without
-    // an unreachable-code warning after the early return above
-    #[cfg(debug_assertions)]
+    let filter = Targets::new()
+        .with_target("azookey_windows", LevelFilter::WARN)
+        .with_default(LevelFilter::OFF);
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(|| DebugOutputWriter);
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .try_init();
+    Ok(())
+}
+
+/// debug: full trace to a per-PID text log file
+#[cfg(debug_assertions)]
+pub fn setup_logger() -> anyhow::Result<()> {
     {
         let Some(folder) = log_folder() else {
             return Ok(());
