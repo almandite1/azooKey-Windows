@@ -17,26 +17,28 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::new_ret_no_self)]
 
 use std::cell::{Cell, RefCell};
+use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use windows::{
     core::{implement, BSTR, IUnknown, Result as WinResult, GUID, PCWSTR, PWSTR, VARIANT},
     Win32::{
-        Foundation::{BOOL, E_FAIL, E_NOTIMPL, HWND, LPARAM, RECT, S_OK, WPARAM},
+        Foundation::{BOOL, E_FAIL, E_NOTIMPL, HWND, LPARAM, POINT, RECT, S_OK, WPARAM},
         System::Com::IDataObject,
         UI::TextServices::{
-            IEnumITfCompositionView, IEnumTfContextViews, IEnumTfDocumentMgrs,
+            IEnumITfCompositionView, IEnumTfContextViews, IEnumTfContexts, IEnumTfDocumentMgrs,
             IEnumTfFunctionProviders, IEnumTfLangBarItems, IEnumTfProperties, IEnumTfRanges,
             ITfComposition, ITfCompositionSink, ITfCompositionView, ITfComposition_Impl,
             ITfCompartmentMgr, ITfContext, ITfContextComposition, ITfContextComposition_Impl,
-            ITfContextView, ITfContext_Impl, ITfDocumentMgr, ITfEditSession, ITfFunctionProvider,
-            ITfInsertAtSelection, ITfInsertAtSelection_Impl, ITfKeyEventSink, ITfKeystrokeMgr,
-            ITfKeystrokeMgr_Impl, ITfLangBarItem, ITfLangBarItemMgr, ITfLangBarItemMgr_Impl,
-            ITfLangBarItemSink, ITfProperty, ITfPropertyStore, ITfProperty_Impl, ITfRange,
-            ITfRangeBackup, ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl, ITfSource,
+            ITfContextView, ITfContextView_Impl, ITfContext_Impl, ITfDocumentMgr,
+            ITfDocumentMgr_Impl, ITfEditSession, ITfFunctionProvider, ITfInsertAtSelection,
+            ITfInsertAtSelection_Impl, ITfKeyEventSink, ITfKeystrokeMgr, ITfKeystrokeMgr_Impl,
+            ITfLangBarItem, ITfLangBarItemMgr, ITfLangBarItemMgr_Impl, ITfLangBarItemSink,
+            ITfProperty, ITfPropertyStore, ITfProperty_Impl, ITfRange, ITfRangeBackup,
+            ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl, ITfSource,
             ITfSource_Impl, ITfThreadMgr, ITfThreadMgr_Impl, INSERT_TEXT_AT_SELECTION_FLAGS,
             TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_E_SYNCHRONOUS, TF_ES_SYNC, TF_HALTCOND,
-            TF_LANGBARITEMINFO, TF_PRESERVEDKEY, TF_S_ASYNC, TS_STATUS,
+            TF_LANGBARITEMINFO, TF_PRESERVEDKEY, TF_SELECTION, TF_S_ASYNC, TS_STATUS,
         },
     },
 };
@@ -44,6 +46,15 @@ use windows::{
 /// The edit cookie the fake hands to `DoEditSession`. Any non-zero value
 /// works; a real host's cookie is opaque to the TIP.
 pub const FAKE_COOKIE: u32 = 0x1234;
+
+/// Serializes tests that touch process-global state (`IMEState`,
+/// `DllModule`). Tests run in parallel threads within one process, so any
+/// test that reads or writes those globals must hold this guard — module-
+/// local locks cannot see each other across test modules.
+pub fn global_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// How the fake host answers `RequestEditSession`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -75,23 +86,75 @@ pub struct EditSessionRequest {
     pub flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS,
 }
 
-#[implement(ITfContext, ITfContextComposition, ITfInsertAtSelection)]
+#[implement(ITfContext, ITfContextComposition, ITfInsertAtSelection, ITfSource)]
 pub struct FakeContext {
     behavior: Cell<EditSessionBehavior>,
     requests: RefCell<Vec<EditSessionRequest>>,
+    /// When set, `GetSelection` serves a [`FakeRange`] over this log and
+    /// `GetActiveView` serves a [`FakeContextView`]; when `None` both keep
+    /// the historical `E_NOTIMPL` so older tests see the same host.
+    range_log: Option<Rc<RangeLog>>,
+    view_log: Rc<ViewLog>,
+    /// `ITfSource` traffic (the text-layout sink advises here).
+    sink_advises: RefCell<Vec<u32>>,
+    sink_unadvises: RefCell<Vec<u32>>,
+    next_sink_cookie: Cell<u32>,
 }
 
 impl FakeContext {
     pub fn new(behavior: EditSessionBehavior) -> ITfContext {
+        Self::build(behavior, None)
+    }
+
+    /// A context that also models a document: `GetSelection` hands out
+    /// ranges over `log` (whose `text` is the document content) and
+    /// `GetActiveView` answers with a fake view. Enables driving
+    /// `update_pos` / `update_context`.
+    pub fn with_ranges(behavior: EditSessionBehavior, log: Rc<RangeLog>) -> ITfContext {
+        Self::build(behavior, Some(log))
+    }
+
+    fn build(behavior: EditSessionBehavior, range_log: Option<Rc<RangeLog>>) -> ITfContext {
         FakeContext {
             behavior: Cell::new(behavior),
             requests: RefCell::new(Vec::new()),
+            range_log,
+            view_log: Rc::new(ViewLog::default()),
+            sink_advises: RefCell::new(Vec::new()),
+            sink_unadvises: RefCell::new(Vec::new()),
+            next_sink_cookie: Cell::new(0x9000),
         }
         .into()
     }
 
     pub fn requests(&self) -> Vec<EditSessionRequest> {
         self.requests.borrow().clone()
+    }
+
+    pub fn view_log(&self) -> Rc<ViewLog> {
+        self.view_log.clone()
+    }
+
+    pub fn sink_advises(&self) -> Vec<u32> {
+        self.sink_advises.borrow().clone()
+    }
+
+    pub fn sink_unadvises(&self) -> Vec<u32> {
+        self.sink_unadvises.borrow().clone()
+    }
+}
+
+impl ITfSource_Impl for FakeContext_Impl {
+    fn AdviseSink(&self, _riid: *const GUID, _punk: Option<&IUnknown>) -> WinResult<u32> {
+        let cookie = self.next_sink_cookie.get();
+        self.next_sink_cookie.set(cookie + 1);
+        self.sink_advises.borrow_mut().push(cookie);
+        Ok(cookie)
+    }
+
+    fn UnadviseSink(&self, dwcookie: u32) -> WinResult<()> {
+        self.sink_unadvises.borrow_mut().push(dwcookie);
+        Ok(())
     }
 }
 
@@ -142,11 +205,25 @@ impl ITfContext_Impl for FakeContext_Impl {
         &self,
         _ec: u32,
         _ulindex: u32,
-        _ulcount: u32,
-        _pselection: *mut windows::Win32::UI::TextServices::TF_SELECTION,
-        _pcfetched: *mut u32,
+        ulcount: u32,
+        pselection: *mut TF_SELECTION,
+        pcfetched: *mut u32,
     ) -> WinResult<()> {
-        Err(E_NOTIMPL.into())
+        let Some(log) = self.range_log.as_ref() else {
+            return Err(E_NOTIMPL.into());
+        };
+        if ulcount == 0 || pselection.is_null() {
+            return Err(E_FAIL.into());
+        }
+        // [out]: the range leaves here AddRef'd inside a ManuallyDrop, like
+        // a real host — the caller leaks it unless it takes ownership (B10)
+        unsafe {
+            (*pselection).range = ManuallyDrop::new(Some(FakeRange::new(log.clone())));
+            if !pcfetched.is_null() {
+                *pcfetched = 1;
+            }
+        }
+        Ok(())
     }
 
     fn SetSelection(
@@ -168,7 +245,14 @@ impl ITfContext_Impl for FakeContext_Impl {
     }
 
     fn GetActiveView(&self) -> WinResult<ITfContextView> {
-        Err(E_NOTIMPL.into())
+        if self.range_log.is_some() {
+            Ok(FakeContextView {
+                log: self.view_log.clone(),
+            }
+            .into())
+        } else {
+            Err(E_NOTIMPL.into())
+        }
     }
 
     fn EnumViews(&self) -> WinResult<IEnumTfContextViews> {
@@ -259,6 +343,114 @@ impl ITfInsertAtSelection_Impl for FakeContext_Impl {
         _dwflags: u32,
         _pdataobject: Option<&IDataObject>,
     ) -> WinResult<ITfRange> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
+/// What a [`FakeContextView`] was asked. The rect it serves is fixed and
+/// known, so a test can assert it reached the IPC layer unchanged.
+#[derive(Default)]
+pub struct ViewLog {
+    pub get_text_ext_calls: Cell<usize>,
+}
+
+/// The rect every [`FakeContextView`] reports for any range.
+pub const FAKE_TEXT_EXT: RECT = RECT {
+    left: 10,
+    top: 20,
+    right: 110,
+    bottom: 44,
+};
+
+/// A stand-in for the context's active view: `GetTextExt` answers with
+/// [`FAKE_TEXT_EXT`] (unclipped) and records the call.
+#[implement(ITfContextView)]
+pub struct FakeContextView {
+    log: Rc<ViewLog>,
+}
+
+impl ITfContextView_Impl for FakeContextView_Impl {
+    fn GetRangeFromPoint(
+        &self,
+        _ec: u32,
+        _ppt: *const POINT,
+        _dwflags: u32,
+    ) -> WinResult<ITfRange> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn GetTextExt(
+        &self,
+        _ec: u32,
+        _prange: Option<&ITfRange>,
+        prc: *mut RECT,
+        pfclipped: *mut BOOL,
+    ) -> WinResult<()> {
+        self.log
+            .get_text_ext_calls
+            .set(self.log.get_text_ext_calls.get() + 1);
+        unsafe {
+            if !prc.is_null() {
+                *prc = FAKE_TEXT_EXT;
+            }
+            if !pfclipped.is_null() {
+                *pfclipped = false.into();
+            }
+        }
+        Ok(())
+    }
+
+    fn GetScreenExt(&self) -> WinResult<RECT> {
+        Ok(RECT::default())
+    }
+
+    fn GetWnd(&self) -> WinResult<HWND> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
+/// A document manager that owns exactly one context — enough for
+/// `GetTop`/`GetBase` (the text-layout-sink advise path).
+#[implement(ITfDocumentMgr)]
+pub struct FakeDocumentMgr {
+    top: ITfContext,
+}
+
+impl FakeDocumentMgr {
+    pub fn new(top: ITfContext) -> ITfDocumentMgr {
+        FakeDocumentMgr { top }.into()
+    }
+}
+
+impl ITfDocumentMgr_Impl for FakeDocumentMgr_Impl {
+    fn CreateContext(
+        &self,
+        _tidowner: u32,
+        _dwflags: u32,
+        _punk: Option<&IUnknown>,
+        _ppic: *mut Option<ITfContext>,
+        _pectextstore: *mut u32,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn Push(&self, _pic: Option<&ITfContext>) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn Pop(&self, _dwflags: u32) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn GetTop(&self) -> WinResult<ITfContext> {
+        Ok(self.top.clone())
+    }
+
+    fn GetBase(&self) -> WinResult<ITfContext> {
+        Ok(self.top.clone())
+    }
+
+    fn EnumContexts(&self) -> WinResult<IEnumTfContexts> {
         Err(E_NOTIMPL.into())
     }
 }
@@ -636,16 +828,30 @@ impl ThreadMgrLog {
 
 /// A fake `ITfThreadMgr` that answers just enough of TSF for the TIP's
 /// `Activate`/`Deactivate` to run end to end in a unit test, and records the
-/// advise/unadvise traffic. `GetFocus` deliberately reports no focus so the
-/// text-layout-sink path (which needs a real document manager) is skipped.
+/// advise/unadvise traffic. Without a focus context, `GetFocus` reports no
+/// focus and the text-layout-sink path is skipped; `with_focus` makes it
+/// serve a [`FakeDocumentMgr`] over the given context so that path runs too.
 #[implement(ITfThreadMgr, ITfKeystrokeMgr, ITfSource, ITfLangBarItemMgr)]
 pub struct FakeThreadMgr {
     log: Rc<ThreadMgrLog>,
+    focus_context: Option<ITfContext>,
 }
 
 impl FakeThreadMgr {
     pub fn new(log: Rc<ThreadMgrLog>) -> ITfThreadMgr {
-        FakeThreadMgr { log }.into()
+        FakeThreadMgr {
+            log,
+            focus_context: None,
+        }
+        .into()
+    }
+
+    pub fn with_focus(log: Rc<ThreadMgrLog>, focus_context: ITfContext) -> ITfThreadMgr {
+        FakeThreadMgr {
+            log,
+            focus_context: Some(focus_context),
+        }
+        .into()
     }
 }
 
@@ -663,9 +869,12 @@ impl ITfThreadMgr_Impl for FakeThreadMgr_Impl {
         Err(E_NOTIMPL.into())
     }
     fn GetFocus(&self) -> WinResult<ITfDocumentMgr> {
-        // No focus: the TIP's `if let Ok(doc_mgr)` skips advising the text
-        // layout sink, which would otherwise need a real document manager.
-        Err(E_FAIL.into())
+        match &self.focus_context {
+            Some(context) => Ok(FakeDocumentMgr::new(context.clone())),
+            // No focus: the TIP's `if let Ok(doc_mgr)` skips advising the
+            // text layout sink, exactly like a host with no focused document.
+            None => Err(E_FAIL.into()),
+        }
     }
     fn SetFocus(&self, _pdimfocus: Option<&ITfDocumentMgr>) -> WinResult<()> {
         Err(E_NOTIMPL.into())
@@ -865,14 +1074,11 @@ pub unsafe fn fake_context_of(context: &ITfContext) -> &FakeContext {
     context.as_impl()
 }
 
-/// Builds a `TextServiceFactory` wired to a fake context, the way
-/// `TextServiceFactory::create` wires a real one.
-pub fn factory_with_fake_context(
-    behavior: EditSessionBehavior,
-) -> (
-    windows::Win32::UI::TextServices::ITfTextInputProcessor,
-    ITfContext,
-) {
+/// Builds a `TextServiceFactory` wired to the given (usually fake) context,
+/// the way `TextServiceFactory::create` wires a real one.
+pub fn factory_with_context(
+    context: ITfContext,
+) -> windows::Win32::UI::TextServices::ITfTextInputProcessor {
     use windows::core::AsImpl as _;
     use windows::Win32::UI::TextServices::ITfTextInputProcessor;
 
@@ -880,14 +1086,25 @@ pub fn factory_with_fake_context(
 
     let tip = TextServiceFactory::create::<ITfTextInputProcessor>()
         .expect("failed to create the factory");
-    let context = FakeContext::new(behavior);
 
     {
         let factory = unsafe { tip.as_impl() };
         let mut text_service = factory.borrow_mut().expect("factory is already borrowed");
         text_service.tid = 1;
-        text_service.context = Some(context.clone());
+        text_service.context = Some(context);
     }
 
-    (tip, context)
+    tip
+}
+
+/// [`factory_with_context`] over a plain [`FakeContext`] with the given
+/// edit-session behavior.
+pub fn factory_with_fake_context(
+    behavior: EditSessionBehavior,
+) -> (
+    windows::Win32::UI::TextServices::ITfTextInputProcessor,
+    ITfContext,
+) {
+    let context = FakeContext::new(behavior);
+    (factory_with_context(context.clone()), context)
 }

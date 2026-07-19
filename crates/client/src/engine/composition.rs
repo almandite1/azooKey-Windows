@@ -13,7 +13,7 @@ use super::{
     ipc_service::Candidates,
     state::IMEState,
     text_util::{to_half_katakana, to_katakana},
-    user_action::{Function, Navigation},
+    transition::{transition, KeystrokeContext},
 };
 use windows::Win32::{
     Foundation::WPARAM,
@@ -49,6 +49,25 @@ pub struct Composition {
     pub tip_composition: Option<ITfComposition>,
 }
 
+/// Mirrors candidate entry `index` into the client-side composition
+/// fields. This is the single point where a selected candidate becomes
+/// the visible preview — the future hook for conversion-history learning
+/// to observe what the user actually picked.
+fn apply_selected_candidate(
+    candidates: &Candidates,
+    index: i32,
+    preview: &mut String,
+    suffix: &mut String,
+    raw_hiragana: &mut String,
+    corresponding_count: &mut i32,
+) {
+    let (text, sub_text, count) = candidates.entry(index as usize);
+    *corresponding_count = count;
+    *preview = text;
+    *suffix = sub_text;
+    *raw_hiragana = candidates.hiragana.clone();
+}
+
 impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnCompositionTerminated(
@@ -67,6 +86,10 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
 }
 
 impl TextServiceFactory {
+    /// Impure shell around the pure transition table
+    /// (engine::transition::transition): reads the OS/COM state the table
+    /// needs, decodes the key, and adapts the result. New key bindings
+    /// belong in the table, not here.
     #[tracing::instrument]
     pub fn process_key(
         &self,
@@ -82,147 +105,20 @@ impl TextServiceFactory {
             return Ok(None);
         }
 
-        #[allow(clippy::let_and_return)]
-        let (composition, mode) = {
+        let ctx = {
             let text_service = self.borrow()?;
-            let composition = text_service.borrow_composition()?.clone();
-            let mode = IMEState::get()?.input_mode.clone();
-            (composition, mode)
+            let composition = text_service.borrow_composition()?;
+            KeystrokeContext {
+                state: composition.state.clone(),
+                mode: text_service.input_mode.clone(),
+                preview_chars: composition.preview.chars().count(),
+                suffix_is_empty: composition.suffix.is_empty(),
+            }
         };
 
         let action = UserAction::try_from(wparam.0)?;
 
-        let (transition, actions) = match composition.state {
-            CompositionState::None => match action {
-                UserAction::Input(char) if mode == InputMode::Kana => (
-                    CompositionState::Composing,
-                    vec![
-                        ClientAction::StartComposition,
-                        ClientAction::AppendText(char.to_string()),
-                    ],
-                ),
-                UserAction::Number(number) if mode == InputMode::Kana => (
-                    CompositionState::Composing,
-                    vec![
-                        ClientAction::StartComposition,
-                        ClientAction::AppendText(number.to_string()),
-                    ],
-                ),
-                UserAction::ToggleInputMode => (
-                    CompositionState::None,
-                    vec![match mode {
-                        InputMode::Kana => ClientAction::SetIMEMode(InputMode::Latin),
-                        InputMode::Latin => ClientAction::SetIMEMode(InputMode::Kana),
-                    }],
-                ),
-                _ => {
-                    return Ok(None);
-                }
-            },
-            // Composing and Previewing share every binding except how new
-            // input is applied: while Previewing, the selected candidate is
-            // committed first (ShrinkText) instead of appending
-            state @ (CompositionState::Composing | CompositionState::Previewing) => {
-                let input_action = |text: String| {
-                    if state == CompositionState::Previewing {
-                        ClientAction::ShrinkText(text)
-                    } else {
-                        ClientAction::AppendText(text)
-                    }
-                };
-
-                match action {
-                    UserAction::Input(char) => (
-                        CompositionState::Composing,
-                        vec![input_action(char.to_string())],
-                    ),
-                    UserAction::Number(number) => (
-                        CompositionState::Composing,
-                        vec![input_action(number.to_string())],
-                    ),
-                    UserAction::Backspace => {
-                        if composition.preview.chars().count() == 1 {
-                            (
-                                CompositionState::None,
-                                vec![ClientAction::RemoveText, ClientAction::EndComposition],
-                            )
-                        } else {
-                            (CompositionState::Composing, vec![ClientAction::RemoveText])
-                        }
-                    }
-                    UserAction::Enter => {
-                        if composition.suffix.is_empty() {
-                            (CompositionState::None, vec![ClientAction::EndComposition])
-                        } else {
-                            (
-                                CompositionState::Composing,
-                                vec![ClientAction::ShrinkText("".to_string())],
-                            )
-                        }
-                    }
-                    UserAction::Escape => (
-                        CompositionState::None,
-                        vec![ClientAction::RemoveText, ClientAction::EndComposition],
-                    ),
-                    UserAction::Navigation(direction) => match direction {
-                        Navigation::Right => (
-                            CompositionState::Composing,
-                            vec![ClientAction::MoveCursor(1)],
-                        ),
-                        Navigation::Left => (
-                            CompositionState::Composing,
-                            vec![ClientAction::MoveCursor(-1)],
-                        ),
-                        Navigation::Up => (
-                            CompositionState::Previewing,
-                            vec![ClientAction::SetSelection(SetSelectionType::Up)],
-                        ),
-                        Navigation::Down => (
-                            CompositionState::Previewing,
-                            vec![ClientAction::SetSelection(SetSelectionType::Down)],
-                        ),
-                    },
-                    UserAction::ToggleInputMode => (
-                        CompositionState::None,
-                        vec![
-                            ClientAction::EndComposition,
-                            ClientAction::SetIMEMode(InputMode::Latin),
-                        ],
-                    ),
-                    UserAction::Space | UserAction::Tab => (
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetSelection(SetSelectionType::Down)],
-                    ),
-                    UserAction::Function(key) => match key {
-                        Function::Six => (
-                            CompositionState::Previewing,
-                            vec![ClientAction::SetTextWithType(SetTextType::Hiragana)],
-                        ),
-                        Function::Seven => (
-                            CompositionState::Previewing,
-                            vec![ClientAction::SetTextWithType(SetTextType::Katakana)],
-                        ),
-                        Function::Eight => (
-                            CompositionState::Previewing,
-                            vec![ClientAction::SetTextWithType(SetTextType::HalfKatakana)],
-                        ),
-                        Function::Nine => (
-                            CompositionState::Previewing,
-                            vec![ClientAction::SetTextWithType(SetTextType::FullLatin)],
-                        ),
-                        Function::Ten => (
-                            CompositionState::Previewing,
-                            vec![ClientAction::SetTextWithType(SetTextType::HalfLatin)],
-                        ),
-                    },
-                    _ => {
-                        return Ok(None);
-                    }
-                }
-            }
-        };
-
-        Ok(Some((actions, transition)))
+        Ok(transition(&ctx, action).map(|(next_state, actions)| (actions, next_state)))
     }
 
     #[tracing::instrument]
@@ -252,7 +148,7 @@ impl TextServiceFactory {
         let (composition, mode) = {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?.clone();
-            let mode = IMEState::get()?.input_mode.clone();
+            let mode = text_service.input_mode.clone();
             (composition, mode)
         };
 
@@ -303,34 +199,36 @@ impl TextServiceFactory {
                         };
 
                         candidates = ipc_service.append_text(text.clone())?;
-                        let (text, sub_text, count) = candidates.entry(selection_index as usize);
-                        let hiragana = candidates.hiragana.clone();
+                        apply_selected_candidate(
+                            &candidates,
+                            selection_index,
+                            &mut preview,
+                            &mut suffix,
+                            &mut raw_hiragana,
+                            &mut corresponding_count,
+                        );
 
-                        corresponding_count = count;
-
-                        preview = text.clone();
-                        suffix = sub_text.clone();
-                        raw_hiragana = hiragana.clone();
-
-                        self.set_text(&text, &sub_text)?;
+                        self.set_text(&preview, &suffix)?;
                         ipc_service.set_candidates(candidates.texts.clone());
                         ipc_service.set_selection(selection_index);
                     }
                     ClientAction::RemoveText => {
                         candidates = ipc_service.remove_text()?;
-                        let (text, sub_text, count) = candidates.entry(selection_index as usize);
-                        let hiragana = candidates.hiragana.clone();
-                        corresponding_count = count;
+                        apply_selected_candidate(
+                            &candidates,
+                            selection_index,
+                            &mut preview,
+                            &mut suffix,
+                            &mut raw_hiragana,
+                            &mut corresponding_count,
+                        );
 
                         raw_input = raw_input
                             .chars()
                             .take(corresponding_count as usize)
                             .collect();
-                        preview = text.clone();
-                        suffix = sub_text.clone();
-                        raw_hiragana = hiragana.clone();
 
-                        self.set_text(&text, &sub_text)?;
+                        self.set_text(&preview, &suffix)?;
                         ipc_service.set_candidates(candidates.texts.clone());
                         ipc_service.set_selection(selection_index);
                     }
@@ -346,11 +244,12 @@ impl TextServiceFactory {
                         self.update_pos()?;
                         self.end_composition()?;
 
-                        // scope the guard tightly: update_lang_bar re-enters
-                        // IMEState through AddItem -> GetIcon (a try_lock),
-                        // which fails outright if we still hold it here
+                        // scope the borrow tightly: update_lang_bar re-enters
+                        // the TextService RefCell through AddItem -> GetIcon
+                        // (a try_borrow), which fails outright if we still
+                        // hold the mutable borrow here
                         {
-                            IMEState::get()?.input_mode = mode.clone();
+                            self.borrow_mut()?.input_mode = mode.clone();
                         }
 
                         // update the language bar
@@ -390,15 +289,16 @@ impl TextServiceFactory {
                         .clamp(0, max(0, texts.len() as i32 - 1));
 
                         ipc_service.set_selection(selection_index);
-                        let (text, sub_text, count) = candidates.entry(selection_index as usize);
-                        let hiragana = candidates.hiragana.clone();
-                        corresponding_count = count;
+                        apply_selected_candidate(
+                            &candidates,
+                            selection_index,
+                            &mut preview,
+                            &mut suffix,
+                            &mut raw_hiragana,
+                            &mut corresponding_count,
+                        );
 
-                        preview = text.clone();
-                        suffix = sub_text.clone();
-                        raw_hiragana = hiragana.clone();
-
-                        self.set_text(&text, &sub_text)?;
+                        self.set_text(&preview, &suffix)?;
                     }
                     ClientAction::ShrinkText(text) => {
                         // shrink text
@@ -416,14 +316,17 @@ impl TextServiceFactory {
                         candidates = ipc_service.append_text(text)?;
                         selection_index = 0;
 
-                        let (text, sub_text, count) = candidates.entry(selection_index as usize);
-                        let hiragana = candidates.hiragana.clone();
-                        self.shift_start(&preview, &text)?;
-
-                        corresponding_count = count;
-                        preview = text.clone();
-                        suffix = sub_text.clone();
-                        raw_hiragana = hiragana.clone();
+                        // shift_start needs the preview being replaced
+                        let previous_preview = preview.clone();
+                        apply_selected_candidate(
+                            &candidates,
+                            selection_index,
+                            &mut preview,
+                            &mut suffix,
+                            &mut raw_hiragana,
+                            &mut corresponding_count,
+                        );
+                        self.shift_start(&previous_preview, &preview)?;
 
                         ipc_service.set_candidates(candidates.texts.clone());
                         ipc_service.set_selection(selection_index);

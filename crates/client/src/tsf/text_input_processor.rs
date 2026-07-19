@@ -203,13 +203,13 @@ mod tests {
     use crate::engine::state::IMEState;
     use crate::globals::{DllModule, DLL_INSTANCE};
     use crate::tsf::factory::TextServiceFactory;
-    use crate::tsf::test_support::{FakeThreadMgr, ThreadMgrLog};
+    use crate::tsf::test_support::{
+        fake_context_of, EditSessionBehavior, FakeContext, FakeThreadMgr, ThreadMgrLog,
+    };
 
-    // Activate/Deactivate mutate the process-global IMEState and DllModule, so
-    // these tests must not run concurrently with each other. (No other test in
-    // the crate touches that global state — only the untested update_pos path
-    // does — so a module-local lock is enough; no serial_test dependency.)
-    static LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
+    // Activate/Deactivate mutate the process-global IMEState and DllModule,
+    // so every test here holds the crate-wide global_state_lock (shared with
+    // the update_pos/update_context tests, which read the same global).
 
     /// A `#[test]` never runs DllMain, so the global DllModule the real
     /// Activate reference-counts is never initialized. Set it up once; the
@@ -250,7 +250,7 @@ mod tests {
     /// making B's un-removable.
     #[test]
     fn deactivating_one_tip_does_not_disturb_anothers_cookie() {
-        let _guard = LIFECYCLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::tsf::test_support::global_state_lock();
         ensure_dll_module();
         let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         reset_ime_state();
@@ -290,7 +290,7 @@ mod tests {
     /// active IME's icon up and the user could never select azooKey.
     #[test]
     fn activate_succeeds_when_the_server_is_unreachable() {
-        let _guard = LIFECYCLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::tsf::test_support::global_state_lock();
         let (_tip, _tm, log) = activate_fresh_tip();
         assert_eq!(
             log.key_sink_advises.borrow().as_slice(),
@@ -311,7 +311,7 @@ mod tests {
     /// second Activate must succeed and advise a live key sink again.
     #[test]
     fn activate_deactivate_activate_cycle_succeeds() {
-        let _guard = LIFECYCLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::tsf::test_support::global_state_lock();
         let (tip, thread_mgr, log) = activate_fresh_tip();
         unsafe { tip.Deactivate() }.expect("Deactivate must succeed");
         unsafe { tip.Activate(Some(&thread_mgr), 1) }
@@ -330,7 +330,7 @@ mod tests {
     /// balance that the Activate-failure investigation kept suspecting.
     #[test]
     fn deactivate_unadvises_what_activate_advised() {
-        let _guard = LIFECYCLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::tsf::test_support::global_state_lock();
         let (tip, _tm, log) = activate_fresh_tip();
         assert_eq!(log.langbar_adds.get(), 1, "Activate adds one langbar item");
         let advised = log.advise_cookies.borrow().clone();
@@ -344,6 +344,42 @@ mod tests {
             log.unadvise_cookies.borrow().as_slice(),
             advised.as_slice(),
             "Deactivate must unadvise exactly the cookie Activate advised"
+        );
+        reset_ime_state();
+    }
+
+    /// With a focused document, Activate must advise the text-layout sink on
+    /// the document's top context and Deactivate must unadvise that exact
+    /// cookie. This drives the path every prior lifecycle test skipped
+    /// (GetFocus used to be un-fakeable).
+    #[test]
+    fn activate_advises_the_layout_sink_when_a_document_has_focus() {
+        let _guard = crate::tsf::test_support::global_state_lock();
+        ensure_dll_module();
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        reset_ime_state();
+
+        let log = Rc::new(ThreadMgrLog::default());
+        let doc_context = FakeContext::new(EditSessionBehavior::RunSync);
+        let thread_mgr = FakeThreadMgr::with_focus(log.clone(), doc_context.clone());
+
+        let tip = TextServiceFactory::create::<ITfTextInputProcessor>()
+            .expect("failed to create the TIP");
+        unsafe { tip.Activate(Some(&thread_mgr), 1) }.expect("Activate must succeed");
+
+        let doc = unsafe { fake_context_of(&doc_context) };
+        let advised = doc.sink_advises();
+        assert_eq!(
+            advised.len(),
+            1,
+            "Activate advises the layout sink on the focused document's context"
+        );
+
+        unsafe { tip.Deactivate() }.expect("Deactivate must succeed");
+        assert_eq!(
+            doc.sink_unadvises(),
+            advised,
+            "Deactivate must unadvise exactly the layout-sink cookie it advised"
         );
         reset_ime_state();
     }
