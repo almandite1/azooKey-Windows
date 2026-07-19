@@ -5,6 +5,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# a newer push to the same branch supersedes the running build
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
@@ -19,9 +24,10 @@ jobs:
 
     # 6.3.3 matches the locally verified toolchain (devenv.bat); newer SDKs
     # no longer need the ucrt.modulemap patch the 6.0.2 setup fetched from a
-    # personal gist
+    # personal gist. The action itself is tag-pinned: binaries below are
+    # SHA256-pinned, so tracking a moving @main here undercut that.
     - name: Install Swift
-      uses: compnerd/gha-setup-swift@main
+      uses: compnerd/gha-setup-swift@v0.4.0
       with:
         branch: swift-6.3.3-release
         tag: 6.3.3-RELEASE
@@ -35,7 +41,23 @@ jobs:
     - name: Install cargo-make
       run: cargo install --force cargo-make
 
+    # ~600 MB of pinned artifacts (three llama zips + the zenz model);
+    # the key embeds the llama release tag and the zenz SHA256 prefix, so
+    # bumping either in the download step below invalidates the cache
+    - name: Cache prebuilt llama and zenz model
+      id: cache-prebuilt
+      uses: actions/cache@v4
+      with:
+        path: |
+          llama_cpu
+          llama_cuda
+          llama_vulkan
+          server-swift/llama.lib
+          zenz.gguf
+        key: prebuilt-llama-b4846-zenz-501F605D
+
     - name: Download prebuilt llama
+      if: steps.cache-prebuilt.outputs.cache-hit != 'true'
       run: |
         # every downloaded artifact is pinned by SHA256: a moved release tag
         # or tampered file fails the build instead of shipping silently
@@ -80,10 +102,11 @@ jobs:
           throw "checksum mismatch for ${zenzUrl}: expected $zenzExpected, got $zenzActual"
         }
 
+    # npm ci: install exactly what package-lock.json pins, or fail
     - name: Install node dependencies
       run: |
         cd frontend
-        npm install
+        npm ci
 
     - name: Build
       run: cargo make build --release

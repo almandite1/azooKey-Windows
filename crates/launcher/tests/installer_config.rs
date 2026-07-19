@@ -212,3 +212,35 @@ fn uninstall_chains_the_settings_app_from_hklm_silently() {
         "the NSIS uninstaller must be passed /S to actually run silently"
     );
 }
+
+/// The product version is single-sourced from [workspace.package] in the
+/// root Cargo.toml. The installer must take its versions from the
+/// generated Version.iss (written by the build_installer task), and the
+/// Tauri config must not pin its own copy — omitting "version" makes
+/// Tauri fall back to src-tauri's (workspace-inherited) Cargo version.
+#[test]
+fn product_version_is_single_sourced() {
+    let iss = read("Installer.iss");
+    assert!(
+        iss.contains("#include \"Version.iss\""),
+        "Installer.iss must include the generated Version.iss"
+    );
+    assert!(
+        !iss.contains("#define MyAppVersion \""),
+        "MyAppVersion must not be hardcoded in Installer.iss"
+    );
+    assert!(
+        !iss.contains("#define TauriAppVersion \""),
+        "TauriAppVersion must not be hardcoded in Installer.iss"
+    );
+
+    let tauri_conf_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../frontend/src-tauri/tauri.conf.json");
+    let tauri_conf = std::fs::read_to_string(&tauri_conf_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", tauri_conf_path.display()));
+    assert!(
+        !tauri_conf.contains("\"version\""),
+        "tauri.conf.json must not pin its own version; it inherits the \
+         workspace version through src-tauri/Cargo.toml"
+    );
+}
