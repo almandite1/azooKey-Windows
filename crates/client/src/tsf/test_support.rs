@@ -335,7 +335,12 @@ impl ITfInsertAtSelection_Impl for FakeContext_Impl {
         _pchtext: &PCWSTR,
         _cch: i32,
     ) -> WinResult<ITfRange> {
-        Err(E_NOTIMPL.into())
+        // A real host inserts at the caret and returns the new (empty) range;
+        // start_composition then hands that range to StartComposition. Return
+        // a FakeRange so the composition-creation path runs end to end (the
+        // recovery-then-fresh-start case depends on this). Uses the context's
+        // range log when it has one, else a throwaway.
+        Ok(FakeRange::new(self.range_log.clone().unwrap_or_default()))
     }
 
     fn InsertEmbeddedAtSelection(
@@ -836,6 +841,10 @@ impl ThreadMgrLog {
 pub struct FakeThreadMgr {
     log: Rc<ThreadMgrLog>,
     focus_context: Option<ITfContext>,
+    /// When true, `AddItem` fails — models a host where the last Activate
+    /// step (adding the language-bar item) fails, so a test can prove the
+    /// TIP unwinds the sinks it already advised (Activate rollback).
+    fail_add_item: bool,
 }
 
 impl FakeThreadMgr {
@@ -843,6 +852,7 @@ impl FakeThreadMgr {
         FakeThreadMgr {
             log,
             focus_context: None,
+            fail_add_item: false,
         }
         .into()
     }
@@ -851,6 +861,19 @@ impl FakeThreadMgr {
         FakeThreadMgr {
             log,
             focus_context: Some(focus_context),
+            fail_add_item: false,
+        }
+        .into()
+    }
+
+    /// A thread manager whose `AddItem` (the final Activate step) fails, so
+    /// the TIP's Activate must roll back the key-event and thread-manager
+    /// sinks it advised earlier.
+    pub fn with_failing_langbar(log: Rc<ThreadMgrLog>) -> ITfThreadMgr {
+        FakeThreadMgr {
+            log,
+            focus_context: None,
+            fail_add_item: true,
         }
         .into()
     }
@@ -1008,6 +1031,9 @@ impl ITfLangBarItemMgr_Impl for FakeThreadMgr_Impl {
     }
     fn AddItem(&self, _punk: Option<&ITfLangBarItem>) -> WinResult<()> {
         self.log.langbar_adds.set(self.log.langbar_adds.get() + 1);
+        if self.fail_add_item {
+            return Err(E_FAIL.into());
+        }
         Ok(())
     }
     fn RemoveItem(&self, _punk: Option<&ITfLangBarItem>) -> WinResult<()> {

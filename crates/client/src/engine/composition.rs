@@ -214,11 +214,25 @@ impl TextServiceFactory {
                     ClientAction::EndComposition | ClientAction::CancelComposition => {
                         // ending COMMITS whatever the range holds, so a
                         // cancel must empty it first — Escape used to leave
-                        // the leftover reading committed (issue #35 family)
+                        // the leftover reading committed (issue #35 family).
+                        //
+                        // Every teardown step below must run even when an
+                        // edit session fails: the old code bailed at the
+                        // first `?`, so a host that rejected the edit session
+                        // skipped clear_text and left the server's reading
+                        // alive. The next keystroke then appended to that old
+                        // reading and the previous composition's text
+                        // reappeared. Clear the client state and the server
+                        // unconditionally, then surface the failure.
+                        let mut edit_result = Ok(());
                         if matches!(action, ClientAction::CancelComposition) {
-                            self.set_text("", "")?;
+                            edit_result = self.set_text("", "");
                         }
-                        self.end_composition()?;
+                        // tear down the TSF composition regardless; even on a
+                        // failed session end_composition releases the
+                        // client-side handle
+                        edit_result = edit_result.and(self.end_composition());
+
                         selection_index = 0;
                         corresponding_count = 0;
                         preview.clear();
@@ -227,7 +241,12 @@ impl TextServiceFactory {
                         raw_hiragana.clear();
                         ipc_service.hide_window();
                         ipc_service.set_candidates(vec![]);
-                        ipc_service.clear_text()?;
+                        let clear_result = ipc_service.clear_text();
+
+                        // surface the first failure only after both the
+                        // client state and the server reading were cleared
+                        edit_result?;
+                        clear_result?;
                     }
                     ClientAction::AppendText(text) => {
                         raw_input.push_str(text);
@@ -428,7 +447,7 @@ mod tests {
     use crate::engine::client_action::SetTextType;
     use crate::engine::ipc_service::IPCService;
     use crate::tsf::test_support::{
-        factory_with_fake_context, global_state_lock, EditSessionBehavior,
+        factory_with_fake_context, global_state_lock, EditSessionBehavior, FakeComposition,
     };
     use windows::core::AsImpl as _;
 
@@ -486,6 +505,62 @@ mod tests {
              text, so a following ShrinkText must drop them all"
         );
 
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// End/Cancel teardown must clear the client state AND release the
+    /// composition even when the edit session fails partway. A host that
+    /// rejects the edit session used to abort the arm at the first `?`,
+    /// leaving raw_hiragana (and the server's reading) alive; the next
+    /// keystroke then appended to the old reading and the previous
+    /// composition's text reappeared.
+    #[test]
+    fn cancel_clears_client_state_even_when_the_edit_session_fails() {
+        let _guard = global_state_lock();
+        IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
+
+        // a host that rejects every edit session: set_text and
+        // end_composition both fail
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::Reject);
+        let factory = unsafe { tip.as_impl() };
+
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Composing;
+            composition.preview = "わたし".to_string();
+            composition.raw_input = "watashi".to_string();
+            composition.raw_hiragana = "わたし".to_string();
+            composition.corresponding_count = 7;
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        // the arm still surfaces the edit-session error...
+        let result =
+            factory.handle_action(&[ClientAction::CancelComposition], CompositionState::None);
+        assert!(
+            result.is_err(),
+            "a rejected edit session must still surface as an error"
+        );
+
+        // ...but only after the teardown ran
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(composition.state, CompositionState::None);
+        assert!(
+            composition.raw_hiragana.is_empty()
+                && composition.raw_input.is_empty()
+                && composition.preview.is_empty(),
+            "the reading must be cleared even though the edit session failed; \
+             a stale reading made the next keystroke resurrect the old text"
+        );
+        assert!(
+            composition.tip_composition.is_none(),
+            "the dead composition handle must be released"
+        );
+
+        drop(composition);
+        drop(text_service);
         IMEState::get().unwrap().ipc_service = None;
     }
 }
