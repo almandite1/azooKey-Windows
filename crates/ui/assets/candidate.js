@@ -25,6 +25,13 @@ function updateSelection(index) {
         selected.removeAttribute('data-selected');
     }
 
+    // guard against an index past the (possibly just-shrunk) list and an empty
+    // list: children[index] / children[0] would be undefined and throw, which
+    // aborts the script and leaves the highlight and scroll stuck
+    if (index < 0 || index >= candidateList.children.length) {
+        return;
+    }
+
     candidateList.children[index].setAttribute('data-selected', '');
 
     const itemHeight = candidateList.children[0].offsetHeight;

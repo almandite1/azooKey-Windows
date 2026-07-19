@@ -167,6 +167,22 @@ pub fn to_fullwidth(s: &str, process_alphabet: bool) -> String {
         .collect()
 }
 
+/// Full-width ASCII conversion, MS-IME F9 style: the printable ASCII range
+/// U+0021..=U+007E maps to its full-width twin at +0xFEE0, and the space maps
+/// to the ideographic space U+3000. Unlike [`to_fullwidth`], symbols become
+/// their plain full-width ASCII forms (`-` → `－`, `,` → `，`, `.` → `．`,
+/// `/` → `／`) rather than the kana punctuation the kana-input map produces
+/// (`ー`, `、`, `。`, `・`). Non-ASCII characters pass through unchanged.
+pub fn to_fullwidth_ascii(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            ' ' => '\u{3000}',
+            '!'..='~' => char::from_u32(c as u32 + 0xFEE0).unwrap_or(c),
+            _ => c,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +216,18 @@ mod tests {
             let full = to_fullwidth(half, false);
             assert_eq!(to_halfwidth(&full), half, "roundtrip failed for {half}");
         }
+    }
+
+    #[test]
+    fn fullwidth_ascii_uses_plain_forms_not_kana_punctuation() {
+        // F9: alphanumerics and symbols become full-width ASCII, NOT the
+        // kana-input punctuation (which would give ー、。・ for -,./)
+        assert_eq!(to_fullwidth_ascii("a-b"), "ａ－ｂ");
+        assert_eq!(to_fullwidth_ascii("1,2.3/4"), "１，２．３／４");
+        assert_eq!(to_fullwidth_ascii("Az9"), "Ａｚ９");
+        // space becomes the ideographic space, non-ASCII passes through
+        assert_eq!(to_fullwidth_ascii("a b"), "ａ\u{3000}ｂ");
+        assert_eq!(to_fullwidth_ascii("あ漢"), "あ漢");
+        assert_eq!(to_fullwidth_ascii(""), "");
     }
 }

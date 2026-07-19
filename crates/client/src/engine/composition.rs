@@ -8,7 +8,7 @@ use crate::{
 
 use super::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
-    full_width::{to_fullwidth, to_halfwidth},
+    full_width::{to_fullwidth, to_fullwidth_ascii, to_halfwidth},
     input_mode::InputMode,
     ipc_service::Candidates,
     state::IMEState,
@@ -272,6 +272,12 @@ impl TextServiceFactory {
                     }
                     ClientAction::RemoveText => {
                         candidates = ipc_service.remove_text()?;
+                        // Backspace returns to Composing with a fresh, shorter
+                        // candidate list; a selection index carried over from
+                        // Previewing would point past the new list (blanking
+                        // the preview via the entry() fallback) or at the wrong
+                        // candidate. Reset to the top.
+                        selection_index = 0;
                         apply_selected_candidate(
                             &candidates,
                             selection_index,
@@ -397,7 +403,7 @@ impl TextServiceFactory {
                             SetTextType::Hiragana => raw_hiragana.clone(),
                             SetTextType::Katakana => to_katakana(&raw_hiragana),
                             SetTextType::HalfKatakana => to_half_katakana(&raw_hiragana),
-                            SetTextType::FullLatin => to_fullwidth(&raw_input, true),
+                            SetTextType::FullLatin => to_fullwidth_ascii(&raw_input),
                             SetTextType::HalfLatin => to_halfwidth(&raw_input),
                         };
 
