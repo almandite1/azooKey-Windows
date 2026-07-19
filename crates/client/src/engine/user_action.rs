@@ -15,6 +15,11 @@ pub enum UserAction {
     Function(Function),
     Number(i8),
     ToggleInputMode,
+    /// Host editing keys (Delete/Insert/Home/End/PageUp/PageDown). Left to
+    /// the host while idle; during a composition they must be consumed as
+    /// no-ops — passed through, the host edits the document underneath the
+    /// open composition (Delete removes the character right after it).
+    EditingKey,
 }
 
 #[derive(Debug)]
@@ -43,6 +48,9 @@ impl TryFrom<usize> for UserAction {
             0x0D => UserAction::Enter,     // VK_RETURN
             0x20 => UserAction::Space,     // VK_SPACE
             0x1B => UserAction::Escape,    // VK_ESCAPE
+
+            // VK_PRIOR, VK_NEXT, VK_END, VK_HOME, VK_INSERT, VK_DELETE
+            0x21..=0x24 | 0x2D | 0x2E => UserAction::EditingKey,
 
             0x25 => UserAction::Navigation(Navigation::Left), // VK_LEFT
             0x26 => UserAction::Navigation(Navigation::Up),   // VK_UP
@@ -115,5 +123,25 @@ impl TryFrom<usize> for UserAction {
         };
 
         Ok(action)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// The host editing keys must decode to EditingKey — falling through to
+    /// the ToUnicode branch instead would make them Unknown and pass them
+    /// through mid-composition (the issue-#5-sibling bug).
+    #[test]
+    fn host_editing_keys_decode_to_editing_key() {
+        // VK_PRIOR, VK_NEXT, VK_END, VK_HOME, VK_INSERT, VK_DELETE
+        for vk in [0x21usize, 0x22, 0x23, 0x24, 0x2D, 0x2E] {
+            assert!(
+                matches!(UserAction::try_from(vk).unwrap(), UserAction::EditingKey),
+                "0x{vk:02X} must decode to EditingKey"
+            );
+        }
     }
 }
