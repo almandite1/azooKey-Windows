@@ -182,6 +182,12 @@ pub fn transition(
                     CompositionState::Previewing,
                     vec![ClientAction::SetSelection(SetSelectionType::Down)],
                 ),
+                // eaten as no-ops: passed through, the host would edit the
+                // document underneath the open composition (Delete removed
+                // the character right after it — issue-#5 sibling). Reading-
+                // editing behaviors (forward delete, in-reading cursor jumps,
+                // candidate paging) can take these over later
+                UserAction::EditingKey => (state.clone(), vec![]),
                 UserAction::Function(key) => match key {
                     Function::Six => (
                         CompositionState::Previewing,
@@ -288,6 +294,7 @@ mod tests {
             UserAction::Unknown,
             UserAction::Navigation(Navigation::Up),
             UserAction::Function(Function::Six),
+            UserAction::EditingKey,
         ] {
             assert!(
                 transition(&kana(CompositionState::None), action).is_none(),
@@ -472,6 +479,21 @@ mod tests {
     #[test]
     fn unknown_keys_are_passed_through_while_composing() {
         assert!(transition(&kana(CompositionState::Composing), UserAction::Unknown).is_none());
+    }
+
+    /// Issue-#5 sibling: Delete/Home/End/PageUp/PageDown/Insert used to fall
+    /// through to the host with the composition still open, letting the host
+    /// edit the document underneath it (Delete removed the character right
+    /// after the composition mid-conversion). During a composition they must
+    /// be consumed as no-ops; the idle case stays pass-through (covered by
+    /// idle_ignores_editing_keys).
+    #[test]
+    fn editing_keys_are_consumed_as_noops_during_a_composition() {
+        for state in [CompositionState::Composing, CompositionState::Previewing] {
+            let (next, actions) = transition(&kana(state.clone()), UserAction::EditingKey).unwrap();
+            assert_eq!(next, state, "the composition must stay in its state");
+            assert_eq!(actions, vec![], "no side effects — just eat the key");
+        }
     }
 
     /// Upstream issue #5: a Ctrl shortcut during a composition must cancel
