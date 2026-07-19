@@ -28,7 +28,6 @@
 struct FFICandidate {
     char *text;
     char *subtext;
-    char *hiragana;
     int correspondingCount;
 };
 

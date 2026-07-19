@@ -24,7 +24,6 @@ use std::ffi::{c_char, c_int};
 pub(crate) struct FFICandidate {
     pub(crate) text: *mut c_char,
     pub(crate) subtext: *mut c_char,
-    pub(crate) hiragana: *mut c_char,
     pub(crate) corresponding_count: c_int,
 }
 

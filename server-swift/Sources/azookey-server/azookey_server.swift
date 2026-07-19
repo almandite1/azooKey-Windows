@@ -212,14 +212,13 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let candidate = converted.mainResults[i]
 
         let text = _strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
-        let hiragana = _strdup(hiragana)
         let correspondingCount = candidate.correspondingCount
 
         var afterComposingText = composingText
         afterComposingText.prefixComplete(correspondingCount: correspondingCount)
         let subtext = _strdup(afterComposingText.convertTarget)
 
-        result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
+        result.append(FFICandidate(text: text, subtext: subtext, correspondingCount: Int32(correspondingCount)))
     }
 
     lengthPtr.pointee = Int32(result.count)
@@ -276,7 +275,6 @@ public func free_composed_text(
         if let item = listPtr[i] {
             free(item.pointee.text)
             free(item.pointee.subtext)
-            free(item.pointee.hiragana)
             item.deallocate()
         }
     }
