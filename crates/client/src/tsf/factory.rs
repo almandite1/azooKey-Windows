@@ -129,4 +129,32 @@ impl TextServiceFactory {
     pub fn borrow(&self) -> Result<Ref<'_, TextService>> {
         Ok(self.text_service.try_borrow()?)
     }
+
+    /// Advises this TIP as a sink of type `S` on `source` and remembers the
+    /// cookie under `S::IID` in the per-instance cookie map (B14). Every
+    /// advise/unadvise pair in the TIP goes through these two, so a new
+    /// sink cannot re-invent the bookkeeping.
+    pub fn advise_sink<S: Interface>(
+        &self,
+        source: &ITfSource,
+        text_service: &mut TextService,
+    ) -> Result<()> {
+        let sink: IUnknown = self.this::<S>()?.cast()?;
+        let cookie = unsafe { source.AdviseSink(&S::IID, &sink)? };
+        text_service.cookies.insert(S::IID, cookie);
+        Ok(())
+    }
+
+    /// Unadvises the sink of type `S` using the cookie remembered by
+    /// `advise_sink`; a no-op if it was never advised.
+    pub fn unadvise_sink<S: Interface>(
+        &self,
+        source: &ITfSource,
+        text_service: &mut TextService,
+    ) -> Result<()> {
+        if let Some(cookie) = text_service.cookies.remove(&S::IID) {
+            unsafe { source.UnadviseSink(cookie)? };
+        }
+        Ok(())
+    }
 }

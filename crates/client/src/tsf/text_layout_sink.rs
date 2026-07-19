@@ -59,30 +59,16 @@ impl TextServiceFactory {
             self.unadvise_text_layout_sink(text_service)?;
         }
 
-        unsafe {
-            let context = doc_mgr.GetTop()?;
-
-            text_service.layout_context = Some(context.clone());
-
-            let cookie = context
-                .cast::<ITfSource>()?
-                .AdviseSink(&ITfTextLayoutSink::IID, &self.this::<ITfTextLayoutSink>()?)?;
-
-            text_service.cookies.insert(ITfTextLayoutSink::IID, cookie);
-
-            Ok(())
-        }
+        let context = unsafe { doc_mgr.GetTop()? };
+        text_service.layout_context = Some(context.clone());
+        self.advise_sink::<ITfTextLayoutSink>(&context.cast::<ITfSource>()?, text_service)
     }
 
     pub fn unadvise_text_layout_sink(&self, text_service: &mut TextService) -> Result<()> {
-        unsafe {
-            if let Some(context) = text_service.layout_context.take() {
-                if let Some(cookie) = text_service.cookies.remove(&ITfTextLayoutSink::IID) {
-                    context.cast::<ITfSource>()?.UnadviseSink(cookie)?;
-                }
-            }
-
-            Ok(())
+        if let Some(context) = text_service.layout_context.take() {
+            self.unadvise_sink::<ITfTextLayoutSink>(&context.cast::<ITfSource>()?, text_service)?;
         }
+
+        Ok(())
     }
 }
