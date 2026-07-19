@@ -92,8 +92,22 @@ impl TonicNamedPipeServer {
         let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
 
         unsafe {
+            // DACL: sandboxed principals may CONNECT but not CREATE pipe
+            // instances. GENERIC_ALL (GA) includes FILE_CREATE_PIPE_INSTANCE,
+            // so the original all-GA descriptor let any AppContainer (AC) or
+            // restricted (RC) process stand up a rogue instance of this pipe
+            // and receive a peer client's connection — intercepting the raw
+            // keystroke stream (AppendText). AC/RC now get 0x12019B
+            // (FILE_GENERIC_READ|FILE_GENERIC_WRITE minus FILE_APPEND_DATA ==
+            // minus FILE_CREATE_PIPE_INSTANCE), which is exactly what the
+            // client opens with (see shared::pipe::PIPE_CLIENT_ACCESS), so
+            // connecting still works. SY/BA/BU keep GA: the server itself runs
+            // as BU (or elevated BA) and must create instances, and a full
+            // same-user process is not a security boundary in Windows anyway.
+            // SACL unchanged: low-IL clients (sandboxed browsers) may still
+            // write up to the pipe.
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:(A;;GA;;;AC)(A;;GA;;;RC)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;BU)S:(ML;;NW;;;LW)"),
+                w!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;BU)(A;;0x12019b;;;AC)(A;;0x12019b;;;RC)S:(ML;;NW;;;LW)"),
                 SDDL_REVISION,
                 &mut security_descriptor,
                 None,
