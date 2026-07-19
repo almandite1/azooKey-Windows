@@ -20,87 +20,76 @@ use super::{
 };
 
 impl TextServiceFactory {
+    /// Every probe below is a host-capability question, not a failure: a
+    /// host that answers Err simply has no transitory parent, so we fall
+    /// back to the document manager we were given (`let Ok(..) = .. else`
+    /// throughout — see the error-handling rule in CLAUDE.md).
     fn to_parent_document_if_exists(
         &self,
         document_manager: Option<ITfDocumentMgr>,
     ) -> Result<ITfDocumentMgr> {
-        let document_manager = match document_manager {
-            Some(doc_mgr) => doc_mgr,
-            None => return Err(anyhow::anyhow!("Document manager is null")),
+        let Some(document_manager) = document_manager else {
+            return Err(anyhow::anyhow!("Document manager is null"));
         };
 
         unsafe {
-            // Get top context
-            let context = match document_manager.GetTop() {
-                Ok(ctx) => ctx,
-                Err(_) => return Ok(document_manager),
+            let Ok(context) = document_manager.GetTop() else {
+                return Ok(document_manager);
             };
 
-            // Get status
-            let status = match context.GetStatus() {
-                Ok(s) => s,
-                Err(_) => return Ok(document_manager),
+            let Ok(status) = context.GetStatus() else {
+                return Ok(document_manager);
             };
 
-            // Check if context is transitory
+            // only a transitory context (e.g. the search box's proxy
+            // document) has a parent worth chasing
             if (status.dwStaticFlags & TS_SS_TRANSITORY) != TS_SS_TRANSITORY {
                 return Ok(document_manager);
             }
 
-            // Get compartment manager
-            let compartment_mgr = match document_manager.cast::<ITfCompartmentMgr>() {
-                Ok(mgr) => mgr,
-                Err(_) => return Ok(document_manager),
+            let Ok(compartment_mgr) = document_manager.cast::<ITfCompartmentMgr>() else {
+                return Ok(document_manager);
             };
 
-            // Get compartment
-            let compartment = match compartment_mgr
-                .GetCompartment(&GUID_COMPARTMENT_TRANSITORYEXTENSION_PARENT)
-            {
-                Ok(comp) => comp,
-                Err(_) => return Ok(document_manager),
+            let Ok(compartment) =
+                compartment_mgr.GetCompartment(&GUID_COMPARTMENT_TRANSITORYEXTENSION_PARENT)
+            else {
+                return Ok(document_manager);
             };
 
-            // Get value
-            let variant = match compartment.GetValue() {
-                Ok(var) => var,
-                Err(_) => return Ok(document_manager),
+            let Ok(variant) = compartment.GetValue() else {
+                return Ok(document_manager);
             };
 
-            // Use a cloned IUnknown from VARIANT to avoid invalid reference-count handling.
-            // If this is not VT_UNKNOWN (or null), treat it as "parent not available".
-            let variant_unk = match IUnknown::try_from(&variant) {
-                Ok(unk) => unk,
-                Err(_) => return Ok(document_manager),
+            // Use a cloned IUnknown from VARIANT to avoid invalid
+            // reference-count handling. If this is not VT_UNKNOWN (or
+            // null), treat it as "parent not available".
+            let Ok(variant_unk) = IUnknown::try_from(&variant) else {
+                return Ok(document_manager);
             };
 
-            match variant_unk.cast::<ITfDocumentMgr>() {
-                Ok(parent_doc_mgr) => Ok(parent_doc_mgr),
-                Err(_) => Ok(document_manager),
-            }
+            let Ok(parent_doc_mgr) = variant_unk.cast::<ITfDocumentMgr>() else {
+                return Ok(document_manager);
+            };
+
+            Ok(parent_doc_mgr)
         }
     }
 
     fn to_parent_context_if_exists(&self, context: Option<ITfContext>) -> Result<ITfContext> {
-        let context = match context {
-            Some(ctx) => ctx,
-            None => return Err(anyhow::anyhow!("Context is null")),
+        let Some(context) = context else {
+            return Err(anyhow::anyhow!("Context is null"));
         };
 
         unsafe {
-            // Get document manager
-            let document_mgr = match context.GetDocumentMgr() {
-                Ok(doc_mgr) => doc_mgr,
-                Err(_) => return Ok(context),
+            let Ok(document_mgr) = context.GetDocumentMgr() else {
+                return Ok(context);
             };
 
-            // Get parent document
             let parent_doc_mgr = self.to_parent_document_if_exists(Some(document_mgr))?;
 
-            // Get top context from parent document
-            let parent_context = match parent_doc_mgr.GetTop() {
-                Ok(ctx) => ctx,
-                Err(_) => return Ok(context),
+            let Ok(parent_context) = parent_doc_mgr.GetTop() else {
+                return Ok(context);
             };
 
             Ok(parent_context)
