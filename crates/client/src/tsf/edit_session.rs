@@ -6,8 +6,8 @@ use windows::{
         UI::TextServices::{
             ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
             ITfEditSession_Impl, ITfInsertAtSelection, ITfRange, GUID_PROP_ATTRIBUTE, TF_AE_NONE,
-            TF_ANCHOR_END, TF_ANCHOR_START, TF_ES_READWRITE, TF_IAS_QUERYONLY, TF_SELECTION,
-            TF_SELECTIONSTYLE, TF_ST_CORRECTION, TF_TF_MOVESTART,
+            TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_ES_READWRITE,
+            TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE, TF_ST_CORRECTION, TF_TF_MOVESTART,
         },
     },
 };
@@ -70,6 +70,9 @@ impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
 /// `ManuallyDrop` and `SetSelection` is [in]-only, so the AddRef taken here
 /// must be released by us afterwards — win or lose — or the range leaks in
 /// the host application once per call.
+///
+/// `selected_range` is the receiving-direction pair; every `TF_SELECTION`
+/// crossing the TSF boundary goes through one of the two.
 fn set_selection(context: &ITfContext, cookie: u32, range: &ITfRange) -> windows::core::Result<()> {
     let selections = [TF_SELECTION {
         range: ManuallyDrop::new(Some(range.clone())),
@@ -83,6 +86,26 @@ fn set_selection(context: &ITfContext, cookie: u32, range: &ITfRange) -> windows
     let [selection] = selections;
     drop(ManuallyDrop::into_inner(selection.range));
     result
+}
+
+/// Fetches the host's current selection and takes ownership of its range.
+/// `GetSelection` is [out]: the range arrives AddRef'd inside a
+/// `ManuallyDrop`, so failing to take it leaked one host-side range per
+/// keystroke (B10). Returns `None` when the host reports no selection.
+pub(super) fn selected_range(
+    context: &ITfContext,
+    cookie: u32,
+) -> windows::core::Result<Option<ITfRange>> {
+    let mut pselection: [TF_SELECTION; 1] = [TF_SELECTION::default()];
+    let mut pfetched = 0;
+    unsafe {
+        context.GetSelection(cookie, TF_DEFAULT_SELECTION, &mut pselection, &mut pfetched)?;
+    }
+    if pfetched == 0 {
+        return Ok(None);
+    }
+    let [selection] = pselection;
+    Ok(ManuallyDrop::into_inner(selection.range))
 }
 
 impl TextServiceFactory {

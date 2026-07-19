@@ -8,14 +8,16 @@ use windows::{
     core::{IUnknown, Interface},
     Win32::UI::TextServices::{
         ITfCompartmentMgr, ITfContext, ITfDocumentMgr, GUID_COMPARTMENT_TRANSITORYEXTENSION_PARENT,
-        TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_HALTCOND, TF_HF_OBJECT, TF_SELECTION,
-        TF_TF_MOVESTART, TS_SS_TRANSITORY,
+        TF_ANCHOR_START, TF_HALTCOND, TF_HF_OBJECT, TF_TF_MOVESTART, TS_SS_TRANSITORY,
     },
 };
 
 use crate::engine::state::IMEState;
 
-use super::{edit_session::edit_session, factory::TextServiceFactory};
+use super::{
+    edit_session::{edit_session, selected_range},
+    factory::TextServiceFactory,
+};
 
 impl TextServiceFactory {
     fn to_parent_document_if_exists(
@@ -120,27 +122,10 @@ impl TextServiceFactory {
                     let preview_count = preview.encode_utf16().count() as i32;
 
                     move |cookie| {
-                        // 2. Get the selection from the parent context.
-                        let mut pselection: [TF_SELECTION; 1] = [TF_SELECTION::default()];
-                        let mut pfetched = 0;
-                        parent_context.GetSelection(
-                            cookie,
-                            TF_DEFAULT_SELECTION,
-                            &mut pselection,
-                            &mut pfetched,
-                        )?;
-
-                        if pfetched == 0 {
+                        // 2. Get the selection from the parent context
+                        // (selected_range owns the ManuallyDrop bookkeeping).
+                        let Some(range) = selected_range(&parent_context, cookie)? else {
                             return Ok(String::new());
-                        }
-
-                        // GetSelection is [out]: the range arrives AddRef'd
-                        // inside a ManuallyDrop, so take ownership or it
-                        // leaks in the host app on every keystroke
-                        let selection_range = ManuallyDrop::take(&mut pselection[0].range);
-                        let range = match selection_range.as_ref() {
-                            Some(range) => range.Clone()?,
-                            None => return Ok(String::new()),
                         };
 
                         let mut preceding_range_shifted = 0;
