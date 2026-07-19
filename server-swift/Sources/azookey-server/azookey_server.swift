@@ -7,6 +7,10 @@ import ffi
 // annotation is NOT enforced across the C boundary. The Rust server MUST
 // call every exported function from a single thread, serially (it runs a
 // current_thread tokio runtime on the process main thread).
+//
+// The canonical declaration of every exported signature is
+// Sources/ffi/include/ffi.h; keep the @_cdecl exports below (and the Rust
+// mirror in crates/server/src/ffi.rs) in sync with it.
 @MainActor let converter = KanaKanjiConverter()
 
 // Per-client composing state, keyed by the session id the Rust server
