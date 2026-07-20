@@ -8,6 +8,7 @@ use windows::{
             ITfEditSession_Impl, ITfInsertAtSelection, ITfRange, GUID_PROP_ATTRIBUTE, TF_AE_NONE,
             TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_ES_READWRITE,
             TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE, TF_ST_CORRECTION, TF_TF_MOVESTART,
+            TS_E_NOLAYOUT,
         },
     },
 };
@@ -19,6 +20,44 @@ use anyhow::Result;
 use crate::{engine::state::IMEState, extension::StringExt as _, globals::GUID_DISPLAY_ATTRIBUTE};
 
 use super::factory::TextServiceFactory;
+
+/// Outcome of one `update_pos` attempt. `PendingLayout` and `Clipped` are
+/// normal transient states, not errors: the candidate window keeps its current
+/// position and a later `OnLayoutChange` retries. We deliberately do *not*
+/// hide the window on either — `show_window` is only ever sent from
+/// `ClientAction::StartComposition` (engine/composition.rs), so hiding
+/// mid-composition would leave the candidates invisible for the rest of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PositionUpdate {
+    Sent,
+    PendingLayout,
+    Clipped,
+    NoIpc,
+}
+
+/// Classifies what `GetTextExt` told us. Split out from the edit-session
+/// closure so the three-way decision can be tested without a live host.
+///
+/// `TS_E_NOLAYOUT` is *not* a failure: the host has no layout for this range
+/// yet and will call `OnLayoutChange` when it does. Every other HRESULT is a
+/// genuine error and keeps propagating.
+fn classify_text_ext(
+    measured: windows::core::Result<()>,
+    clipped: windows::Win32::Foundation::BOOL,
+) -> Result<PositionUpdate> {
+    if let Err(error) = measured {
+        if error.code() == TS_E_NOLAYOUT {
+            return Ok(PositionUpdate::PendingLayout);
+        }
+        return Err(error.into());
+    }
+
+    if clipped.as_bool() {
+        return Ok(PositionUpdate::Clipped);
+    }
+
+    Ok(PositionUpdate::Sent)
+}
 
 #[implement(ITfEditSession)]
 struct EditSession<'a, T> {
@@ -395,7 +434,7 @@ impl TextServiceFactory {
             };
 
             if let Some(tip_composition) = tip_composition {
-                edit_session(
+                let outcome = edit_session(
                     tid,
                     context.clone(),
                     Rc::new({
@@ -406,24 +445,37 @@ impl TextServiceFactory {
                             let range = tip_composition.GetRange()?;
 
                             let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() else {
-                                return Ok(());
+                                return Ok(PositionUpdate::NoIpc);
                             };
 
                             let mut rect = RECT::default();
                             let mut clipped = false.into();
-                            view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
+                            let measured = view.GetTextExt(cookie, &range, &mut rect, &mut clipped);
 
-                            ipc_service.set_window_position(
-                                rect.top,
-                                rect.left,
-                                rect.bottom,
-                                rect.right,
-                            );
+                            let outcome = classify_text_ext(measured, clipped)?;
+                            if outcome == PositionUpdate::Sent {
+                                ipc_service.set_window_position(
+                                    rect.top,
+                                    rect.left,
+                                    rect.bottom,
+                                    rect.right,
+                                );
+                            }
 
-                            Ok(())
+                            Ok(outcome)
                         }
                     }),
                 )?;
+
+                match outcome {
+                    Some(PositionUpdate::PendingLayout) => {
+                        tracing::debug!("Layout not ready yet; waiting for OnLayoutChange")
+                    }
+                    Some(PositionUpdate::Clipped) => {
+                        tracing::debug!("Composition rect is clipped; keeping the current position")
+                    }
+                    _ => {}
+                }
             }
 
             Ok(())
@@ -453,8 +505,9 @@ mod tests {
     use crate::engine::ipc_service::IPCService;
     use crate::tsf::test_support::{
         factory_with_context, factory_with_fake_context, fake_context_of, global_state_lock,
-        EditSessionBehavior, FakeComposition, FakeContext, RangeLog, FAKE_COOKIE,
+        EditSessionBehavior, FakeComposition, FakeContext, RangeLog, TextExtBehavior, FAKE_COOKIE,
     };
+    use windows::Win32::Foundation::E_FAIL;
     use windows::Win32::UI::TextServices::ITfTextInputProcessor;
 
     /// A factory whose composition is live and whose ranges report into the
@@ -530,6 +583,81 @@ mod tests {
             "the composition rect must be measured on the active view"
         );
         assert_eq!(log.live_ranges(), 0, "no range may leak from update_pos");
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// C-1: `TS_E_NOLAYOUT` means "layout is not ready yet, wait for
+    /// `OnLayoutChange`" — a normal transient state every host produces, not
+    /// a failure. Before this, it was collapsed into the generic error warn.
+    #[test]
+    fn a_pending_layout_is_not_an_error() {
+        let outcome = classify_text_ext(Err(TS_E_NOLAYOUT.into()), false.into())
+            .expect("NOLAYOUT is a transient state, not a failure");
+        assert_eq!(outcome, PositionUpdate::PendingLayout);
+    }
+
+    /// Only NOLAYOUT gets that treatment; a real failure must still propagate
+    /// so it is logged rather than silently swallowed.
+    #[test]
+    fn other_hresults_still_propagate_as_errors() {
+        let outcome = classify_text_ext(Err(E_FAIL.into()), false.into());
+        assert!(
+            outcome.is_err(),
+            "a genuine GetTextExt failure must not be mistaken for a pending layout"
+        );
+    }
+
+    /// C-1: a clipped rect is not where the text actually is, so it must not
+    /// be forwarded as a window position — that would move the candidate
+    /// window somewhere the caret is not.
+    #[test]
+    fn a_clipped_rect_is_not_forwarded() {
+        let outcome = classify_text_ext(Ok(()), true.into()).unwrap();
+        assert_eq!(
+            outcome,
+            PositionUpdate::Clipped,
+            "a clipped rect must not reach set_window_position"
+        );
+    }
+
+    /// The ordinary path still sends the position.
+    #[test]
+    fn an_unclipped_measurement_is_sent() {
+        let outcome = classify_text_ext(Ok(()), false.into()).unwrap();
+        assert_eq!(outcome, PositionUpdate::Sent);
+    }
+
+    /// The transient answers must still release the range they measured.
+    #[test]
+    fn update_pos_leaks_no_range_when_layout_is_pending() {
+        let _guard = global_state_lock();
+        let log = Rc::new(RangeLog::default());
+        let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
+        let tip = factory_with_context(context.clone());
+        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        factory
+            .borrow()
+            .unwrap()
+            .borrow_mut_composition()
+            .unwrap()
+            .tip_composition = Some(FakeComposition::with_log(log.clone()));
+        IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
+
+        let view = unsafe { fake_context_of(&context) }.view_log();
+        view.text_ext_behavior.set(TextExtBehavior::NoLayout);
+
+        factory.update_pos().unwrap();
+
+        assert_eq!(
+            view.get_text_ext_calls.get(),
+            1,
+            "the view must still be measured; NOLAYOUT is the answer, not a skip"
+        );
+        assert_eq!(
+            log.live_ranges(),
+            0,
+            "a NOLAYOUT answer must not leak the measured range"
+        );
         IMEState::get().unwrap().ipc_service = None;
     }
 

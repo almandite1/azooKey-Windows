@@ -38,7 +38,8 @@ use windows::{
             ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl, ITfSource,
             ITfSource_Impl, ITfThreadMgr, ITfThreadMgr_Impl, INSERT_TEXT_AT_SELECTION_FLAGS,
             TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_SYNC, TF_E_SYNCHRONOUS, TF_HALTCOND,
-            TF_LANGBARITEMINFO, TF_PRESERVEDKEY, TF_SELECTION, TF_S_ASYNC, TS_STATUS,
+            TF_LANGBARITEMINFO, TF_PRESERVEDKEY, TF_SELECTION, TF_S_ASYNC, TS_E_NOLAYOUT,
+            TS_STATUS,
         },
     },
 };
@@ -353,11 +354,27 @@ impl ITfInsertAtSelection_Impl for FakeContext_Impl {
     }
 }
 
+/// How a [`FakeContextView`] answers `GetTextExt`. Hosts routinely return
+/// `TS_E_NOLAYOUT` while layout is pending, and report a clipped rect when
+/// the composition is scrolled out of view; both are normal, so `update_pos`
+/// has to tell them apart from real failures.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextExtBehavior {
+    /// Serve [`FAKE_TEXT_EXT`], unclipped.
+    #[default]
+    Ok,
+    /// Fail with `TS_E_NOLAYOUT`.
+    NoLayout,
+    /// Serve [`FAKE_TEXT_EXT`] but flag it clipped.
+    Clipped,
+}
+
 /// What a [`FakeContextView`] was asked. The rect it serves is fixed and
 /// known, so a test can assert it reached the IPC layer unchanged.
 #[derive(Default)]
 pub struct ViewLog {
     pub get_text_ext_calls: Cell<usize>,
+    pub text_ext_behavior: Cell<TextExtBehavior>,
 }
 
 /// The rect every [`FakeContextView`] reports for any range.
@@ -395,12 +412,18 @@ impl ITfContextView_Impl for FakeContextView_Impl {
         self.log
             .get_text_ext_calls
             .set(self.log.get_text_ext_calls.get() + 1);
+
+        let behavior = self.log.text_ext_behavior.get();
+        if behavior == TextExtBehavior::NoLayout {
+            return Err(TS_E_NOLAYOUT.into());
+        }
+
         unsafe {
             if !prc.is_null() {
                 *prc = FAKE_TEXT_EXT;
             }
             if !pfclipped.is_null() {
-                *pfclipped = false.into();
+                *pfclipped = (behavior == TextExtBehavior::Clipped).into();
             }
         }
         Ok(())
