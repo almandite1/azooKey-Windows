@@ -113,7 +113,12 @@ impl TextServiceFactory {
         selection_index: i32,
         updated_flags: u32,
     ) -> Result<()> {
-        self.ui_update(candidates, selection_index, updated_flags)?;
+        // Advisory (CLAUDE.md): UILess bookkeeping must never break typing.
+        // Propagating here would mean a host-side element problem also
+        // stopped the candidates reaching our own window.
+        if let Err(error) = self.ui_update(candidates, selection_index, updated_flags) {
+            tracing::warn!("ui_update failed (non-fatal): {error:?}");
+        }
 
         if self.ui_should_show() {
             if updated_flags & TF_CLUIE_STRING != 0 {
@@ -257,7 +262,13 @@ impl TextServiceFactory {
                         // where the caret is before deciding. A host that
                         // draws the candidates itself answers false and our
                         // own window stays hidden.
-                        if self.ui_begin()? {
+                        // advisory: if we cannot ask the host, show our own
+                        // window -- the pre-UILess behaviour
+                        let show = self.ui_begin().unwrap_or_else(|error| {
+                            tracing::warn!("ui_begin failed (non-fatal): {error:?}");
+                            true
+                        });
+                        if show {
                             ipc_service.show_window();
                         }
                     }
@@ -291,10 +302,11 @@ impl TextServiceFactory {
                         raw_hiragana.clear();
                         // unconditional: hiding is safe even if we never
                         // showed, and ui_end is a no-op with no live element
-                        let ui_result = self.ui_end();
+                        if let Err(error) = self.ui_end() {
+                            tracing::warn!("ui_end failed (non-fatal): {error:?}");
+                        }
                         ipc_service.hide_window();
                         ipc_service.set_candidates(vec![]);
-                        edit_result = edit_result.and(ui_result);
                         let clear_result = ipc_service.clear_text();
 
                         // surface the first failure only after both the
@@ -372,11 +384,20 @@ impl TextServiceFactory {
 
                         // this arm clears the composition, so any candidate
                         // element the host is holding is now stale.
+                        //
+                        // Advisory on purpose: propagating here aborted the
+                        // arm BEFORE apply_input_mode, so a failure to tear
+                        // down the element silently cancelled the mode
+                        // switch itself -- the user just could not leave the
+                        // current mode.
+                        //
                         // (Pre-existing gap, left alone here: unlike the
                         // End/CancelComposition arm this one never sends
                         // hide_window, so our own window relies on the next
                         // composition to reposition it.)
-                        self.ui_end()?;
+                        if let Err(error) = self.ui_end() {
+                            tracing::warn!("ui_end failed (non-fatal): {error:?}");
+                        }
 
                         // publishes the mode to the langbar, the indicator,
                         // and the OS compartments (so the touch keyboard,

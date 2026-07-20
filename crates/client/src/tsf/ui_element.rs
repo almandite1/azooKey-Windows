@@ -355,8 +355,8 @@ mod tests {
     use windows::core::AsImpl as _;
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::TextServices::{
-        ITfCandidateListUIElement, ITfTextInputProcessor, TF_CLUIE_CURRENTPAGE,
-        TF_CLUIE_PAGEINDEX, TF_CLUIE_STRING,
+        ITfCandidateListUIElement, ITfTextInputProcessor, TF_CLUIE_CURRENTPAGE, TF_CLUIE_PAGEINDEX,
+        TF_CLUIE_STRING,
     };
 
     /// Calls `GetPageIndex` through the raw vtable, the way a host does.
