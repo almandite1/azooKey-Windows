@@ -42,7 +42,9 @@ const HEARTBEAT_STALL_THRESHOLD: Duration = Duration::from_secs(15);
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // obtain uiaccess token (on success this re-executes the process and
-    // never returns). Without UIAccess the candidate window may appear
+    // never returns: the original process stays behind as a supervision shim
+    // that mirrors the child's exit code, so the launcher's watchdog keeps
+    // covering the real UI). Without UIAccess the candidate window may appear
     // behind full-screen or elevated applications, but a working IME beats
     // no candidate window at all — continue instead of dying.
     if let Err(e) = prepare_uiaccess_token() {
@@ -152,11 +154,31 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // the caret rect the TIP last positioned the candidate window at; kept
+    // so resizes (SetCandidate width, UpdateHeight, DPI changes) can
+    // re-clamp the grown window into the work area (issue #3)
+    let mut last_caret: Option<utils::CaretRect> = None;
+
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
             Event::NewEvents(StartCause::Init) => {}
+            Event::WindowEvent {
+                event: WindowEvent::ScaleFactorChanged { new_inner_size, .. },
+                window_id,
+                ..
+            } if window_id == candidate_window.id() => {
+                // crossing into a monitor with a different DPI changes the
+                // window's physical size; re-clamp with the size it is about
+                // to have (inner_size() still reports the old one here)
+                window_actions::reposition_candidate(
+                    &candidate_window,
+                    &last_caret,
+                    new_inner_size.width as i32,
+                    new_inner_size.height as i32,
+                );
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
@@ -207,7 +229,19 @@ async fn main() -> anyhow::Result<()> {
                     // every resize at high DPI (B20).
                     let scale = candidate_window.scale_factor();
                     let width = candidate_window.inner_size().to_logical::<f64>(scale).width;
-                    candidate_window.set_inner_size(LogicalSize::new(width, height as f64));
+                    let new_size = LogicalSize::new(width, height as f64);
+                    candidate_window.set_inner_size(new_size);
+
+                    // a taller list can now overflow the work-area bottom (or
+                    // flip and overflow the top); re-clamp for the size the
+                    // window is GOING to have (issue #3)
+                    let physical = new_size.to_physical::<i32>(scale);
+                    window_actions::reposition_candidate(
+                        &candidate_window,
+                        &last_caret,
+                        physical.width,
+                        physical.height,
+                    );
                 }
                 UserEvent::Heartbeat => {
                     // test hook: simulate a stalled event loop (inert unless
@@ -227,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
                         &indicator_window,
                         &task_guard,
                         &event_loop_proxy,
+                        &mut last_caret,
                     );
                 }
             },

@@ -13,12 +13,30 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::ipc::WindowAction;
-use crate::utils;
+use crate::utils::{self, CaretRect};
 use crate::window::{is_visible, notify_ime_event, pin_topmost, set_visibility};
 use crate::UserEvent;
 use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_IME_CHANGE, EVENT_OBJECT_IME_HIDE, EVENT_OBJECT_IME_SHOW,
 };
+
+/// Re-clamps the candidate window against the last caret rect for the size
+/// it is about to have (physical px). Call after every resize — clamping
+/// only at position time let a subsequently grown window overflow the work
+/// area (issue #3).
+pub fn reposition_candidate(
+    candidate_window: &Window,
+    last_caret: &Option<CaretRect>,
+    win_width: i32,
+    win_height: i32,
+) {
+    // no caret yet (nothing was composed since startup): nothing to clamp to
+    let Some(caret) = last_caret else {
+        return;
+    };
+    let (x, y) = utils::get_candidate_window_position(caret, win_width, win_height);
+    candidate_window.set_outer_position(PhysicalPosition::new(x, y));
+}
 
 pub fn handle_window_action(
     action: WindowAction,
@@ -26,6 +44,7 @@ pub fn handle_window_action(
     indicator_window: &Window,
     indicator_flash: &Arc<Mutex<Option<JoinHandle<()>>>>,
     proxy: &EventLoopProxy<UserEvent>,
+    last_caret: &mut Option<CaretRect>,
 ) {
     let indicator_hwnd = indicator_window.hwnd();
 
@@ -61,16 +80,35 @@ pub fn handle_window_action(
             bottom,
             right,
         } => {
-            let (x, y) =
-                utils::get_candidate_window_position(top, left, bottom, right, candidate_window);
+            let caret = CaretRect {
+                top,
+                left,
+                bottom,
+                right,
+            };
+            // remembered so later RESIZES (SetCandidate width, UpdateHeight,
+            // DPI changes) can re-clamp against the same caret (issue #3)
+            *last_caret = Some(caret);
 
             pin_topmost(candidate_window.hwnd());
             pin_topmost(indicator_hwnd);
 
-            candidate_window.set_outer_position(PhysicalPosition::new(x, y));
+            let size = candidate_window.inner_size();
+            reposition_candidate(
+                candidate_window,
+                last_caret,
+                size.width as i32,
+                size.height as i32,
+            );
             // clamp the indicator into the work area too — it used to hang
             // off-screen near screen edges (B20)
-            let (ix, iy) = utils::get_indicator_position(left, bottom, indicator_window);
+            let indicator_size = indicator_window.inner_size();
+            let (ix, iy) = utils::get_indicator_position(
+                left,
+                bottom,
+                indicator_size.width as i32,
+                indicator_size.height as i32,
+            );
             indicator_window.set_outer_position(PhysicalPosition::new(ix, iy));
 
             if is_visible(candidate_window.hwnd()) {
@@ -88,10 +126,22 @@ pub fn handle_window_action(
                 .inner_size()
                 .to_logical::<f64>(scale)
                 .height;
-            candidate_window.set_inner_size(LogicalSize::new(
+            let new_size = LogicalSize::new(
                 utils::candidate_window_logical_width(max_len) as f64,
                 height,
-            ));
+            );
+            candidate_window.set_inner_size(new_size);
+
+            // the window may have just grown for a longer candidate;
+            // re-clamp for the size it is GOING to have — inner_size() can
+            // still report the pre-resize value here (issue #3)
+            let physical = new_size.to_physical::<i32>(scale);
+            reposition_candidate(
+                candidate_window,
+                last_caret,
+                physical.width,
+                physical.height,
+            );
 
             // Vec<String> serialization cannot fail; fall back to an empty
             // list rather than crash the UI
