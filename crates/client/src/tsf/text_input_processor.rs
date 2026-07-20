@@ -21,6 +21,19 @@ use windows::{
 
 use anyhow::Result;
 
+/// Records the first failure of a best-effort teardown step while letting the
+/// remaining steps run. Used across Deactivate and its `teardown_*` helpers so
+/// a single failing unadvise cannot strand the others (which would leak a sink
+/// into the host or pin its ITfContext).
+fn record(slot: &mut Result<()>, result: Result<()>) {
+    if let Err(error) = result {
+        tracing::warn!("Deactivate step failed: {error:?}");
+        if slot.is_ok() {
+            *slot = Err(error);
+        }
+    }
+}
+
 impl TextServiceFactory {
     /// Advises the key-event sink — the lifeline every keystroke arrives
     /// through. Paired with `unadvise_key_sink`; extracted from the inline
@@ -44,6 +57,95 @@ impl TextServiceFactory {
                 .UnadviseKeyEventSink(tid)?;
         }
         Ok(())
+    }
+
+    /// Deactivate phase 1: unadvise the thread-scoped registrations (key-event
+    /// sink, langbar item) that need the thread manager. Best-effort — returns
+    /// the first failure but attempts every step it can reach.
+    fn teardown_thread_scoped(&self) -> Result<()> {
+        let text_service = self.borrow()?;
+        let thread_mgr = text_service.thread_mgr()?;
+
+        let mut first_error = Ok(());
+        tracing::debug!("UnadviseKeyEventSink");
+        record(
+            &mut first_error,
+            self.unadvise_key_sink(&thread_mgr, text_service.tid),
+        );
+        tracing::debug!("Remove langbar");
+        record(&mut first_error, self.remove_langbar_item(&thread_mgr));
+        first_error
+    }
+
+    /// Deactivate phase 2: unadvise the per-instance sinks (thread-mgr event
+    /// sink, text-layout sink, compartment sinks) and reset this activation's
+    /// fields so TSF can reuse the TextService for the next Activate. Best-
+    /// effort — returns the first failure.
+    fn teardown_instance_state(&self) -> Result<()> {
+        let mut text_service = self.borrow_mut()?;
+        let mut first_error = Ok(());
+
+        tracing::debug!("UnadviseThreadMgrEventSink");
+        match text_service.thread_mgr() {
+            Ok(thread_mgr) => match thread_mgr.cast::<ITfSource>() {
+                Ok(source) => record(
+                    &mut first_error,
+                    self.unadvise_sink::<ITfThreadMgrEventSink>(&source, &mut text_service),
+                ),
+                Err(error) => record(&mut first_error, Err(error.into())),
+            },
+            Err(error) => record(&mut first_error, Err(error)),
+        }
+
+        tracing::debug!("UnadviseTextLayoutSink");
+        record(
+            &mut first_error,
+            self.unadvise_text_layout_sink(&mut text_service),
+        );
+
+        tracing::debug!("UnadviseCompartmentSinks");
+        record(
+            &mut first_error,
+            self.unadvise_compartment_sinks(&mut text_service),
+        );
+
+        // clear display attribute
+        text_service.display_attribute_atom.clear();
+
+        text_service.tid = 0;
+        text_service.thread_mgr = None;
+        // The OS compartment is the durable store for the mode now, and the
+        // next Activate adopts it back, so the cached copy must not outlive
+        // this activation.
+        text_service.input_mode = crate::engine::input_mode::InputMode::default();
+        text_service.suppress_compartment_echo = false;
+        // a stale flag would otherwise be inherited by a plain Activate() that
+        // carries no flags of its own
+        text_service.activate_flags = 0;
+        // Also let go of the last document's context: handle_key re-sets it on
+        // every keystroke after the next Activate, and end_composition() above
+        // already ran, so nothing dereferences it in between. Keeping it would
+        // pin the host's ITfContext while the TIP is deactivated. (The old
+        // `this` self-reference is gone entirely — TSF reuses this object
+        // across Deactivate/Activate cycles, and every callback reaches its COM
+        // interfaces via TextServiceFactory::this(), a QI on the containing
+        // allocation, so there is nothing to clear/restore.)
+        text_service.context = None;
+        text_service.layout_context = None;
+
+        // Reset the engine composition. TSF reuses this TextService across
+        // Deactivate/Activate, so a leftover Composing state (and its reading)
+        // would otherwise resume after an in-app IME switch (Win+Space and back
+        // within the same app, which does NOT fire OnSetFocus): the first
+        // keystroke would land in the Composing arm with no live
+        // tip_composition, set_text would no-op, and the typing would be
+        // invisible.
+        match text_service.borrow_mut_composition() {
+            Ok(mut composition) => *composition = Composition::default(),
+            Err(error) => record(&mut first_error, Err(error)),
+        }
+
+        first_error
     }
 }
 
@@ -186,20 +288,12 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         let mut dll_instance = DllModule::get()?;
         dll_instance.release();
 
-        // Best-effort teardown: every step below runs even if an earlier one
-        // fails. The old code chained the unadvises with `?`, so a single
-        // failing step (e.g. end_composition on a document being torn down
-        // during a profile switch) stranded the remaining unadvises — leaking
-        // a sink into the host or pinning its ITfContext. The first error is
-        // remembered and surfaced at the end.
-        fn record(slot: &mut Result<()>, result: Result<()>) {
-            if let Err(error) = result {
-                tracing::warn!("Deactivate step failed: {error:?}");
-                if slot.is_ok() {
-                    *slot = Err(error);
-                }
-            }
-        }
+        // Best-effort teardown: every step runs even if an earlier one fails.
+        // The old code chained the unadvises with `?`, so a single failing
+        // step (e.g. end_composition on a document being torn down during a
+        // profile switch) stranded the remaining unadvises — leaking a sink
+        // into the host or pinning its ITfContext. `record` remembers the
+        // first error; it is surfaced at the end, in the order the steps run.
         let mut first_error: Result<()> = Ok(());
 
         // end composition (releases the client-side handle even on failure)
@@ -211,90 +305,11 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // the B15 leak shape all over again.
         record(&mut first_error, self.ui_end());
 
-        // key event sink + langbar removal need the thread manager
-        match self.borrow() {
-            Ok(text_service) => match text_service.thread_mgr() {
-                Ok(thread_mgr) => {
-                    tracing::debug!("UnadviseKeyEventSink");
-                    record(
-                        &mut first_error,
-                        self.unadvise_key_sink(&thread_mgr, text_service.tid),
-                    );
+        // phase 1: thread-scoped registrations (key sink, langbar)
+        record(&mut first_error, self.teardown_thread_scoped());
 
-                    tracing::debug!("Remove langbar");
-                    record(&mut first_error, self.remove_langbar_item(&thread_mgr));
-                }
-                Err(error) => record(&mut first_error, Err(error)),
-            },
-            Err(error) => record(&mut first_error, Err(error)),
-        }
-
-        // thread-mgr event sink + text layout sink + field cleanup
-        match self.borrow_mut() {
-            Ok(mut text_service) => {
-                tracing::debug!("UnadviseThreadMgrEventSink");
-                match text_service.thread_mgr() {
-                    Ok(thread_mgr) => match thread_mgr.cast::<ITfSource>() {
-                        Ok(source) => record(
-                            &mut first_error,
-                            self.unadvise_sink::<ITfThreadMgrEventSink>(&source, &mut text_service),
-                        ),
-                        Err(error) => record(&mut first_error, Err(error.into())),
-                    },
-                    Err(error) => record(&mut first_error, Err(error)),
-                }
-
-                tracing::debug!("UnadviseTextLayoutSink");
-                record(
-                    &mut first_error,
-                    self.unadvise_text_layout_sink(&mut text_service),
-                );
-
-                tracing::debug!("UnadviseCompartmentSinks");
-                record(
-                    &mut first_error,
-                    self.unadvise_compartment_sinks(&mut text_service),
-                );
-
-                // clear display attribute
-                text_service.display_attribute_atom.clear();
-
-                text_service.tid = 0;
-                text_service.thread_mgr = None;
-                // The OS compartment is the durable store for the mode now,
-                // and the next Activate adopts it back, so the cached copy
-                // must not outlive this activation.
-                text_service.input_mode = crate::engine::input_mode::InputMode::default();
-                text_service.suppress_compartment_echo = false;
-                // a stale flag would otherwise be inherited by a plain
-                // Activate() that carries no flags of its own
-                text_service.activate_flags = 0;
-                // Also let go of the last document's context: handle_key
-                // re-sets it on every keystroke after the next Activate, and
-                // end_composition() above already ran, so nothing dereferences
-                // it in between. Keeping it would pin the host's ITfContext
-                // while the TIP is deactivated. (The old `this` self-reference
-                // is gone entirely — TSF reuses this object across
-                // Deactivate/Activate cycles, and every callback reaches its
-                // COM interfaces via TextServiceFactory::this(), a QI on the
-                // containing allocation, so there is nothing to clear/restore.)
-                text_service.context = None;
-                text_service.layout_context = None;
-
-                // Reset the engine composition. TSF reuses this TextService
-                // across Deactivate/Activate, so a leftover Composing state
-                // (and its reading) would otherwise resume after an in-app IME
-                // switch (Win+Space and back within the same app, which does
-                // NOT fire OnSetFocus): the first keystroke would land in the
-                // Composing arm with no live tip_composition, set_text would
-                // no-op, and the typing would be invisible.
-                match text_service.borrow_mut_composition() {
-                    Ok(mut composition) => *composition = Composition::default(),
-                    Err(error) => record(&mut first_error, Err(error)),
-                }
-            }
-            Err(error) => record(&mut first_error, Err(error)),
-        }
+        // phase 2: per-instance sinks + field reset for the next Activate
+        record(&mut first_error, self.teardown_instance_state());
 
         if first_error.is_ok() {
             tracing::debug!("Deactivate success");
