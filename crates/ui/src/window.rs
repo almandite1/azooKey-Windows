@@ -13,8 +13,8 @@ use windows::Win32::{
     UI::{
         Accessibility::NotifyWinEvent,
         WindowsAndMessaging::{
-            SetWindowLongW, SetWindowPos, ShowWindow, CHILDID_SELF, GWL_EXSTYLE, GWL_STYLE,
-            HWND_TOPMOST, OBJID_CLIENT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
+            IsWindowVisible, SetWindowLongW, SetWindowPos, ShowWindow, CHILDID_SELF, GWL_EXSTYLE,
+            GWL_STYLE, HWND_TOPMOST, OBJID_CLIENT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
             SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
         },
     },
@@ -25,9 +25,16 @@ use crate::UserEvent;
 /// Shows or hides a window without activating it (the IME must never steal
 /// focus from the host application). Takes the raw HWND so callers off the
 /// UI thread — the indicator flash task — can use it too.
-pub fn set_visibility(hwnd: isize, visible: bool) {
+/// Returns whether the window was *already* visible, so a caller can tell a
+/// real transition from a no-op. `ShowWindow` reports this for free.
+pub fn set_visibility(hwnd: isize, visible: bool) -> bool {
     let cmd = if visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
-    let _ = unsafe { ShowWindow(HWND(hwnd as *mut std::ffi::c_void), cmd) };
+    unsafe { ShowWindow(HWND(hwnd as *mut std::ffi::c_void), cmd) }.as_bool()
+}
+
+/// Whether the window is currently visible.
+pub fn is_visible(hwnd: isize) -> bool {
+    unsafe { IsWindowVisible(HWND(hwnd as *mut std::ffi::c_void)) }.as_bool()
 }
 
 /// Announces a candidate-window change to the shell and to assistive
