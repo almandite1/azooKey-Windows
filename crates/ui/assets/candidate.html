@@ -1,5 +1,11 @@
-<html>
+<!-- lang matters for a screen reader: without it the candidates are read
+     with the reader's default language voice, mispronouncing kana. -->
+<html lang="ja">
     <head>
+        <!-- Required now that the markup carries a Japanese aria-label.
+             The candidate text itself arrives through textContent and is
+             encoding-safe, which is why nothing needed this before. -->
+        <meta charset="utf-8">
         <style>
 {theme_css}
 {candidate_css}
@@ -10,7 +16,16 @@
     </head>
     <body style="margin: 0;">
         <main>
-            <ol id="candidate-list">
+            <!-- role is explicit because candidate.css sets
+                 `list-style-type: none`, which makes Chromium drop the
+                 implicit list semantics of <ol>/<li>. aria-activedescendant
+                 is how the selection is announced: this window is
+                 WS_EX_NOACTIVATE and never takes focus, so there is no real
+                 focus to follow. -->
+            <ol id="candidate-list"
+                role="listbox"
+                aria-label="変換候補"
+                aria-orientation="vertical">
             </ol>
             <footer>
                 <svg width="20" height="14" viewBox="0 0 22 16" fill="none" xmlns="http://www.w3.org/2000/svg">
