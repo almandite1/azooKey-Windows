@@ -1,6 +1,6 @@
 use crate::extension::VKeyExt;
 use anyhow::{Context, Result};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, ToUnicode, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, ToUnicode, VK_KANA, VK_SHIFT};
 
 #[derive(Debug)]
 pub enum UserAction {
@@ -87,6 +87,19 @@ impl TryFrom<usize> for UserAction {
                     unsafe {
                         GetKeyboardState(&mut key_state)?;
                     }
+
+                    // Ignore the kana lock. ToUnicode honours the VK_KANA
+                    // toggle, so with the lock on it answers ち for the A
+                    // key instead of 'a'. The engine takes romaji, so that
+                    // reading is never what we want.
+                    //
+                    // This is not hypothetical: ATOK's かな入力 mode leaves
+                    // the lock set, and switching back to azooKey then typed
+                    // ﾁ for every A. Clearing both the toggle (bit 0) and the
+                    // pressed (bit 7) flag keeps our decoding independent of
+                    // whatever the previous IME left behind.
+                    key_state[VK_KANA.0 as usize] = 0;
+
                     key_state
                 };
                 let unicode = {
