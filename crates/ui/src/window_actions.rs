@@ -14,8 +14,11 @@ use tokio::task::JoinHandle;
 
 use crate::ipc::WindowAction;
 use crate::utils;
-use crate::window::{pin_topmost, set_visibility};
+use crate::window::{notify_ime_event, pin_topmost, set_visibility};
 use crate::UserEvent;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EVENT_OBJECT_IME_CHANGE, EVENT_OBJECT_IME_HIDE, EVENT_OBJECT_IME_SHOW,
+};
 
 pub fn handle_window_action(
     action: WindowAction,
@@ -42,9 +45,11 @@ pub fn handle_window_action(
             }
 
             set_visibility(candidate_window.hwnd(), true);
+            notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_SHOW);
         }
         WindowAction::Hide => {
             set_visibility(candidate_window.hwnd(), false);
+            notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_HIDE);
         }
         WindowAction::SetPosition {
             top,
@@ -63,6 +68,8 @@ pub fn handle_window_action(
             // off-screen near screen edges (B20)
             let (ix, iy) = utils::get_indicator_position(left, bottom, indicator_window);
             indicator_window.set_outer_position(PhysicalPosition::new(ix, iy));
+
+            notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_CHANGE);
         }
         WindowAction::SetCandidate { candidates } => {
             let max_len = utils::max_candidate_chars(&candidates);
@@ -86,6 +93,10 @@ pub fn handle_window_action(
                 serde_json::to_string(&candidates).unwrap_or_else(|_| "[]".to_string());
 
             let _ = proxy.send_event(UserEvent::UpdateCandidates(candidates));
+
+            // the window has already been resized here; the list contents
+            // land asynchronously once the webview runs the script
+            notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_CHANGE);
         }
         WindowAction::SetSelection { index } => {
             let _ = proxy.send_event(UserEvent::UpdateSelection(index));

@@ -10,10 +10,13 @@ use tao::{
 };
 use windows::Win32::{
     Foundation::HWND,
-    UI::WindowsAndMessaging::{
-        SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_TOPMOST,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    UI::{
+        Accessibility::NotifyWinEvent,
+        WindowsAndMessaging::{
+            SetWindowLongW, SetWindowPos, ShowWindow, CHILDID_SELF, GWL_EXSTYLE, GWL_STYLE,
+            HWND_TOPMOST, OBJID_CLIENT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
+            SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        },
     },
 };
 
@@ -25,6 +28,27 @@ use crate::UserEvent;
 pub fn set_visibility(hwnd: isize, visible: bool) {
     let cmd = if visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
     let _ = unsafe { ShowWindow(HWND(hwnd as *mut std::ffi::c_void), cmd) };
+}
+
+/// Announces a candidate-window change to the shell and to assistive
+/// technology, which is how an IME "participates in the light dismiss model"
+/// (a Windows IME requirement). Without these, nothing outside our process
+/// can tell that the candidate UI appeared, moved, or went away — the window
+/// is a `WS_EX_NOACTIVATE` tool window in a separate process, so it is
+/// otherwise invisible to anything watching focus.
+///
+/// `event` is one of `EVENT_OBJECT_IME_SHOW` / `_HIDE` / `_CHANGE`.
+/// Best-effort: `NotifyWinEvent` reports nothing and there is no useful
+/// recovery if the shell is not listening.
+pub fn notify_ime_event(hwnd: isize, event: u32) {
+    unsafe {
+        NotifyWinEvent(
+            event,
+            HWND(hwnd as *mut std::ffi::c_void),
+            OBJID_CLIENT.0,
+            CHILDID_SELF as i32,
+        );
+    }
 }
 
 /// Re-asserts the window's place in the topmost band without moving,
