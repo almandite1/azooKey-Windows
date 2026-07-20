@@ -192,8 +192,8 @@ async fn main() -> anyhow::Result<()> {
                     // pipe can call with an arbitrary payload; a raw `"{}"`
                     // interpolation let a `"`/`\` break out of the string and
                     // inject script into the (UIAccess) webview.
-                    let arg = serde_json::to_string(&input_method)
-                        .unwrap_or_else(|_| "\"\"".to_string());
+                    let arg =
+                        serde_json::to_string(&input_method).unwrap_or_else(|_| "\"\"".to_string());
                     if let Err(e) =
                         indicator_webview.evaluate_script(&format!("updateInputMethod({arg})"))
                     {

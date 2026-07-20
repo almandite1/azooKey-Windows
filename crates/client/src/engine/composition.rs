@@ -21,7 +21,10 @@ use windows::Win32::{
     Foundation::WPARAM,
     UI::{
         Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU},
-        TextServices::{ITfComposition, ITfCompositionSink_Impl, ITfContext},
+        TextServices::{
+            ITfComposition, ITfCompositionSink_Impl, ITfContext, TF_CLUIE_COUNT,
+            TF_CLUIE_CURRENTPAGE, TF_CLUIE_PAGEINDEX, TF_CLUIE_SELECTION, TF_CLUIE_STRING,
+        },
     },
 };
 
@@ -87,7 +90,46 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
     }
 }
 
+/// Flags for `ui_update` when the whole candidate list was replaced.
+const CANDIDATES_CHANGED: u32 = TF_CLUIE_COUNT
+    | TF_CLUIE_STRING
+    | TF_CLUIE_SELECTION
+    | TF_CLUIE_CURRENTPAGE
+    | TF_CLUIE_PAGEINDEX;
+
+/// Flags for `ui_update` when only the highlighted candidate moved.
+const SELECTION_CHANGED: u32 = TF_CLUIE_SELECTION | TF_CLUIE_CURRENTPAGE;
+
 impl TextServiceFactory {
+    /// Hands the candidate list to the host (UILess mode) and, unless the
+    /// host said it draws them itself, to our own window.
+    ///
+    /// Every candidate update goes through here so the two can never
+    /// disagree about what is displayed.
+    fn publish_candidates(
+        &self,
+        ipc_service: &mut crate::engine::ipc_service::IPCService,
+        candidates: &Candidates,
+        selection_index: i32,
+        updated_flags: u32,
+    ) -> Result<()> {
+        // Advisory (CLAUDE.md): UILess bookkeeping must never break typing.
+        // Propagating here would mean a host-side element problem also
+        // stopped the candidates reaching our own window.
+        if let Err(error) = self.ui_update(candidates, selection_index, updated_flags) {
+            tracing::warn!("ui_update failed (non-fatal): {error:?}");
+        }
+
+        if self.ui_should_show() {
+            if updated_flags & TF_CLUIE_STRING != 0 {
+                ipc_service.set_candidates(candidates.texts.clone());
+            }
+            ipc_service.set_selection(selection_index);
+        }
+
+        Ok(())
+    }
+
     /// Impure shell around the pure decision functions
     /// (engine::transition): reads the OS/COM state they need, decodes the
     /// key, and adapts the result. New key bindings belong in the
@@ -101,6 +143,13 @@ impl TextServiceFactory {
         if context.is_none() {
             return Ok(None);
         };
+
+        // The host can switch input off for this context — a password field
+        // is the case that matters. Answering None hands the raw key back,
+        // which is the whole point: we must not compose here.
+        if self.is_input_disabled(context) {
+            return Ok(None);
+        }
 
         // a Ctrl or Alt chord is the host's shortcut: cancel any composition
         // so the shortcut actually works (issue #5), and never eat the key.
@@ -209,7 +258,19 @@ impl TextServiceFactory {
                     ClientAction::StartComposition => {
                         self.start_composition()?;
                         self.update_pos()?;
-                        ipc_service.show_window();
+                        // ask the host first -- after update_pos, so it knows
+                        // where the caret is before deciding. A host that
+                        // draws the candidates itself answers false and our
+                        // own window stays hidden.
+                        // advisory: if we cannot ask the host, show our own
+                        // window -- the pre-UILess behaviour
+                        let show = self.ui_begin().unwrap_or_else(|error| {
+                            tracing::warn!("ui_begin failed (non-fatal): {error:?}");
+                            true
+                        });
+                        if show {
+                            ipc_service.show_window();
+                        }
                     }
                     ClientAction::EndComposition | ClientAction::CancelComposition => {
                         // ending COMMITS whatever the range holds, so a
@@ -239,6 +300,11 @@ impl TextServiceFactory {
                         suffix.clear();
                         raw_input.clear();
                         raw_hiragana.clear();
+                        // unconditional: hiding is safe even if we never
+                        // showed, and ui_end is a no-op with no live element
+                        if let Err(error) = self.ui_end() {
+                            tracing::warn!("ui_end failed (non-fatal): {error:?}");
+                        }
                         ipc_service.hide_window();
                         ipc_service.set_candidates(vec![]);
                         let clear_result = ipc_service.clear_text();
@@ -267,8 +333,12 @@ impl TextServiceFactory {
                         );
 
                         self.set_text(&preview, &suffix)?;
-                        ipc_service.set_candidates(candidates.texts.clone());
-                        ipc_service.set_selection(selection_index);
+                        self.publish_candidates(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            CANDIDATES_CHANGED,
+                        )?;
                     }
                     ClientAction::RemoveText => {
                         candidates = ipc_service.remove_text()?;
@@ -293,8 +363,12 @@ impl TextServiceFactory {
                             .collect();
 
                         self.set_text(&preview, &suffix)?;
-                        ipc_service.set_candidates(candidates.texts.clone());
-                        ipc_service.set_selection(selection_index);
+                        self.publish_candidates(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            CANDIDATES_CHANGED,
+                        )?;
                     }
                     ClientAction::MoveCursor(_offset) => {
                         // Deliberate no-op for now: the MoveCursor RPC and the
@@ -308,23 +382,27 @@ impl TextServiceFactory {
                         self.update_pos()?;
                         self.end_composition()?;
 
-                        // scope the borrow tightly: update_lang_bar re-enters
-                        // the TextService RefCell through AddItem -> GetIcon
-                        // (a try_borrow), which fails outright if we still
-                        // hold the mutable borrow here
-                        {
-                            self.borrow_mut()?.input_mode = mode.clone();
+                        // this arm clears the composition, so any candidate
+                        // element the host is holding is now stale.
+                        //
+                        // Advisory on purpose: propagating here aborted the
+                        // arm BEFORE apply_input_mode, so a failure to tear
+                        // down the element silently cancelled the mode
+                        // switch itself -- the user just could not leave the
+                        // current mode.
+                        //
+                        // (Pre-existing gap, left alone here: unlike the
+                        // End/CancelComposition arm this one never sends
+                        // hide_window, so our own window relies on the next
+                        // composition to reposition it.)
+                        if let Err(error) = self.ui_end() {
+                            tracing::warn!("ui_end failed (non-fatal): {error:?}");
                         }
 
-                        // update the language bar
-                        self.update_lang_bar()?;
-
-                        let mode = match mode {
-                            InputMode::Latin => "A",
-                            InputMode::Kana => "あ",
-                        };
-
-                        ipc_service.set_input_mode(mode);
+                        // publishes the mode to the langbar, the indicator,
+                        // and the OS compartments (so the touch keyboard,
+                        // IMM32 apps and the shell see it too)
+                        self.apply_input_mode(mode.clone(), true)?;
 
                         selection_index = 0;
                         corresponding_count = 0;
@@ -352,7 +430,12 @@ impl TextServiceFactory {
                         }
                         .clamp(0, max(0, texts.len() as i32 - 1));
 
-                        ipc_service.set_selection(selection_index);
+                        self.publish_candidates(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            SELECTION_CHANGED,
+                        )?;
                         apply_selected_candidate(
                             &candidates,
                             selection_index,
@@ -392,8 +475,12 @@ impl TextServiceFactory {
                         );
                         self.shift_start(&previous_preview, &preview)?;
 
-                        ipc_service.set_candidates(candidates.texts.clone());
-                        ipc_service.set_selection(selection_index);
+                        self.publish_candidates(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            CANDIDATES_CHANGED,
+                        )?;
                         self.update_pos()?;
 
                         transition = CompositionState::Composing;

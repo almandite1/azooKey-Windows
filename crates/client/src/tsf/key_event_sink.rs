@@ -65,7 +65,19 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     }
 
     #[macros::anyhow]
-    fn OnSetFocus(&self, _fforeground: BOOL) -> Result<()> {
+    fn OnSetFocus(&self, fforeground: BOOL) -> Result<()> {
+        // Gaining the foreground is where the mode can have been changed
+        // behind our back — by the touch keyboard, the shell, or an IMM32
+        // app while another window had focus.
+        if !fforeground.as_bool() {
+            return Ok(());
+        }
+
+        // advisory: never break typing over a mode read (see CLAUDE.md)
+        if let Err(error) = self.sync_input_mode_from_compartments() {
+            tracing::warn!("OnSetFocus: compartment sync failed: {error:?}");
+        }
+
         Ok(())
     }
 }

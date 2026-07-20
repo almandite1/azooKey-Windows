@@ -31,6 +31,13 @@ pub const GUID_PROFILE: GUID = GUID::from_u128(0xffdefe7a_2fc2_11ef_b16b_94e70b2
 // DisplayAttribute用のGUID
 pub const GUID_DISPLAY_ATTRIBUTE: GUID = GUID::from_u128(0xffdefe7b_2fc2_11ef_b16b_94e70b2c378c);
 
+/// Identifies our candidate list to `ITfUIElementMgr`. Must be TIP-specific
+/// and stable — deliberately NOT `GUID_TEXT_SERVICE`, which identifies the
+/// text service itself rather than this UI element.
+// ffdefe7c-2fc2-11ef-b16b-94e70b2c378c
+pub const GUID_CANDIDATE_LIST_UI_ELEMENT: GUID =
+    GUID::from_u128(0xffdefe7c_2fc2_11ef_b16b_94e70b2c378c);
+
 pub const DISPLAY_ATTRIBUTE: TF_DISPLAYATTRIBUTE = TF_DISPLAYATTRIBUTE {
     crText: TF_DA_COLOR {
         r#type: TF_CT_NONE,

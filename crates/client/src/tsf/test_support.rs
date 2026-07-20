@@ -28,17 +28,20 @@ use windows::{
         UI::TextServices::{
             IEnumITfCompositionView, IEnumTfContextViews, IEnumTfContexts, IEnumTfDocumentMgrs,
             IEnumTfFunctionProviders, IEnumTfLangBarItems, IEnumTfProperties, IEnumTfRanges,
-            ITfCompartmentMgr, ITfComposition, ITfCompositionSink, ITfCompositionView,
-            ITfComposition_Impl, ITfContext, ITfContextComposition, ITfContextComposition_Impl,
-            ITfContextView, ITfContextView_Impl, ITfContext_Impl, ITfDocumentMgr,
-            ITfDocumentMgr_Impl, ITfEditSession, ITfFunctionProvider, ITfInsertAtSelection,
-            ITfInsertAtSelection_Impl, ITfKeyEventSink, ITfKeystrokeMgr, ITfKeystrokeMgr_Impl,
-            ITfLangBarItem, ITfLangBarItemMgr, ITfLangBarItemMgr_Impl, ITfLangBarItemSink,
-            ITfProperty, ITfPropertyStore, ITfProperty_Impl, ITfRange, ITfRangeBackup,
-            ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl, ITfSource,
-            ITfSource_Impl, ITfThreadMgr, ITfThreadMgr_Impl, INSERT_TEXT_AT_SELECTION_FLAGS,
+            IEnumTfUIElements, ITfCompartment, ITfCompartmentEventSink, ITfCompartmentMgr,
+            ITfCompartmentMgr_Impl, ITfCompartment_Impl, ITfComposition, ITfCompositionSink,
+            ITfCompositionView, ITfComposition_Impl, ITfContext, ITfContextComposition,
+            ITfContextComposition_Impl, ITfContextView, ITfContextView_Impl, ITfContext_Impl,
+            ITfDocumentMgr, ITfDocumentMgr_Impl, ITfEditSession, ITfFunctionProvider,
+            ITfInsertAtSelection, ITfInsertAtSelection_Impl, ITfKeyEventSink, ITfKeystrokeMgr,
+            ITfKeystrokeMgr_Impl, ITfLangBarItem, ITfLangBarItemMgr, ITfLangBarItemMgr_Impl,
+            ITfLangBarItemSink, ITfProperty, ITfPropertyStore, ITfProperty_Impl, ITfRange,
+            ITfRangeBackup, ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl,
+            ITfSource, ITfSource_Impl, ITfThreadMgr, ITfThreadMgr_Impl, ITfUIElement,
+            ITfUIElementMgr, ITfUIElementMgr_Impl, INSERT_TEXT_AT_SELECTION_FLAGS,
             TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_SYNC, TF_E_SYNCHRONOUS, TF_HALTCOND,
-            TF_LANGBARITEMINFO, TF_PRESERVEDKEY, TF_SELECTION, TF_S_ASYNC, TS_STATUS,
+            TF_LANGBARITEMINFO, TF_PRESERVEDKEY, TF_SELECTION, TF_S_ASYNC, TS_E_NOLAYOUT,
+            TS_STATUS,
         },
     },
 };
@@ -87,10 +90,19 @@ pub struct EditSessionRequest {
     pub flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS,
 }
 
-#[implement(ITfContext, ITfContextComposition, ITfInsertAtSelection, ITfSource)]
+#[implement(
+    ITfContext,
+    ITfContextComposition,
+    ITfInsertAtSelection,
+    ITfSource,
+    ITfCompartmentMgr
+)]
 pub struct FakeContext {
     behavior: Cell<EditSessionBehavior>,
     requests: RefCell<Vec<EditSessionRequest>>,
+    /// Context-scoped compartments (`KEYBOARD_DISABLED`, `EMPTYCONTEXT`) —
+    /// how a host turns the IME off for e.g. a password field.
+    compartments: Rc<CompartmentLog>,
     /// When set, `GetSelection` serves a [`FakeRange`] over this log and
     /// `GetActiveView` serves a [`FakeContextView`]; when `None` both keep
     /// the historical `E_NOTIMPL` so older tests see the same host.
@@ -104,7 +116,7 @@ pub struct FakeContext {
 
 impl FakeContext {
     pub fn new(behavior: EditSessionBehavior) -> ITfContext {
-        Self::build(behavior, None)
+        Self::build(behavior, None, Rc::new(CompartmentLog::default()))
     }
 
     /// A context that also models a document: `GetSelection` hands out
@@ -112,13 +124,28 @@ impl FakeContext {
     /// `GetActiveView` answers with a fake view. Enables driving
     /// `update_pos` / `update_context`.
     pub fn with_ranges(behavior: EditSessionBehavior, log: Rc<RangeLog>) -> ITfContext {
-        Self::build(behavior, Some(log))
+        Self::build(behavior, Some(log), Rc::new(CompartmentLog::default()))
     }
 
-    fn build(behavior: EditSessionBehavior, range_log: Option<Rc<RangeLog>>) -> ITfContext {
+    /// A context whose compartments the test controls — set
+    /// `GUID_COMPARTMENT_KEYBOARD_DISABLED` on `compartments` to model a
+    /// password field.
+    pub fn with_compartments(
+        behavior: EditSessionBehavior,
+        compartments: Rc<CompartmentLog>,
+    ) -> ITfContext {
+        Self::build(behavior, None, compartments)
+    }
+
+    fn build(
+        behavior: EditSessionBehavior,
+        range_log: Option<Rc<RangeLog>>,
+        compartments: Rc<CompartmentLog>,
+    ) -> ITfContext {
         FakeContext {
             behavior: Cell::new(behavior),
             requests: RefCell::new(Vec::new()),
+            compartments,
             range_log,
             view_log: Rc::new(ViewLog::default()),
             sink_advises: RefCell::new(Vec::new()),
@@ -142,6 +169,28 @@ impl FakeContext {
 
     pub fn sink_unadvises(&self) -> Vec<u32> {
         self.sink_unadvises.borrow().clone()
+    }
+}
+
+impl ITfCompartmentMgr_Impl for FakeContext_Impl {
+    fn GetCompartment(&self, rguid: *const GUID) -> WinResult<ITfCompartment> {
+        let guid = unsafe { rguid.as_ref() }.ok_or_else(|| {
+            windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG)
+        })?;
+
+        Ok(FakeCompartment {
+            guid: *guid,
+            log: self.compartments.clone(),
+        }
+        .into())
+    }
+
+    fn ClearCompartment(&self, _tid: u32, _rguid: *const GUID) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn EnumCompartments(&self) -> WinResult<windows::Win32::System::Com::IEnumGUID> {
+        Err(E_NOTIMPL.into())
     }
 }
 
@@ -353,11 +402,27 @@ impl ITfInsertAtSelection_Impl for FakeContext_Impl {
     }
 }
 
+/// How a [`FakeContextView`] answers `GetTextExt`. Hosts routinely return
+/// `TS_E_NOLAYOUT` while layout is pending, and report a clipped rect when
+/// the composition is scrolled out of view; both are normal, so `update_pos`
+/// has to tell them apart from real failures.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextExtBehavior {
+    /// Serve [`FAKE_TEXT_EXT`], unclipped.
+    #[default]
+    Ok,
+    /// Fail with `TS_E_NOLAYOUT`.
+    NoLayout,
+    /// Serve [`FAKE_TEXT_EXT`] but flag it clipped.
+    Clipped,
+}
+
 /// What a [`FakeContextView`] was asked. The rect it serves is fixed and
 /// known, so a test can assert it reached the IPC layer unchanged.
 #[derive(Default)]
 pub struct ViewLog {
     pub get_text_ext_calls: Cell<usize>,
+    pub text_ext_behavior: Cell<TextExtBehavior>,
 }
 
 /// The rect every [`FakeContextView`] reports for any range.
@@ -395,12 +460,18 @@ impl ITfContextView_Impl for FakeContextView_Impl {
         self.log
             .get_text_ext_calls
             .set(self.log.get_text_ext_calls.get() + 1);
+
+        let behavior = self.log.text_ext_behavior.get();
+        if behavior == TextExtBehavior::NoLayout {
+            return Err(TS_E_NOLAYOUT.into());
+        }
+
         unsafe {
             if !prc.is_null() {
                 *prc = FAKE_TEXT_EXT;
             }
             if !pfclipped.is_null() {
-                *pfclipped = false.into();
+                *pfclipped = (behavior == TextExtBehavior::Clipped).into();
             }
         }
         Ok(())
@@ -799,6 +870,172 @@ impl ITfComposition_Impl for FakeComposition_Impl {
     }
 }
 
+/// What a fake host's `ITfUIElementMgr` recorded, and how it answers.
+///
+/// `show` is the `pbShow` the host returns from `BeginUIElement` — the only
+/// gate that decides whether the TIP may draw its own candidate window.
+pub struct UiElementLog {
+    /// The host's answer to "may the TIP show its own UI?".
+    pub show: Cell<bool>,
+    pub begin_calls: Cell<usize>,
+    pub update_calls: Cell<usize>,
+    pub end_calls: Cell<usize>,
+    /// Ids handed out by `BeginUIElement`, and those passed to `EndUIElement`.
+    pub begun_ids: RefCell<Vec<u32>>,
+    pub ended_ids: RefCell<Vec<u32>>,
+    next_id: Cell<u32>,
+}
+
+impl Default for UiElementLog {
+    fn default() -> Self {
+        Self {
+            // a host that has no opinion lets the TIP draw
+            show: Cell::new(true),
+            begin_calls: Cell::new(0),
+            update_calls: Cell::new(0),
+            end_calls: Cell::new(0),
+            begun_ids: RefCell::new(Vec::new()),
+            ended_ids: RefCell::new(Vec::new()),
+            next_id: Cell::new(0x4100),
+        }
+    }
+}
+
+impl UiElementLog {
+    /// A host that draws the candidates itself (a UILess thread), so the TIP
+    /// must keep its own window hidden.
+    pub fn suppressing() -> Self {
+        let log = Self::default();
+        log.show.set(false);
+        log
+    }
+
+    pub fn live_elements(&self) -> usize {
+        self.begun_ids.borrow().len() - self.ended_ids.borrow().len()
+    }
+}
+
+/// Shared state behind every [`FakeCompartment`] a [`FakeThreadMgr`] hands
+/// out: the compartment values, and the sinks advised on them.
+///
+/// The interesting part is that `SetValue` dispatches `OnChange`
+/// **synchronously**, on the calling thread, exactly as TSF does. That is
+/// what makes a `RefCell` borrow held across a compartment write show up as
+/// a `BorrowMutError` in the callback rather than in production.
+#[derive(Default)]
+pub struct CompartmentLog {
+    values: RefCell<std::collections::HashMap<GUID, i32>>,
+    sinks: RefCell<Vec<(u32, GUID, ITfCompartmentEventSink)>>,
+    next_cookie: Cell<u32>,
+    pub set_value_calls: Cell<usize>,
+    pub advise_count: Cell<usize>,
+    pub unadvise_cookies: RefCell<Vec<u32>>,
+}
+
+impl CompartmentLog {
+    /// Seeds a compartment as if another IME had already set it, so a test
+    /// can prove Activate adopts the existing mode instead of stamping over
+    /// it.
+    pub fn preset(&self, guid: GUID, value: i32) {
+        self.values.borrow_mut().insert(guid, value);
+    }
+
+    pub fn value(&self, guid: GUID) -> Option<i32> {
+        self.values.borrow().get(&guid).copied()
+    }
+
+    pub fn live_sinks(&self) -> usize {
+        self.sinks.borrow().len()
+    }
+
+    /// Simulates somebody *else* writing the compartment — the touch
+    /// keyboard, the shell, or an IMM32 app — and dispatches `OnChange` the
+    /// way TSF does: synchronously, on this thread.
+    pub fn external_set(&self, guid: GUID, value: i32) {
+        self.values.borrow_mut().insert(guid, value);
+
+        let sinks: Vec<ITfCompartmentEventSink> = self
+            .sinks
+            .borrow()
+            .iter()
+            .filter(|(_, g, _)| *g == guid)
+            .map(|(_, _, sink)| sink.clone())
+            .collect();
+
+        for sink in sinks {
+            let _ = unsafe { sink.OnChange(&guid) };
+        }
+    }
+}
+
+/// One compartment. `GetValue` reports `VT_EMPTY` until something writes,
+/// matching a real unset compartment.
+#[implement(ITfCompartment, ITfSource)]
+pub struct FakeCompartment {
+    guid: GUID,
+    log: Rc<CompartmentLog>,
+}
+
+impl ITfCompartment_Impl for FakeCompartment_Impl {
+    fn SetValue(&self, _tid: u32, pvarvalue: *const VARIANT) -> WinResult<()> {
+        self.log
+            .set_value_calls
+            .set(self.log.set_value_calls.get() + 1);
+
+        let value = unsafe { pvarvalue.as_ref() }
+            .and_then(|v| i32::try_from(v).ok())
+            .unwrap_or(0);
+        self.log.values.borrow_mut().insert(self.guid, value);
+
+        // Synchronous dispatch, like TSF. Clone the sink list first so the
+        // callback may advise/unadvise without a borrow conflict here.
+        let sinks: Vec<ITfCompartmentEventSink> = self
+            .log
+            .sinks
+            .borrow()
+            .iter()
+            .filter(|(_, guid, _)| *guid == self.guid)
+            .map(|(_, _, sink)| sink.clone())
+            .collect();
+
+        for sink in sinks {
+            unsafe { sink.OnChange(&self.guid)? };
+        }
+
+        Ok(())
+    }
+
+    fn GetValue(&self) -> WinResult<VARIANT> {
+        match self.log.values.borrow().get(&self.guid) {
+            Some(value) => Ok(VARIANT::from(*value)),
+            // unset compartment: VT_EMPTY
+            None => Ok(VARIANT::default()),
+        }
+    }
+}
+
+impl ITfSource_Impl for FakeCompartment_Impl {
+    fn AdviseSink(&self, _riid: *const GUID, punk: Option<&IUnknown>) -> WinResult<u32> {
+        let punk = punk.ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
+        let sink: ITfCompartmentEventSink = windows::core::Interface::cast(punk)?;
+
+        let cookie = self.log.next_cookie.get() + 1;
+        self.log.next_cookie.set(cookie);
+        self.log.advise_count.set(self.log.advise_count.get() + 1);
+        self.log.sinks.borrow_mut().push((cookie, self.guid, sink));
+        Ok(cookie)
+    }
+
+    fn UnadviseSink(&self, dwcookie: u32) -> WinResult<()> {
+        self.log.unadvise_cookies.borrow_mut().push(dwcookie);
+        self.log
+            .sinks
+            .borrow_mut()
+            .retain(|(c, _, _)| *c != dwcookie);
+        Ok(())
+    }
+}
+
 /// What a [`FakeThreadMgr`] recorded while a TIP activated and deactivated
 /// against it. Lets a test prove the sinks the TIP advised on Activate are
 /// exactly the ones it unadvises on Deactivate — no leak, no double-advise.
@@ -837,7 +1074,14 @@ impl ThreadMgrLog {
 /// advise/unadvise traffic. Without a focus context, `GetFocus` reports no
 /// focus and the text-layout-sink path is skipped; `with_focus` makes it
 /// serve a [`FakeDocumentMgr`] over the given context so that path runs too.
-#[implement(ITfThreadMgr, ITfKeystrokeMgr, ITfSource, ITfLangBarItemMgr)]
+#[implement(
+    ITfThreadMgr,
+    ITfKeystrokeMgr,
+    ITfSource,
+    ITfLangBarItemMgr,
+    ITfCompartmentMgr,
+    ITfUIElementMgr
+)]
 pub struct FakeThreadMgr {
     log: Rc<ThreadMgrLog>,
     focus_context: Option<ITfContext>,
@@ -845,37 +1089,132 @@ pub struct FakeThreadMgr {
     /// step (adding the language-bar item) fails, so a test can prove the
     /// TIP unwinds the sinks it already advised (Activate rollback).
     fail_add_item: bool,
+    compartments: Rc<CompartmentLog>,
+    ui_elements: Rc<UiElementLog>,
 }
 
 impl FakeThreadMgr {
     pub fn new(log: Rc<ThreadMgrLog>) -> ITfThreadMgr {
-        FakeThreadMgr {
-            log,
-            focus_context: None,
-            fail_add_item: false,
-        }
-        .into()
+        Self::build(log, None, false, Default::default(), Default::default())
     }
 
     pub fn with_focus(log: Rc<ThreadMgrLog>, focus_context: ITfContext) -> ITfThreadMgr {
-        FakeThreadMgr {
+        Self::build(
             log,
-            focus_context: Some(focus_context),
-            fail_add_item: false,
-        }
-        .into()
+            Some(focus_context),
+            false,
+            Default::default(),
+            Default::default(),
+        )
     }
 
     /// A thread manager whose `AddItem` (the final Activate step) fails, so
     /// the TIP's Activate must roll back the key-event and thread-manager
     /// sinks it advised earlier.
     pub fn with_failing_langbar(log: Rc<ThreadMgrLog>) -> ITfThreadMgr {
+        Self::build(log, None, true, Default::default(), Default::default())
+    }
+
+    /// A thread manager sharing `compartments`, so a test can seed the
+    /// open/close state before Activate and inspect it afterwards.
+    pub fn with_compartments(
+        log: Rc<ThreadMgrLog>,
+        compartments: Rc<CompartmentLog>,
+    ) -> ITfThreadMgr {
+        Self::build(log, None, false, compartments, Default::default())
+    }
+
+    /// A thread manager whose `ITfUIElementMgr` the test controls — set
+    /// `show` on `ui_elements` to model a UILess host that draws the
+    /// candidates itself.
+    pub fn with_ui_elements(log: Rc<ThreadMgrLog>, ui_elements: Rc<UiElementLog>) -> ITfThreadMgr {
+        Self::build(log, None, false, Default::default(), ui_elements)
+    }
+
+    fn build(
+        log: Rc<ThreadMgrLog>,
+        focus_context: Option<ITfContext>,
+        fail_add_item: bool,
+        compartments: Rc<CompartmentLog>,
+        ui_elements: Rc<UiElementLog>,
+    ) -> ITfThreadMgr {
         FakeThreadMgr {
             log,
-            focus_context: None,
-            fail_add_item: true,
+            focus_context,
+            fail_add_item,
+            compartments,
+            ui_elements,
         }
         .into()
+    }
+}
+
+impl ITfCompartmentMgr_Impl for FakeThreadMgr_Impl {
+    fn GetCompartment(&self, rguid: *const GUID) -> WinResult<ITfCompartment> {
+        let guid = unsafe { rguid.as_ref() }.ok_or_else(|| {
+            windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG)
+        })?;
+
+        Ok(FakeCompartment {
+            guid: *guid,
+            log: self.compartments.clone(),
+        }
+        .into())
+    }
+
+    fn ClearCompartment(&self, _tid: u32, _rguid: *const GUID) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn EnumCompartments(&self) -> WinResult<windows::Win32::System::Com::IEnumGUID> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
+impl ITfUIElementMgr_Impl for FakeThreadMgr_Impl {
+    fn BeginUIElement(
+        &self,
+        _pelement: Option<&ITfUIElement>,
+        pbshow: *mut BOOL,
+        pdwuielementid: *mut u32,
+    ) -> WinResult<()> {
+        let log = &self.ui_elements;
+        log.begin_calls.set(log.begin_calls.get() + 1);
+
+        let id = log.next_id.get() + 1;
+        log.next_id.set(id);
+        log.begun_ids.borrow_mut().push(id);
+
+        unsafe {
+            if !pbshow.is_null() {
+                *pbshow = log.show.get().into();
+            }
+            if !pdwuielementid.is_null() {
+                *pdwuielementid = id;
+            }
+        }
+        Ok(())
+    }
+
+    fn UpdateUIElement(&self, _dwuielementid: u32) -> WinResult<()> {
+        let log = &self.ui_elements;
+        log.update_calls.set(log.update_calls.get() + 1);
+        Ok(())
+    }
+
+    fn EndUIElement(&self, dwuielementid: u32) -> WinResult<()> {
+        let log = &self.ui_elements;
+        log.end_calls.set(log.end_calls.get() + 1);
+        log.ended_ids.borrow_mut().push(dwuielementid);
+        Ok(())
+    }
+
+    fn GetUIElement(&self, _dwuielementid: u32) -> WinResult<ITfUIElement> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn EnumUIElements(&self) -> WinResult<IEnumTfUIElements> {
+        Err(E_NOTIMPL.into())
     }
 }
 

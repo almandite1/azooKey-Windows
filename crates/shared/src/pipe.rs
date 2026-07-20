@@ -173,7 +173,11 @@ mod tests {
         );
         // still a working read/write client
         assert_ne!(PIPE_CLIENT_ACCESS & FILE_GENERIC_READ.0, 0);
-        assert_ne!(PIPE_CLIENT_ACCESS & 0x0002, 0, "FILE_WRITE_DATA is retained");
+        assert_ne!(
+            PIPE_CLIENT_ACCESS & 0x0002,
+            0,
+            "FILE_WRITE_DATA is retained"
+        );
         // exactly (FILE_GENERIC_READ | FILE_GENERIC_WRITE) minus append
         assert_eq!(PIPE_CLIENT_ACCESS, 0x0012_019B);
     }

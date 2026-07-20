@@ -141,6 +141,27 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             tracing::warn!("langbar AddItem failed (non-fatal): {error:?}");
         }
 
+        tracing::debug!("Initialize input-mode compartments");
+        // Advisory: a host without ITfCompartmentMgr (or one that refuses the
+        // compartments) must still get a working IME.
+        let adopted = match self.init_compartments(&mut text_service) {
+            Ok(adopted) => adopted,
+            Err(error) => {
+                tracing::warn!("compartment setup failed (non-fatal): {error:?}");
+                None
+            }
+        };
+
+        // The OS held a mode from before this activation; adopt it so the
+        // user's choice survives a profile switch. Must happen after the
+        // borrow is released -- apply_input_mode re-enters the RefCell.
+        drop(text_service);
+        if let Some(mode) = adopted {
+            if let Err(error) = self.apply_input_mode(mode, false) {
+                tracing::warn!("adopting the compartment mode failed (non-fatal): {error:?}");
+            }
+        }
+
         tracing::debug!("Activate success");
 
         Ok(())
@@ -173,6 +194,12 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
 
         // end composition (releases the client-side handle even on failure)
         record(&mut first_error, self.end_composition());
+
+        // MANDATORY, not best-effort housekeeping: BeginUIElement made the
+        // host AddRef this object and hold it until EndUIElement. Leaving an
+        // element open across Deactivate pins the TIP in the host forever —
+        // the B15 leak shape all over again.
+        record(&mut first_error, self.ui_end());
 
         // key event sink + langbar removal need the thread manager
         match self.borrow() {
@@ -230,11 +257,25 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                     self.unadvise_text_layout_sink(&mut text_service),
                 );
 
+                tracing::debug!("UnadviseCompartmentSinks");
+                record(
+                    &mut first_error,
+                    self.unadvise_compartment_sinks(&mut text_service),
+                );
+
                 // clear display attribute
                 text_service.display_attribute_atom.clear();
 
                 text_service.tid = 0;
                 text_service.thread_mgr = None;
+                // The OS compartment is the durable store for the mode now,
+                // and the next Activate adopts it back, so the cached copy
+                // must not outlive this activation.
+                text_service.input_mode = crate::engine::input_mode::InputMode::default();
+                text_service.suppress_compartment_echo = false;
+                // a stale flag would otherwise be inherited by a plain
+                // Activate() that carries no flags of its own
+                text_service.activate_flags = 0;
                 // Also let go of the last document's context: handle_key
                 // re-sets it on every keystroke after the next Activate, and
                 // end_composition() above already ran, so nothing dereferences
@@ -272,11 +313,21 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
 
 impl ITfTextInputProcessorEx_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
-    fn ActivateEx(&self, ptim: Option<&ITfThreadMgr>, tid: u32, _dwflags: u32) -> Result<()> {
+    fn ActivateEx(&self, ptim: Option<&ITfThreadMgr>, tid: u32, dwflags: u32) -> Result<()> {
         // called when the text service is activated
         // if this function is implemented, the Activate() function won't be called
         // so we need to call the Activate function manually
-        tracing::debug!("Activated(Ex) with tid: {tid}");
+        tracing::debug!("Activated(Ex) with tid: {tid}, flags: {dwflags:#x}");
+
+        // Diagnostics only: UI suppression is decided by BeginUIElement's
+        // pbShow, never by an activation flag. Scope the borrow — Activate
+        // takes its own borrow_mut straight away.
+        {
+            if let Ok(mut text_service) = self.borrow_mut() {
+                text_service.activate_flags = dwflags;
+            }
+        }
+
         self.Activate(ptim, tid)?;
         Ok(())
     }

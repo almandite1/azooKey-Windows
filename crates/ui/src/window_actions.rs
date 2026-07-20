@@ -14,8 +14,11 @@ use tokio::task::JoinHandle;
 
 use crate::ipc::WindowAction;
 use crate::utils;
-use crate::window::{pin_topmost, set_visibility};
+use crate::window::{is_visible, notify_ime_event, pin_topmost, set_visibility};
 use crate::UserEvent;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EVENT_OBJECT_IME_CHANGE, EVENT_OBJECT_IME_HIDE, EVENT_OBJECT_IME_SHOW,
+};
 
 pub fn handle_window_action(
     action: WindowAction,
@@ -41,10 +44,16 @@ pub fn handle_window_action(
                 set_visibility(indicator_hwnd, false);
             }
 
-            set_visibility(candidate_window.hwnd(), true);
+            // only on a real transition: the TIP sends Show/Hide freely, and
+            // announcing every request buried listeners in redundant events
+            if !set_visibility(candidate_window.hwnd(), true) {
+                notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_SHOW);
+            }
         }
         WindowAction::Hide => {
-            set_visibility(candidate_window.hwnd(), false);
+            if set_visibility(candidate_window.hwnd(), false) {
+                notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_HIDE);
+            }
         }
         WindowAction::SetPosition {
             top,
@@ -63,6 +72,10 @@ pub fn handle_window_action(
             // off-screen near screen edges (B20)
             let (ix, iy) = utils::get_indicator_position(left, bottom, indicator_window);
             indicator_window.set_outer_position(PhysicalPosition::new(ix, iy));
+
+            if is_visible(candidate_window.hwnd()) {
+                notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_CHANGE);
+            }
         }
         WindowAction::SetCandidate { candidates } => {
             let max_len = utils::max_candidate_chars(&candidates);
@@ -86,6 +99,16 @@ pub fn handle_window_action(
                 serde_json::to_string(&candidates).unwrap_or_else(|_| "[]".to_string());
 
             let _ = proxy.send_event(UserEvent::UpdateCandidates(candidates));
+
+            // The window has already been resized here; the list contents
+            // land asynchronously once the webview runs the script.
+            //
+            // Only while visible: ending a composition sends hide_window()
+            // and then set_candidates(vec![]), which announced a CHANGE on a
+            // window that had just been hidden.
+            if is_visible(candidate_window.hwnd()) {
+                notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_CHANGE);
+            }
         }
         WindowAction::SetSelection { index } => {
             let _ = proxy.send_event(UserEvent::UpdateSelection(index));

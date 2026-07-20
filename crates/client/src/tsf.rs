@@ -1,3 +1,4 @@
+pub(super) mod compartment;
 pub(super) mod display_attribute;
 pub(super) mod edit_session;
 pub(super) mod factory;
@@ -10,3 +11,4 @@ pub(super) mod text_input_processor;
 pub(super) mod text_layout_sink;
 pub(super) mod text_service;
 pub(super) mod thread_mgr_event_sink;
+pub(super) mod ui_element;
