@@ -5,21 +5,47 @@ use crate::{
     globals::{DllModule, GUID_DISPLAY_ATTRIBUTE},
 };
 
-use super::factory::TextServiceFactory_Impl;
+use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 use windows::{
     core::Interface as _,
     Win32::{
         Foundation::BOOL,
         System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER},
         UI::TextServices::{
-            CLSID_TF_CategoryMgr, ITfCategoryMgr, ITfKeyEventSink, ITfKeystrokeMgr,
-            ITfLangBarItemButton, ITfLangBarItemMgr, ITfSource, ITfTextInputProcessorEx_Impl,
-            ITfTextInputProcessor_Impl, ITfThreadMgr, ITfThreadMgrEventSink,
+            CLSID_TF_CategoryMgr, ITfCategoryMgr, ITfKeyEventSink, ITfKeystrokeMgr, ITfSource,
+            ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
+            ITfThreadMgrEventSink,
         },
     },
 };
 
 use anyhow::Result;
+
+impl TextServiceFactory {
+    /// Advises the key-event sink — the lifeline every keystroke arrives
+    /// through. Paired with `unadvise_key_sink`; extracted from the inline
+    /// closures Activate and Deactivate each open-coded.
+    fn advise_key_sink(&self, thread_mgr: &ITfThreadMgr, tid: u32) -> Result<()> {
+        unsafe {
+            thread_mgr.cast::<ITfKeystrokeMgr>()?.AdviseKeyEventSink(
+                tid,
+                &self.this::<ITfKeyEventSink>()?,
+                BOOL::from(true),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Unadvises the key-event sink advised by `advise_key_sink`.
+    fn unadvise_key_sink(&self, thread_mgr: &ITfThreadMgr, tid: u32) -> Result<()> {
+        unsafe {
+            thread_mgr
+                .cast::<ITfKeystrokeMgr>()?
+                .UnadviseKeyEventSink(tid)?;
+        }
+        Ok(())
+    }
+}
 
 impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
@@ -69,16 +95,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // whose failure is fatal — undo tid/thread_mgr and the dll ref, and
         // report it.
         tracing::debug!("AdviseKeyEventSink");
-        if let Err(error) = (|| -> Result<()> {
-            unsafe {
-                thread_mgr.cast::<ITfKeystrokeMgr>()?.AdviseKeyEventSink(
-                    tid,
-                    &self.this::<ITfKeyEventSink>()?,
-                    BOOL::from(true),
-                )?;
-            }
-            Ok(())
-        })() {
+        if let Err(error) = self.advise_key_sink(&thread_mgr, tid) {
             tracing::error!("AdviseKeyEventSink failed; the TIP cannot receive keys: {error:?}");
             text_service.tid = 0;
             text_service.thread_mgr = None;
@@ -130,14 +147,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         }
 
         tracing::debug!("Initialize langbar");
-        if let Err(error) = (|| -> Result<()> {
-            unsafe {
-                thread_mgr
-                    .cast::<ITfLangBarItemMgr>()?
-                    .AddItem(&self.this::<ITfLangBarItemButton>()?)?;
-            }
-            Ok(())
-        })() {
+        if let Err(error) = self.add_langbar_item(&thread_mgr) {
             tracing::warn!("langbar AddItem failed (non-fatal): {error:?}");
         }
 
@@ -208,28 +218,11 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                     tracing::debug!("UnadviseKeyEventSink");
                     record(
                         &mut first_error,
-                        (|| -> Result<()> {
-                            unsafe {
-                                thread_mgr
-                                    .cast::<ITfKeystrokeMgr>()?
-                                    .UnadviseKeyEventSink(text_service.tid)?;
-                            }
-                            Ok(())
-                        })(),
+                        self.unadvise_key_sink(&thread_mgr, text_service.tid),
                     );
 
                     tracing::debug!("Remove langbar");
-                    record(
-                        &mut first_error,
-                        (|| -> Result<()> {
-                            unsafe {
-                                thread_mgr
-                                    .cast::<ITfLangBarItemMgr>()?
-                                    .RemoveItem(&self.this::<ITfLangBarItemButton>()?)?;
-                            }
-                            Ok(())
-                        })(),
-                    );
+                    record(&mut first_error, self.remove_langbar_item(&thread_mgr));
                 }
                 Err(error) => record(&mut first_error, Err(error)),
             },

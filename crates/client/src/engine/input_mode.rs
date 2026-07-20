@@ -1,10 +1,5 @@
 use crate::{engine::state::IMEState, tsf::factory::TextServiceFactory};
 
-use windows::{
-    core::Interface,
-    Win32::UI::TextServices::{ITfLangBarItemButton, ITfLangBarItemMgr},
-};
-
 use anyhow::Result;
 
 #[derive(Default, Clone, PartialEq, Debug)]
@@ -51,20 +46,10 @@ impl TextServiceFactory {
     }
 
     pub fn update_lang_bar(&self) -> Result<()> {
-        // change the icon of the language bar item
-        let text_service = self.borrow()?;
-        let thread_mgr = text_service.thread_mgr()?;
-
-        unsafe {
-            thread_mgr
-                .cast::<ITfLangBarItemMgr>()?
-                .RemoveItem(&self.this::<ITfLangBarItemButton>()?)?;
-
-            thread_mgr
-                .cast::<ITfLangBarItemMgr>()?
-                .AddItem(&self.this::<ITfLangBarItemButton>()?)?;
-        };
-
+        // refresh the icon by removing and re-adding the langbar item
+        let thread_mgr = self.borrow()?.thread_mgr()?;
+        self.remove_langbar_item(&thread_mgr)?;
+        self.add_langbar_item(&thread_mgr)?;
         Ok(())
     }
 }
