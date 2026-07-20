@@ -1,8 +1,20 @@
-use tao::window::Window;
 use windows::Win32::{
     Foundation::RECT,
     Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST},
 };
+
+/// The caret rectangle the TIP last reported (physical px, screen
+/// coordinates). Kept around so the candidate window can be re-clamped when
+/// it RESIZES: the window grows for longer candidates and taller lists after
+/// it was positioned, and clamping only at position time let the grown
+/// window overflow the work area (issue #3).
+#[derive(Clone, Copy, Debug)]
+pub struct CaretRect {
+    pub top: i32,
+    pub left: i32,
+    pub bottom: i32,
+    pub right: i32,
+}
 
 /// Logical (CSS px) width of the candidate window for the longest candidate,
 /// in characters. The webview lays out in CSS px, so this must be applied as
@@ -40,6 +52,10 @@ fn clamp_candidate_position(
     } else {
         y
     };
+    // A list taller than the space above the caret would flip right off the
+    // top edge; a clipped-at-the-top list at least keeps the first (most
+    // likely) candidates visible
+    let y = y.max(work.top);
 
     // If the right of the candidate window is hidden, show it to the left
     let mut x = if x + win_width > work.right {
@@ -87,38 +103,40 @@ fn work_area_near(rect: RECT) -> Option<RECT> {
     ok.then_some(monitor_info.rcWork)
 }
 
+/// Computes the candidate window's top-left for a caret rect and a WINDOW
+/// SIZE PASSED IN by the caller (physical px). The size is a parameter, not
+/// read from the window, because the interesting call sites are resizes:
+/// right after `set_inner_size` the window may not report its new size yet,
+/// and clamping against the stale one is what let the window overflow the
+/// screen edge (issue #3).
 pub fn get_candidate_window_position(
-    top: i32,
-    left: i32,
-    bottom: i32,
-    right: i32,
-    window: &Window,
+    caret: &CaretRect,
+    win_width: i32,
+    win_height: i32,
 ) -> (f64, f64) {
-    let x = left - 15;
-    let y = bottom;
+    let x = caret.left - 15;
+    let y = caret.bottom;
 
     let Some(work) = work_area_near(RECT {
-        left,
-        top,
-        right,
-        bottom,
+        left: caret.left,
+        top: caret.top,
+        right: caret.right,
+        bottom: caret.bottom,
     }) else {
         return (x as f64, y as f64);
     };
 
-    let (x, y) = clamp_candidate_position(
-        x,
-        y,
-        top,
-        window.inner_size().width as i32,
-        window.inner_size().height as i32,
-        &work,
-    );
+    let (x, y) = clamp_candidate_position(x, y, caret.top, win_width, win_height, &work);
 
     (x as f64, y as f64)
 }
 
-pub fn get_indicator_position(left: i32, bottom: i32, window: &Window) -> (f64, f64) {
+pub fn get_indicator_position(
+    left: i32,
+    bottom: i32,
+    win_width: i32,
+    win_height: i32,
+) -> (f64, f64) {
     let x = left - 45;
     let y = bottom;
 
@@ -131,13 +149,7 @@ pub fn get_indicator_position(left: i32, bottom: i32, window: &Window) -> (f64, 
         return (x as f64, y as f64);
     };
 
-    let (x, y) = clamp_indicator_position(
-        x,
-        y,
-        window.inner_size().width as i32,
-        window.inner_size().height as i32,
-        &work,
-    );
+    let (x, y) = clamp_indicator_position(x, y, win_width, win_height, &work);
 
     (x as f64, y as f64)
 }
@@ -180,6 +192,17 @@ mod tests {
         assert_eq!(
             clamp_candidate_position(100, 1000, 900, 300, 200, &WORK),
             (100, 700)
+        );
+    }
+
+    #[test]
+    fn candidate_flip_is_clamped_at_the_top_edge() {
+        // caret near the bottom (top 300, bottom 320) with an 800px list:
+        // 320 + 800 > 1040 flips it above to 300 - 800 = -500, which would
+        // put the first candidates off-screen — clamp to the top edge
+        assert_eq!(
+            clamp_candidate_position(100, 320, 300, 300, 800, &WORK),
+            (100, 0)
         );
     }
 

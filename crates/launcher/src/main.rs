@@ -268,8 +268,10 @@ async fn run_supervisor(exe: &'static str, prefix: &'static str, pipe_name: Stri
 /// Why a supervisor loop stopped.
 #[derive(Debug, PartialEq, Eq)]
 enum SuperviseOutcome {
-    /// The child exited cleanly and on purpose (e.g. the UI re-executing
-    /// itself with a UIAccess token). Nothing to recover.
+    /// The child exited cleanly and on purpose. Nothing to recover. (The
+    /// UIAccess re-exec no longer takes this path: the spawned ui.exe stays
+    /// alive as a shim that mirrors the UIAccess child's exit code, so this
+    /// supervisor keeps covering the process that actually draws the UI.)
     Exited,
     /// The child is unrecoverable — spawn failure, or a crash/hang loop that
     /// exhausted the restart budget. The launcher should stand down.

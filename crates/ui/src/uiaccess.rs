@@ -21,11 +21,17 @@ use windows::{
                 TH32CS_SNAPPROCESS,
             },
             Environment::GetCommandLineW,
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
             SystemServices::PRIVILEGE_SET_ALL_NECESSARY,
             Threading::{
-                CreateProcessAsUserW, ExitProcess, GetCurrentProcess, GetStartupInfoW, OpenProcess,
-                OpenProcessToken, SetThreadToken, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-                PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+                CreateProcessAsUserW, ExitProcess, GetCurrentProcess, GetExitCodeProcess,
+                GetStartupInfoW, OpenProcess, OpenProcessToken, ResumeThread, SetThreadToken,
+                TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED, INFINITE,
+                PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
             },
         },
     },
@@ -294,6 +300,9 @@ pub fn prepare_uiaccess_token() -> Result<()> {
 
     unsafe {
         GetStartupInfoW(&mut startup_info);
+        // CREATE_SUSPENDED: the child must not run before it is tied to the
+        // shim's kill-on-close job below — a child that starts first can
+        // outlive the whole supervision chain and squat on the pipe name
         let created = CreateProcessAsUserW(
             token_handle,
             None,
@@ -301,7 +310,7 @@ pub fn prepare_uiaccess_token() -> Result<()> {
             None,
             None,
             false,
-            PROCESS_CREATION_FLAGS::default(),
+            CREATE_SUSPENDED,
             None,
             None,
             &startup_info,
@@ -315,8 +324,87 @@ pub fn prepare_uiaccess_token() -> Result<()> {
         created?;
 
         println!("Process created with UIAccess token");
-        CloseHandle(process_info.hProcess)?;
-        CloseHandle(process_info.hThread)?;
-        ExitProcess(0);
+        run_as_supervision_shim(process_info)
     }
+}
+
+/// Keeps the pre-UIAccess process alive as a supervision shim for the
+/// re-executed child, mirroring the child's exit code. Never returns on the
+/// success path; an error means the child could not be started and the caller
+/// should fall back to running the UI itself, without UIAccess.
+///
+/// The launcher supervises by CHILD HANDLE: if this process just exited 0
+/// (as it used to), the supervisor read that as a deliberate shutdown and
+/// stopped — leaving the UIAccess child, the process actually drawing the
+/// candidate window, with no hang detection and no restarts. Staying alive
+/// keeps the launcher's watchdog aimed at something whose lifetime equals the
+/// real UI's:
+/// - child crashes → the shim exits with the same nonzero code → restart;
+/// - child hangs → its health pipe goes silent → the watchdog kills the shim
+///   → the job below tears the child down → restart;
+/// - launcher dies → its kill-on-close job kills the shim → same teardown.
+unsafe fn run_as_supervision_shim(process_info: PROCESS_INFORMATION) -> Result<()> {
+    // Tie the (still suspended) child to this shim's lifetime. A failure is
+    // not fatal — supervision still works via the exit-code mirror; only the
+    // die-with-the-shim guarantee is lost (same policy as the launcher's own
+    // job setup).
+    match create_kill_on_close_job() {
+        // the job handle is deliberately never closed: closing the last
+        // handle kills the child, so it must live exactly as long as this
+        // process
+        Ok(job) => {
+            if let Err(e) = AssignProcessToJobObject(job, process_info.hProcess) {
+                eprintln!(
+                    "UIAccess child could not be tied to the shim ({e}); it won't die with it"
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("shim job creation failed ({e}); the UIAccess child won't die with the shim")
+        }
+    }
+
+    if ResumeThread(process_info.hThread) == u32::MAX {
+        // the child never ran; clean it up and let the caller run without
+        // UIAccess instead of leaving a suspended zombie behind
+        let _ = TerminateProcess(process_info.hProcess, 1);
+        let _ = CloseHandle(process_info.hThread);
+        let _ = CloseHandle(process_info.hProcess);
+        anyhow::bail!("ResumeThread failed for the UIAccess child");
+    }
+    let _ = CloseHandle(process_info.hThread);
+
+    WaitForSingleObject(process_info.hProcess, INFINITE);
+    let mut code: u32 = 1;
+    if GetExitCodeProcess(process_info.hProcess, &mut code).is_err() {
+        // unknown outcome: report an abnormal exit so the launcher restarts
+        code = 1;
+    }
+    let _ = CloseHandle(process_info.hProcess);
+    ExitProcess(code);
+}
+
+/// A job object that kills its members when the last handle closes, exactly
+/// like the launcher's `CHILD_JOB`.
+unsafe fn create_kill_on_close_job() -> Result<HANDLE> {
+    let job = CreateJobObjectW(None, windows::core::PCWSTR::null())?;
+
+    let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+            LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    if let Err(e) = SetInformationJobObject(
+        job,
+        JobObjectExtendedLimitInformation,
+        &info as *const _ as *const c_void,
+        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+    ) {
+        let _ = CloseHandle(job);
+        return Err(e.into());
+    }
+
+    Ok(job)
 }

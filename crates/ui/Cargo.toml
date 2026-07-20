@@ -20,6 +20,9 @@ workspace = true
 features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Environment",
+    # the UIAccess supervision shim ties its re-exec child to a
+    # kill-on-close job, like the launcher does for its children
+    "Win32_System_JobObjects",
     # NotifyWinEvent, for the light-dismiss EVENT_OBJECT_IME_* notifications
     "Win32_UI_Accessibility",
     # this crate calls ShowWindow/SetWindowPos/SetWindowLongW directly; it

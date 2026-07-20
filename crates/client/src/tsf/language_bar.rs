@@ -40,6 +40,11 @@ const INFO: TF_LANGBARITEMINFO = TF_LANGBARITEMINFO {
 impl ITfLangBarItem_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn GetInfo(&self, p_info: *mut TF_LANGBARITEMINFO) -> Result<()> {
+        // a raw deref in a COM callback is a segfault, which catch_unwind
+        // cannot turn into an HRESULT (same guard as GetPageIndex)
+        if p_info.is_null() {
+            return Err(windows_core::Error::from_hresult(E_INVALIDARG).into());
+        }
         unsafe {
             *p_info = INFO;
         }
@@ -137,6 +142,11 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
 impl ITfSource_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn AdviseSink(&self, riid: *const GUID, punk: Option<&IUnknown>) -> Result<u32> {
+        // a raw deref in a COM callback is a segfault, which catch_unwind
+        // cannot turn into an HRESULT (same guard as GetPageIndex)
+        if riid.is_null() {
+            return Err(windows_core::Error::from_hresult(E_INVALIDARG).into());
+        }
         let riid = unsafe { *riid };
 
         if riid != ITfLangBarItemSink::IID {
