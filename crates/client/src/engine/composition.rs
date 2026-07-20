@@ -10,7 +10,7 @@ use super::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
     full_width::{to_fullwidth, to_fullwidth_ascii, to_halfwidth},
     input_mode::InputMode,
-    ipc_service::Candidates,
+    ipc_service::{Candidates, IPCService},
     state::IMEState,
     text_util::{to_half_katakana, to_katakana},
     transition::{
@@ -71,6 +71,70 @@ fn apply_selected_candidate(
     *preview = text;
     *suffix = sub_text;
     *raw_hiragana = candidates.hiragana.clone();
+}
+
+/// The mutable working copy `handle_action` edits while dispatching a batch
+/// of actions, then writes back to the live `Composition` in one shot.
+///
+/// Split out so each action is an ordinary `act_*` method taking `&mut
+/// CompositionEdit` instead of threading eight locals through a 300-line
+/// `match`. The write-back runs regardless of whether the batch succeeded,
+/// so a failed action still leaves the client consistent with the server
+/// (a mid-batch `?` used to skip the write-back and wedge input).
+struct CompositionEdit {
+    preview: String,
+    suffix: String,
+    raw_input: String,
+    raw_hiragana: String,
+    corresponding_count: i32,
+    candidates: Candidates,
+    selection_index: i32,
+    /// the state the composition moves to once the batch finishes
+    state: CompositionState,
+}
+
+impl CompositionEdit {
+    /// Snapshots the live composition into a working copy that transitions
+    /// to `state` on write-back.
+    fn from_composition(composition: &Composition, state: CompositionState) -> Self {
+        Self {
+            preview: composition.preview.clone(),
+            suffix: composition.suffix.clone(),
+            raw_input: composition.raw_input.clone(),
+            raw_hiragana: composition.raw_hiragana.clone(),
+            corresponding_count: composition.corresponding_count,
+            candidates: composition.candidates.clone(),
+            selection_index: composition.selection_index,
+            state,
+        }
+    }
+
+    /// Mirrors candidate `index` of `candidates` into the preview fields.
+    /// Method form of [`apply_selected_candidate`] operating on this working
+    /// copy — the learning hook still lives in that function.
+    fn adopt_candidate(&mut self, candidates: &Candidates, index: i32) {
+        apply_selected_candidate(
+            candidates,
+            index,
+            &mut self.preview,
+            &mut self.suffix,
+            &mut self.raw_hiragana,
+            &mut self.corresponding_count,
+        );
+    }
+
+    /// Writes the working copy back onto the live composition. Leaves
+    /// `tip_composition` alone — that handle is owned by start/end_composition.
+    fn write_back(self, composition: &mut Composition) {
+        composition.preview = self.preview;
+        composition.state = self.state;
+        composition.selection_index = self.selection_index;
+        composition.raw_input = self.raw_input;
+        composition.raw_hiragana = self.raw_hiragana;
+        composition.candidates = self.candidates;
+        composition.suffix = self.suffix;
+        composition.corresponding_count = self.corresponding_count;
+    }
 }
 
 impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
@@ -257,133 +321,40 @@ impl TextServiceFactory {
         actions: &[ClientAction],
         transition: CompositionState,
     ) -> Result<()> {
-        #[allow(clippy::let_and_return)]
         let (composition, mode) = {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?.clone();
-            let mode = text_service.input_mode.clone();
-            (composition, mode)
+            (composition, text_service.input_mode.clone())
         };
 
-        let mut preview = composition.preview.clone();
-        let mut suffix = composition.suffix.clone();
-        let mut raw_input = composition.raw_input.clone();
-        let mut raw_hiragana = composition.raw_hiragana.clone();
-        let mut corresponding_count = composition.corresponding_count;
-        let mut candidates = composition.candidates.clone();
-        let mut selection_index = composition.selection_index;
+        let mut edit = CompositionEdit::from_composition(&composition, transition);
         let mut ipc_service = IMEState::get()?
             .ipc_service
             .clone()
             .context("ipc_service is None")?;
-        let mut transition = transition;
 
-        self.update_context(&preview)?;
+        self.update_context(&edit.preview)?;
 
-        // the loop below is wrapped so that the state write-back at the end
-        // ALWAYS runs: an early return on a failed action used to skip it,
-        // desyncing the client composition from the server (stuck input)
-        let mut process = || -> Result<()> {
+        // wrapped so the write-back below ALWAYS runs: an early return on a
+        // failed action used to skip it, desyncing the client composition
+        // from the server (stuck input)
+        let result = (|| -> Result<()> {
             for action in actions {
                 match action {
                     ClientAction::StartComposition => {
-                        self.start_composition()?;
-                        // open after update_pos, so the host knows where the
-                        // caret is before deciding whether it draws
-                        self.update_pos()?;
-                        self.open_candidate_ui(&mut ipc_service);
+                        self.act_start_composition(&mut ipc_service)?
                     }
-                    ClientAction::EndComposition | ClientAction::CancelComposition => {
-                        // ending COMMITS whatever the range holds, so a
-                        // cancel must empty it first — Escape used to leave
-                        // the leftover reading committed (issue #35 family).
-                        //
-                        // Every teardown step below must run even when an
-                        // edit session fails: the old code bailed at the
-                        // first `?`, so a host that rejected the edit session
-                        // skipped clear_text and left the server's reading
-                        // alive. The next keystroke then appended to that old
-                        // reading and the previous composition's text
-                        // reappeared. Clear the client state and the server
-                        // unconditionally, then surface the failure.
-                        let mut edit_result = Ok(());
-                        if matches!(action, ClientAction::CancelComposition) {
-                            edit_result = self.set_text("", "");
-                        }
-                        // tear down the TSF composition regardless; even on a
-                        // failed session end_composition releases the
-                        // client-side handle
-                        edit_result = edit_result.and(self.end_composition());
-
-                        selection_index = 0;
-                        corresponding_count = 0;
-                        preview.clear();
-                        suffix.clear();
-                        raw_input.clear();
-                        raw_hiragana.clear();
-                        self.close_candidate_ui(&mut ipc_service);
-                        let clear_result = ipc_service.clear_text();
-
-                        // surface the first failure only after both the
-                        // client state and the server reading were cleared
-                        edit_result?;
-                        clear_result?;
+                    ClientAction::EndComposition => {
+                        self.act_end_composition(&mut edit, &mut ipc_service, false)?
+                    }
+                    ClientAction::CancelComposition => {
+                        self.act_end_composition(&mut edit, &mut ipc_service, true)?
                     }
                     ClientAction::AppendText(text) => {
-                        raw_input.push_str(text);
-
-                        let text = match mode {
-                            InputMode::Kana => to_fullwidth(text, false),
-                            InputMode::Latin => text.to_string(),
-                        };
-
-                        candidates = ipc_service.append_text(text.clone())?;
-                        apply_selected_candidate(
-                            &candidates,
-                            selection_index,
-                            &mut preview,
-                            &mut suffix,
-                            &mut raw_hiragana,
-                            &mut corresponding_count,
-                        );
-
-                        self.set_text(&preview, &suffix)?;
-                        self.publish_candidates(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
-                            CANDIDATES_CHANGED,
-                        )?;
+                        self.act_append_text(&mut edit, &mut ipc_service, &mode, text)?
                     }
                     ClientAction::RemoveText => {
-                        candidates = ipc_service.remove_text()?;
-                        // Backspace returns to Composing with a fresh, shorter
-                        // candidate list; a selection index carried over from
-                        // Previewing would point past the new list (blanking
-                        // the preview via the entry() fallback) or at the wrong
-                        // candidate. Reset to the top.
-                        selection_index = 0;
-                        apply_selected_candidate(
-                            &candidates,
-                            selection_index,
-                            &mut preview,
-                            &mut suffix,
-                            &mut raw_hiragana,
-                            &mut corresponding_count,
-                        );
-
-                        raw_input = raw_input
-                            .chars()
-                            .take(corresponding_count as usize)
-                            .collect();
-
-                        self.set_text(&preview, &suffix)?;
-                        self.publish_candidates(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
-                            CANDIDATES_CHANGED,
-                        )?;
+                        self.act_remove_text(&mut edit, &mut ipc_service)?
                     }
                     ClientAction::MoveCursor(_offset) => {
                         // Deliberate no-op for now: the MoveCursor RPC and the
@@ -393,151 +364,272 @@ impl TextServiceFactory {
                         // conversion feature, which needs cursor movement anyway.
                     }
                     ClientAction::SetIMEMode(mode) => {
-                        self.start_composition()?;
-                        self.update_pos()?;
-                        self.end_composition()?;
-
-                        // this arm clears the composition, so any candidate
-                        // element the host is holding is stale — and our own
-                        // window must hide with it. This arm used to call
-                        // ui_end alone and skip hide_window, leaving the
-                        // candidate window floating over a composition that
-                        // no longer existed (issue #21). Advisory on purpose:
-                        // propagating aborted the arm BEFORE apply_input_mode,
-                        // silently cancelling the mode switch itself.
-                        self.close_candidate_ui(&mut ipc_service);
-
-                        // publishes the mode to the langbar, the indicator,
-                        // and the OS compartments (so the touch keyboard,
-                        // IMM32 apps and the shell see it too)
-                        self.apply_input_mode(mode.clone(), true)?;
-
-                        selection_index = 0;
-                        corresponding_count = 0;
-                        preview.clear();
-                        suffix.clear();
-                        raw_input.clear();
-                        raw_hiragana.clear();
-                        ipc_service.clear_text()?;
+                        self.act_set_ime_mode(&mut edit, &mut ipc_service, mode)?
                     }
                     ClientAction::SetSelection(selection) => {
-                        let candidates = {
-                            let text_service = self.borrow()?;
-                            let composition = text_service.borrow_composition()?.clone();
-
-                            composition.candidates.clone()
-                        };
-
-                        let texts = candidates.texts.clone();
-
-                        // clamp lower bound first: on an empty list len() - 1 is
-                        // -1 and the later `as usize` cast would go out of bounds
-                        selection_index = match selection {
-                            SetSelectionType::Up => selection_index - 1,
-                            SetSelectionType::Down => selection_index + 1,
-                        }
-                        .clamp(0, max(0, texts.len() as i32 - 1));
-
-                        self.publish_candidates(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
-                            SELECTION_CHANGED,
-                        )?;
-                        apply_selected_candidate(
-                            &candidates,
-                            selection_index,
-                            &mut preview,
-                            &mut suffix,
-                            &mut raw_hiragana,
-                            &mut corresponding_count,
-                        );
-
-                        self.set_text(&preview, &suffix)?;
+                        self.act_set_selection(&mut edit, &mut ipc_service, selection)?
                     }
                     ClientAction::ShrinkText(text) => {
-                        // shrink text
-                        raw_input.push_str(text);
-                        raw_input = raw_input
-                            .chars()
-                            .skip(corresponding_count as usize)
-                            .collect();
-
-                        ipc_service.shrink_text(corresponding_count)?;
-                        let text = match mode {
-                            InputMode::Kana => to_fullwidth(text, false),
-                            InputMode::Latin => text.to_string(),
-                        };
-                        candidates = ipc_service.append_text(text)?;
-                        selection_index = 0;
-
-                        // shift_start needs the preview being replaced
-                        let previous_preview = preview.clone();
-                        apply_selected_candidate(
-                            &candidates,
-                            selection_index,
-                            &mut preview,
-                            &mut suffix,
-                            &mut raw_hiragana,
-                            &mut corresponding_count,
-                        );
-                        self.shift_start(&previous_preview, &preview)?;
-
-                        self.publish_candidates(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
-                            CANDIDATES_CHANGED,
-                        )?;
-                        self.update_pos()?;
-
-                        transition = CompositionState::Composing;
+                        self.act_shrink_text(&mut edit, &mut ipc_service, &mode, text)?
                     }
                     ClientAction::SetTextWithType(set_type) => {
-                        let text = match set_type {
-                            SetTextType::Hiragana => raw_hiragana.clone(),
-                            SetTextType::Katakana => to_katakana(&raw_hiragana),
-                            SetTextType::HalfKatakana => to_half_katakana(&raw_hiragana),
-                            SetTextType::FullLatin => to_fullwidth_ascii(&raw_input),
-                            SetTextType::HalfLatin => to_halfwidth(&raw_input),
-                        };
-
-                        self.set_text(&text, "")?;
-
-                        // sync the written-back state with what is now on
-                        // screen: the whole reading converted, no suffix
-                        // left. A stale preview made the next ShrinkText's
-                        // shift_start commit only the first
-                        // `old_preview.len()` units of the converted text,
-                        // and a stale suffix sent Enter down the
-                        // pending-suffix path instead of ending
-                        preview = text;
-                        suffix.clear();
-                        // the conversion covers every input element typed so
-                        // far, so a following ShrinkText must drop them all
-                        corresponding_count = raw_input.chars().count() as i32;
+                        self.act_set_text_with_type(&mut edit, set_type)?
                     }
                 }
             }
             Ok(())
-        };
-        let result = process();
+        })();
 
         // write back the state of the last successful action even when a
         // later action failed, keeping the client consistent with the server
         let text_service = self.borrow()?;
         let mut composition = text_service.borrow_mut_composition()?;
-
-        composition.preview = preview.clone();
-        composition.state = transition;
-        composition.selection_index = selection_index;
-        composition.raw_input = raw_input.clone();
-        composition.raw_hiragana = raw_hiragana.clone();
-        composition.candidates = candidates;
-        composition.suffix = suffix.clone();
-        composition.corresponding_count = corresponding_count;
-
+        edit.write_back(&mut composition);
         result
+    }
+
+    /// Begins a TSF composition and opens the candidate UI. `open_candidate_ui`
+    /// runs after `update_pos` so a UILess host knows where the caret is
+    /// before deciding whether it draws the candidates itself.
+    fn act_start_composition(&self, ipc_service: &mut IPCService) -> Result<()> {
+        self.start_composition()?;
+        self.update_pos()?;
+        self.open_candidate_ui(ipc_service);
+        Ok(())
+    }
+
+    /// Ends the composition (committing the range) or, when `cancel`, empties
+    /// it first — Escape used to leave the leftover reading committed (issue
+    /// #35 family).
+    ///
+    /// Every teardown step runs even when an edit session fails: the old code
+    /// bailed at the first `?`, so a host that rejected the edit session
+    /// skipped `clear_text` and left the server's reading alive; the next
+    /// keystroke appended to it and the previous composition's text
+    /// reappeared. Clear the client state and the server unconditionally,
+    /// then surface the first failure.
+    fn act_end_composition(
+        &self,
+        edit: &mut CompositionEdit,
+        ipc_service: &mut IPCService,
+        cancel: bool,
+    ) -> Result<()> {
+        let mut edit_result = Ok(());
+        if cancel {
+            edit_result = self.set_text("", "");
+        }
+        // tear down the TSF composition regardless; even on a failed session
+        // end_composition releases the client-side handle
+        edit_result = edit_result.and(self.end_composition());
+
+        edit.selection_index = 0;
+        edit.corresponding_count = 0;
+        edit.preview.clear();
+        edit.suffix.clear();
+        edit.raw_input.clear();
+        edit.raw_hiragana.clear();
+        self.close_candidate_ui(ipc_service);
+        let clear_result = ipc_service.clear_text();
+
+        // surface the first failure only after both the client state and the
+        // server reading were cleared
+        edit_result?;
+        clear_result?;
+        Ok(())
+    }
+
+    /// Feeds a keystroke to the engine and shows the fresh candidate list.
+    fn act_append_text(
+        &self,
+        edit: &mut CompositionEdit,
+        ipc_service: &mut IPCService,
+        mode: &InputMode,
+        text: &str,
+    ) -> Result<()> {
+        edit.raw_input.push_str(text);
+
+        let text = match mode {
+            InputMode::Kana => to_fullwidth(text, false),
+            InputMode::Latin => text.to_string(),
+        };
+
+        let candidates = ipc_service.append_text(text)?;
+        edit.adopt_candidate(&candidates, edit.selection_index);
+        edit.candidates = candidates;
+
+        self.set_text(&edit.preview, &edit.suffix)?;
+        self.publish_candidates(
+            ipc_service,
+            &edit.candidates,
+            edit.selection_index,
+            CANDIDATES_CHANGED,
+        )
+    }
+
+    /// Backspace: the engine returns a fresh, shorter list. A selection index
+    /// carried over from Previewing would point past the new list (blanking
+    /// the preview via the `entry()` fallback) or at the wrong candidate, so
+    /// reset to the top and shrink `raw_input` to what the new top covers.
+    fn act_remove_text(
+        &self,
+        edit: &mut CompositionEdit,
+        ipc_service: &mut IPCService,
+    ) -> Result<()> {
+        let candidates = ipc_service.remove_text()?;
+        edit.selection_index = 0;
+        edit.adopt_candidate(&candidates, edit.selection_index);
+        edit.candidates = candidates;
+
+        edit.raw_input = edit
+            .raw_input
+            .chars()
+            .take(edit.corresponding_count as usize)
+            .collect();
+
+        self.set_text(&edit.preview, &edit.suffix)?;
+        self.publish_candidates(
+            ipc_service,
+            &edit.candidates,
+            edit.selection_index,
+            CANDIDATES_CHANGED,
+        )
+    }
+
+    /// Switches the IME mode. Clears the composition and hides the candidate
+    /// window with it (issue #21). `apply_input_mode` is advisory on purpose:
+    /// propagating a teardown failure aborted the arm before it, silently
+    /// cancelling the mode switch itself.
+    fn act_set_ime_mode(
+        &self,
+        edit: &mut CompositionEdit,
+        ipc_service: &mut IPCService,
+        mode: &InputMode,
+    ) -> Result<()> {
+        self.start_composition()?;
+        self.update_pos()?;
+        self.end_composition()?;
+
+        self.close_candidate_ui(ipc_service);
+
+        // publishes the mode to the langbar, the indicator, and the OS
+        // compartments (so the touch keyboard, IMM32 apps and the shell see
+        // it too)
+        self.apply_input_mode(mode.clone(), true)?;
+
+        edit.selection_index = 0;
+        edit.corresponding_count = 0;
+        edit.preview.clear();
+        edit.suffix.clear();
+        edit.raw_input.clear();
+        edit.raw_hiragana.clear();
+        ipc_service.clear_text()?;
+        Ok(())
+    }
+
+    /// Moves the highlighted candidate up or down, clamped to the list.
+    fn act_set_selection(
+        &self,
+        edit: &mut CompositionEdit,
+        ipc_service: &mut IPCService,
+        selection: &SetSelectionType,
+    ) -> Result<()> {
+        let candidates = {
+            let text_service = self.borrow()?;
+            let composition = text_service.borrow_composition()?.clone();
+            composition.candidates.clone()
+        };
+
+        let texts = candidates.texts.clone();
+
+        // clamp lower bound first: on an empty list len() - 1 is -1 and the
+        // later `as usize` cast would go out of bounds
+        edit.selection_index = match selection {
+            SetSelectionType::Up => edit.selection_index - 1,
+            SetSelectionType::Down => edit.selection_index + 1,
+        }
+        .clamp(0, max(0, texts.len() as i32 - 1));
+
+        self.publish_candidates(
+            ipc_service,
+            &candidates,
+            edit.selection_index,
+            SELECTION_CHANGED,
+        )?;
+        edit.adopt_candidate(&candidates, edit.selection_index);
+
+        self.set_text(&edit.preview, &edit.suffix)
+    }
+
+    /// Confirms the selected candidate and keeps composing the remainder:
+    /// commits it with `shift_start`, drops the committed input elements, and
+    /// forces the state back to Composing for the fresh reading.
+    fn act_shrink_text(
+        &self,
+        edit: &mut CompositionEdit,
+        ipc_service: &mut IPCService,
+        mode: &InputMode,
+        text: &str,
+    ) -> Result<()> {
+        edit.raw_input.push_str(text);
+        edit.raw_input = edit
+            .raw_input
+            .chars()
+            .skip(edit.corresponding_count as usize)
+            .collect();
+
+        ipc_service.shrink_text(edit.corresponding_count)?;
+        let text = match mode {
+            InputMode::Kana => to_fullwidth(text, false),
+            InputMode::Latin => text.to_string(),
+        };
+        let candidates = ipc_service.append_text(text)?;
+        edit.selection_index = 0;
+
+        // shift_start needs the preview being replaced
+        let previous_preview = edit.preview.clone();
+        edit.adopt_candidate(&candidates, edit.selection_index);
+        self.shift_start(&previous_preview, &edit.preview)?;
+        edit.candidates = candidates;
+
+        self.publish_candidates(
+            ipc_service,
+            &edit.candidates,
+            edit.selection_index,
+            CANDIDATES_CHANGED,
+        )?;
+        self.update_pos()?;
+
+        edit.state = CompositionState::Composing;
+        Ok(())
+    }
+
+    /// F6–F10: rewrites the whole reading as hiragana/katakana/half-katakana/
+    /// full- or half-width latin, then syncs the written-back state with what
+    /// is now on screen — the whole reading converted, no suffix left. A stale
+    /// preview made the next ShrinkText's shift_start commit only the first
+    /// `old_preview.len()` units, and a stale suffix sent Enter down the
+    /// pending-suffix path instead of ending.
+    fn act_set_text_with_type(
+        &self,
+        edit: &mut CompositionEdit,
+        set_type: &SetTextType,
+    ) -> Result<()> {
+        let text = match set_type {
+            SetTextType::Hiragana => edit.raw_hiragana.clone(),
+            SetTextType::Katakana => to_katakana(&edit.raw_hiragana),
+            SetTextType::HalfKatakana => to_half_katakana(&edit.raw_hiragana),
+            SetTextType::FullLatin => to_fullwidth_ascii(&edit.raw_input),
+            SetTextType::HalfLatin => to_halfwidth(&edit.raw_input),
+        };
+
+        self.set_text(&text, "")?;
+
+        edit.preview = text;
+        edit.suffix.clear();
+        // the conversion covers every input element typed so far, so a
+        // following ShrinkText must drop them all
+        edit.corresponding_count = edit.raw_input.chars().count() as i32;
+        Ok(())
     }
 }
 
