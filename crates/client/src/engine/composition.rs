@@ -130,6 +130,37 @@ impl TextServiceFactory {
         Ok(())
     }
 
+    /// Opens the candidate UI for a new composition: asks the host first
+    /// (UILess), and shows our own window only when the host does not draw
+    /// the candidates itself. Advisory throughout — a host-side element
+    /// problem must not break typing, so on failure we fall back to our own
+    /// window (the pre-UILess behaviour).
+    ///
+    /// Counterpart of `close_candidate_ui`; the visibility transitions live
+    /// in this pair (and host-driven `ITfUIElement::Show`) only, so an arm
+    /// cannot forget one half of the teardown again (issue #21).
+    fn open_candidate_ui(&self, ipc_service: &mut crate::engine::ipc_service::IPCService) {
+        let show = self.ui_begin().unwrap_or_else(|error| {
+            tracing::warn!("ui_begin failed (non-fatal): {error:?}");
+            true
+        });
+        if show {
+            ipc_service.show_window();
+        }
+    }
+
+    /// Closes the candidate UI: releases the host's UI element (UILess) and
+    /// hides our own window, blanking the now-stale list. Everything here is
+    /// unconditional and advisory: hiding is safe even if we never showed,
+    /// and ui_end is a no-op with no live element.
+    fn close_candidate_ui(&self, ipc_service: &mut crate::engine::ipc_service::IPCService) {
+        if let Err(error) = self.ui_end() {
+            tracing::warn!("ui_end failed (non-fatal): {error:?}");
+        }
+        ipc_service.hide_window();
+        ipc_service.set_candidates(vec![]);
+    }
+
     /// Impure shell around the pure decision functions
     /// (engine::transition): reads the OS/COM state they need, decodes the
     /// key, and adapts the result. New key bindings belong in the
@@ -257,20 +288,10 @@ impl TextServiceFactory {
                 match action {
                     ClientAction::StartComposition => {
                         self.start_composition()?;
+                        // open after update_pos, so the host knows where the
+                        // caret is before deciding whether it draws
                         self.update_pos()?;
-                        // ask the host first -- after update_pos, so it knows
-                        // where the caret is before deciding. A host that
-                        // draws the candidates itself answers false and our
-                        // own window stays hidden.
-                        // advisory: if we cannot ask the host, show our own
-                        // window -- the pre-UILess behaviour
-                        let show = self.ui_begin().unwrap_or_else(|error| {
-                            tracing::warn!("ui_begin failed (non-fatal): {error:?}");
-                            true
-                        });
-                        if show {
-                            ipc_service.show_window();
-                        }
+                        self.open_candidate_ui(&mut ipc_service);
                     }
                     ClientAction::EndComposition | ClientAction::CancelComposition => {
                         // ending COMMITS whatever the range holds, so a
@@ -300,13 +321,7 @@ impl TextServiceFactory {
                         suffix.clear();
                         raw_input.clear();
                         raw_hiragana.clear();
-                        // unconditional: hiding is safe even if we never
-                        // showed, and ui_end is a no-op with no live element
-                        if let Err(error) = self.ui_end() {
-                            tracing::warn!("ui_end failed (non-fatal): {error:?}");
-                        }
-                        ipc_service.hide_window();
-                        ipc_service.set_candidates(vec![]);
+                        self.close_candidate_ui(&mut ipc_service);
                         let clear_result = ipc_service.clear_text();
 
                         // surface the first failure only after both the
@@ -383,21 +398,14 @@ impl TextServiceFactory {
                         self.end_composition()?;
 
                         // this arm clears the composition, so any candidate
-                        // element the host is holding is now stale.
-                        //
-                        // Advisory on purpose: propagating here aborted the
-                        // arm BEFORE apply_input_mode, so a failure to tear
-                        // down the element silently cancelled the mode
-                        // switch itself -- the user just could not leave the
-                        // current mode.
-                        //
-                        // (Pre-existing gap, left alone here: unlike the
-                        // End/CancelComposition arm this one never sends
-                        // hide_window, so our own window relies on the next
-                        // composition to reposition it.)
-                        if let Err(error) = self.ui_end() {
-                            tracing::warn!("ui_end failed (non-fatal): {error:?}");
-                        }
+                        // element the host is holding is stale — and our own
+                        // window must hide with it. This arm used to call
+                        // ui_end alone and skip hide_window, leaving the
+                        // candidate window floating over a composition that
+                        // no longer existed (issue #21). Advisory on purpose:
+                        // propagating aborted the arm BEFORE apply_input_mode,
+                        // silently cancelling the mode switch itself.
+                        self.close_candidate_ui(&mut ipc_service);
 
                         // publishes the mode to the langbar, the indicator,
                         // and the OS compartments (so the touch keyboard,
@@ -538,11 +546,362 @@ impl TextServiceFactory {
 mod tests {
     use super::*;
     use crate::engine::client_action::SetTextType;
-    use crate::engine::ipc_service::IPCService;
+    use crate::engine::ipc_service::{FakeIpc, IPCService, IpcCall};
     use crate::tsf::test_support::{
         factory_with_fake_context, global_state_lock, EditSessionBehavior, FakeComposition,
     };
+    use std::sync::{Arc, Mutex};
     use windows::core::AsImpl as _;
+
+    /// Installs a recording IPC service into the global state and scripts
+    /// the candidates the engine RPCs answer with. Callers must hold
+    /// `global_state_lock` and reset `ipc_service` to `None` when done.
+    fn install_fake_ipc(scripted: Candidates) -> Arc<Mutex<FakeIpc>> {
+        let (service, fake) = IPCService::new_fake().unwrap();
+        fake.lock().unwrap().scripted_candidates = scripted;
+        IMEState::get().unwrap().ipc_service = Some(service);
+        fake
+    }
+
+    fn scripted(texts: &[&str], hiragana: &str, counts: &[i32]) -> Candidates {
+        Candidates {
+            texts: texts.iter().map(|s| s.to_string()).collect(),
+            sub_texts: texts.iter().map(|_| String::new()).collect(),
+            hiragana: hiragana.to_string(),
+            corresponding_count: counts.to_vec(),
+        }
+    }
+
+    fn recorded_calls(fake: &Arc<Mutex<FakeIpc>>) -> Vec<IpcCall> {
+        fake.lock().unwrap().calls.clone()
+    }
+
+    /// AppendText is the main typing path: the engine's answer must become
+    /// the written-back preview state, and the candidate list must be
+    /// published to the window (full CANDIDATES_CHANGED: list AND selection).
+    #[test]
+    fn append_text_applies_the_engine_answer_and_publishes_the_list() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(scripted(&["水", "未"], "みず", &[4, 4]));
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = unsafe { tip.as_impl() };
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Composing;
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        factory
+            .handle_action(
+                &[ClientAction::AppendText("mi".to_string())],
+                CompositionState::Composing,
+            )
+            .unwrap();
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(composition.preview, "水");
+        assert_eq!(composition.raw_input, "mi");
+        assert_eq!(composition.raw_hiragana, "みず");
+        assert_eq!(composition.corresponding_count, 4);
+        assert_eq!(composition.candidates.texts, vec!["水", "未"]);
+        drop(composition);
+        drop(text_service);
+
+        let calls = recorded_calls(&fake);
+        assert!(calls.contains(&IpcCall::AppendText("mi".to_string())));
+        assert!(
+            calls.contains(&IpcCall::SetCandidates(vec![
+                "水".to_string(),
+                "未".to_string()
+            ])),
+            "a CANDIDATES_CHANGED update must push the new list to the window: {calls:?}"
+        );
+        assert!(calls.contains(&IpcCall::SetSelection(0)));
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// Backspace returns to Composing with a fresh, shorter list: a
+    /// selection index carried over from Previewing pointed past the new
+    /// list (or at the wrong candidate), so it must reset to the top, and
+    /// raw_input must shrink to what the new top candidate covers.
+    #[test]
+    fn remove_text_resets_the_selection_and_truncates_raw_input() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(scripted(&["水"], "みず", &[4]));
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = unsafe { tip.as_impl() };
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Previewing;
+            composition.selection_index = 3;
+            composition.raw_input = "mizuu".to_string();
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        factory
+            .handle_action(&[ClientAction::RemoveText], CompositionState::Composing)
+            .unwrap();
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(
+            composition.selection_index, 0,
+            "a stale Previewing selection must not survive Backspace"
+        );
+        assert_eq!(
+            composition.raw_input, "mizu",
+            "raw_input must shrink to the new top candidate's corresponding count"
+        );
+        drop(composition);
+        drop(text_service);
+
+        assert!(recorded_calls(&fake).contains(&IpcCall::RemoveText));
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// Confirm-and-continue: ShrinkText commits the selected candidate
+    /// (shift_start with the OLD preview), drops the committed input
+    /// elements from raw_input, and forces the state back to Composing
+    /// regardless of what the caller passed.
+    #[test]
+    fn shrink_text_commits_and_returns_to_composing() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(scripted(&["ん"], "ん", &[1]));
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = unsafe { tip.as_impl() };
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Previewing;
+            composition.preview = "水".to_string();
+            composition.raw_input = "mizu".to_string();
+            composition.corresponding_count = 4;
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        factory
+            .handle_action(
+                &[ClientAction::ShrinkText("n".to_string())],
+                CompositionState::Previewing,
+            )
+            .unwrap();
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(
+            composition.state,
+            CompositionState::Composing,
+            "the arm must force Composing for the fresh reading"
+        );
+        assert_eq!(
+            composition.raw_input, "n",
+            "the committed input elements must be dropped"
+        );
+        assert_eq!(composition.selection_index, 0);
+        drop(composition);
+        drop(text_service);
+
+        let calls = recorded_calls(&fake);
+        let shrink = calls
+            .iter()
+            .position(|c| *c == IpcCall::ShrinkText(4))
+            .expect("shrink_text must be sent with the committed element count");
+        let append = calls
+            .iter()
+            .position(|c| *c == IpcCall::AppendText("n".to_string()))
+            .expect("the new keystroke must be appended");
+        assert!(
+            shrink < append,
+            "the server must commit BEFORE the new reading starts: {calls:?}"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// Candidate navigation clamps at both ends (an empty list included —
+    /// the lower clamp guards the later `as usize` cast) and publishes a
+    /// SELECTION_CHANGED update: selection only, never the list itself.
+    #[test]
+    fn set_selection_clamps_and_publishes_only_the_selection() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(Candidates::default());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = unsafe { tip.as_impl() };
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Previewing;
+            composition.candidates = scripted(&["a", "b", "c"], "あ", &[1, 1, 1]);
+            composition.selection_index = 2;
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        // Down at the last candidate must stay clamped there
+        factory
+            .handle_action(
+                &[ClientAction::SetSelection(SetSelectionType::Down)],
+                CompositionState::Previewing,
+            )
+            .unwrap();
+        {
+            let text_service = factory.borrow().unwrap();
+            let composition = text_service.borrow_composition().unwrap();
+            assert_eq!(composition.selection_index, 2, "Down must clamp at len-1");
+        }
+
+        // Up three times from index 2 must clamp at 0, not go negative
+        for _ in 0..3 {
+            factory
+                .handle_action(
+                    &[ClientAction::SetSelection(SetSelectionType::Up)],
+                    CompositionState::Previewing,
+                )
+                .unwrap();
+        }
+        {
+            let text_service = factory.borrow().unwrap();
+            let composition = text_service.borrow_composition().unwrap();
+            assert_eq!(composition.selection_index, 0, "Up must clamp at 0");
+        }
+
+        let calls = recorded_calls(&fake);
+        assert!(calls.contains(&IpcCall::SetSelection(2)));
+        assert!(
+            !calls.iter().any(|c| matches!(c, IpcCall::SetCandidates(_))),
+            "SELECTION_CHANGED must not re-send the candidate list: {calls:?}"
+        );
+
+        // an empty list must not panic and must stay at 0
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.candidates = Candidates::default();
+            composition.selection_index = 0;
+        }
+        factory
+            .handle_action(
+                &[ClientAction::SetSelection(SetSelectionType::Down)],
+                CompositionState::Previewing,
+            )
+            .unwrap();
+        {
+            let text_service = factory.borrow().unwrap();
+            let composition = text_service.borrow_composition().unwrap();
+            assert_eq!(composition.selection_index, 0);
+        }
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// Ending a composition must tear the candidate UI down over IPC:
+    /// hide the window, blank the stale list, and clear the server reading.
+    #[test]
+    fn end_composition_tears_down_the_candidate_ui() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(Candidates::default());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = unsafe { tip.as_impl() };
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Composing;
+            composition.preview = "水".to_string();
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        factory
+            .handle_action(&[ClientAction::EndComposition], CompositionState::None)
+            .unwrap();
+
+        let calls = recorded_calls(&fake);
+        assert!(calls.contains(&IpcCall::HideWindow), "{calls:?}");
+        assert!(
+            calls.contains(&IpcCall::SetCandidates(vec![])),
+            "the stale list must be blanked: {calls:?}"
+        );
+        assert!(
+            calls.contains(&IpcCall::ClearText),
+            "the server reading must be cleared: {calls:?}"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// Switching the IME mode clears the composition, so the candidate
+    /// window must hide with it. This arm used to call ui_end alone and
+    /// skip hide_window (issue #21), leaving our window floating over a
+    /// composition that no longer existed.
+    ///
+    /// The teardown runs before apply_input_mode, whose langbar update
+    /// needs a thread manager this fake environment does not provide — the
+    /// arm therefore errors afterwards, which is exactly why the teardown
+    /// must already have happened by then.
+    #[test]
+    fn set_ime_mode_hides_the_candidate_window() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(Candidates::default());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = unsafe { tip.as_impl() };
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Composing;
+            composition.preview = "わたし".to_string();
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        let _ = factory.handle_action(
+            &[ClientAction::SetIMEMode(InputMode::Kana)],
+            CompositionState::None,
+        );
+
+        let calls = recorded_calls(&fake);
+        assert!(
+            calls.contains(&IpcCall::HideWindow),
+            "a mode switch must hide the candidate window (issue #21): {calls:?}"
+        );
+        assert!(
+            calls.contains(&IpcCall::SetCandidates(vec![])),
+            "the stale list must be blanked on a mode switch: {calls:?}"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// Starting a composition asks the host first (UILess); a host without
+    /// a UI element manager wants our own window shown.
+    #[test]
+    fn start_composition_shows_our_window_without_a_uiless_host() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(Candidates::default());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = unsafe { tip.as_impl() };
+
+        factory
+            .handle_action(
+                &[ClientAction::StartComposition],
+                CompositionState::Composing,
+            )
+            .unwrap();
+
+        assert!(
+            recorded_calls(&fake).contains(&IpcCall::ShowWindow),
+            "no UILess host answered, so our own window must be shown"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
 
     /// After F6–F10 (SetTextWithType) the written-back composition state must
     /// describe what is actually on screen: the converted reading as the
