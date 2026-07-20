@@ -207,6 +207,35 @@ pub(super) fn selected_range(
 }
 
 impl TextServiceFactory {
+    /// Shared skeleton for edit sessions that operate on the LIVE
+    /// composition: borrows the service and, when no composition is
+    /// started, warns and no-ops — a missing composition is a normal race
+    /// (e.g. the host tore it down first), not an error. `build` receives
+    /// the borrowed service and the live composition handle, captures what
+    /// the session body needs, and returns the body to run.
+    ///
+    /// Every composition-mutating path (set_text / shift_start /
+    /// end_composition — and future ones like MoveCursor) goes through
+    /// here, so the guard, the tid/context plumbing and the warn stay in
+    /// one place.
+    fn with_live_composition(
+        &self,
+        build: impl FnOnce(
+            &crate::tsf::text_service::TextService,
+            ITfComposition,
+        ) -> Result<Rc<dyn Fn(u32) -> Result<()>>>,
+    ) -> Result<()> {
+        let text_service = self.borrow()?;
+        let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() else {
+            tracing::warn!("Composition is not started");
+            return Ok(());
+        };
+
+        let callback = build(&text_service, composition)?;
+        edit_session(text_service.tid, text_service.context()?, callback)?;
+        Ok(())
+    }
+
     #[tracing::instrument]
     pub fn start_composition(&self) -> Result<()> {
         tracing::debug!("start_composition");
@@ -262,144 +291,103 @@ impl TextServiceFactory {
     #[tracing::instrument]
     pub fn end_composition(&self) -> Result<()> {
         tracing::debug!("end_composition");
-        let text_service = self.borrow()?;
 
-        let result =
-            if let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() {
-                edit_session(
-                    text_service.tid,
-                    text_service.context()?,
-                    Rc::new({
-                        let context = text_service.context::<ITfContext>()?;
+        let result = self.with_live_composition(|text_service, composition| {
+            let context = text_service.context::<ITfContext>()?;
 
-                        move |cookie| unsafe {
-                            let range: ITfRange = composition.GetRange()?;
+            Ok(Rc::new(move |cookie: u32| unsafe {
+                let range: ITfRange = composition.GetRange()?;
 
-                            // re-write the full text without the composition's
-                            // display attribute (B23: read it whole, not the
-                            // first 1024 units)
-                            let text = read_range_text(&range, cookie)?;
-                            range.SetText(cookie, TF_ST_CORRECTION, &text)?;
+                // re-write the full text without the composition's
+                // display attribute (B23: read it whole, not the
+                // first 1024 units)
+                let text = read_range_text(&range, cookie)?;
+                range.SetText(cookie, TF_ST_CORRECTION, &text)?;
 
-                            let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
-                            prop.Clear(cookie, &range)?;
+                let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+                prop.Clear(cookie, &range)?;
 
-                            caret_to_end(&context, cookie, &range)?;
+                caret_to_end(&context, cookie, &range)?;
 
-                            composition.EndComposition(cookie)?;
-                            Ok(())
-                        }
-                    }),
-                )
-                .map(|_| ())
-            } else {
-                tracing::warn!("Composition is not started");
+                composition.EndComposition(cookie)?;
                 Ok(())
-            };
+            }) as Rc<dyn Fn(u32) -> Result<()>>)
+        });
 
         // whether or not the TSF side could be ended, the client must let
         // go: keeping a handle to a dead composition wedges every later
         // start_composition
-        text_service.borrow_mut_composition()?.tip_composition = None;
+        self.borrow()?.borrow_mut_composition()?.tip_composition = None;
 
         result
     }
 
     #[tracing::instrument]
     pub fn set_text(&self, text: &str, subtext: &str) -> Result<()> {
-        let text_service = self.borrow()?;
+        self.with_live_composition(|text_service, composition| {
+            // TSF measures ranges in UTF-16 code units (like ACP
+            // offsets); chars() would undercount non-BMP characters
+            let text_len = text.encode_utf16().count() as i32;
 
-        if let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() {
-            edit_session(
-                text_service.tid,
-                text_service.context()?,
-                Rc::new({
-                    // TSF measures ranges in UTF-16 code units (like ACP
-                    // offsets); chars() would undercount non-BMP characters
-                    let text_len = text.encode_utf16().count() as i32;
+            // unpadded is all you need!
+            let text = format!("{text}{subtext}").as_str().to_wide_16_unpadded();
+            let context = text_service.context::<ITfContext>()?;
+            let display_attribute_atom = text_service.display_attribute_atom.clone();
 
-                    // unpadded is all you need!
-                    let text = format!("{text}{subtext}").as_str().to_wide_16_unpadded();
-                    let context = text_service.context::<ITfContext>()?;
-                    let display_attribute_atom = text_service.display_attribute_atom.clone();
+            Ok(Rc::new(move |cookie: u32| unsafe {
+                let range = composition.GetRange()?;
+                range.SetText(cookie, TF_ST_CORRECTION, &text)?;
 
-                    move |cookie| unsafe {
-                        let range = composition.GetRange()?;
-                        range.SetText(cookie, TF_ST_CORRECTION, &text)?;
+                // mark only the "text" part (not the subtext) with
+                // the display attribute
+                let text_range = range.Clone()?;
+                text_range.Collapse(cookie, TF_ANCHOR_START)?;
+                let mut shifted: i32 = 0;
+                text_range.ShiftEnd(cookie, text_len, &mut shifted, std::ptr::null())?;
+                apply_display_attribute(&context, cookie, &text_range, &display_attribute_atom)?;
 
-                        // mark only the "text" part (not the subtext) with
-                        // the display attribute
-                        let text_range = range.Clone()?;
-                        text_range.Collapse(cookie, TF_ANCHOR_START)?;
-                        let mut shifted: i32 = 0;
-                        text_range.ShiftEnd(cookie, text_len, &mut shifted, std::ptr::null())?;
-                        apply_display_attribute(
-                            &context,
-                            cookie,
-                            &text_range,
-                            &display_attribute_atom,
-                        )?;
+                caret_to_end(&context, cookie, &range)?;
 
-                        caret_to_end(&context, cookie, &range)?;
-
-                        Ok(())
-                    }
-                }),
-            )?;
-        } else {
-            tracing::warn!("Composition is not started");
-        }
-
-        Ok(())
+                Ok(())
+            }) as Rc<dyn Fn(u32) -> Result<()>>)
+        })
     }
 
     #[tracing::instrument]
     pub fn shift_start(&self, text: &str, subtext: &str) -> Result<()> {
-        let text_service = self.borrow()?;
+        self.with_live_composition(|text_service, composition| {
+            // UTF-16 code units, not chars: a boundary computed with
+            // chars() lands inside a surrogate pair on confirm and
+            // the following SetText corrupts committed text
+            let text_len = text.encode_utf16().count() as i32;
+            let subtext = subtext.to_wide_16_unpadded();
+            let context = text_service.context::<ITfContext>()?;
+            let display_attribute_atom = text_service.display_attribute_atom.clone();
 
-        if let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() {
-            edit_session(
-                text_service.tid,
-                text_service.context()?,
-                Rc::new({
-                    // UTF-16 code units, not chars: a boundary computed with
-                    // chars() lands inside a surrogate pair on confirm and
-                    // the following SetText corrupts committed text
-                    let text_len = text.encode_utf16().count() as i32;
-                    let subtext = subtext.to_wide_16_unpadded();
-                    let context = text_service.context::<ITfContext>()?;
-                    let display_attribute_atom = text_service.display_attribute_atom.clone();
+            Ok(Rc::new(move |cookie: u32| unsafe {
+                // first, shift the start of the composition
+                let range = composition.GetRange()?;
+                let mut shifted: i32 = 0;
 
-                    move |cookie| unsafe {
-                        // first, shift the start of the composition
-                        let range = composition.GetRange()?;
-                        let mut shifted: i32 = 0;
+                // and clear the display attribute
+                let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+                prop.Clear(cookie, &range)?;
 
-                        // and clear the display attribute
-                        let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
-                        prop.Clear(cookie, &range)?;
+                range.Collapse(cookie, TF_ANCHOR_START)?;
+                range.ShiftStart(cookie, text_len, &mut shifted, std::ptr::null())?;
 
-                        range.Collapse(cookie, TF_ANCHOR_START)?;
-                        range.ShiftStart(cookie, text_len, &mut shifted, std::ptr::null())?;
+                composition.ShiftStart(cookie, &range)?;
 
-                        composition.ShiftStart(cookie, &range)?;
+                // then, write the remaining subtext and re-mark it
+                let range = composition.GetRange()?;
+                range.SetText(cookie, TF_ST_CORRECTION, &subtext)?;
+                apply_display_attribute(&context, cookie, &range, &display_attribute_atom)?;
 
-                        // then, write the remaining subtext and re-mark it
-                        let range = composition.GetRange()?;
-                        range.SetText(cookie, TF_ST_CORRECTION, &subtext)?;
-                        apply_display_attribute(&context, cookie, &range, &display_attribute_atom)?;
+                caret_to_end(&context, cookie, &range)?;
 
-                        caret_to_end(&context, cookie, &range)?;
-
-                        Ok(())
-                    }
-                }),
-            )?;
-        } else {
-            tracing::warn!("Composition is not started");
-        }
-
-        Ok(())
+                Ok(())
+            }) as Rc<dyn Fn(u32) -> Result<()>>)
+        })
     }
 
     #[tracing::instrument]
