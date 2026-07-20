@@ -130,6 +130,37 @@ impl TextServiceFactory {
         Ok(())
     }
 
+    /// Opens the candidate UI for a new composition: asks the host first
+    /// (UILess), and shows our own window only when the host does not draw
+    /// the candidates itself. Advisory throughout — a host-side element
+    /// problem must not break typing, so on failure we fall back to our own
+    /// window (the pre-UILess behaviour).
+    ///
+    /// Counterpart of `close_candidate_ui`; the visibility transitions live
+    /// in this pair (and host-driven `ITfUIElement::Show`) only, so an arm
+    /// cannot forget one half of the teardown again (issue #21).
+    fn open_candidate_ui(&self, ipc_service: &mut crate::engine::ipc_service::IPCService) {
+        let show = self.ui_begin().unwrap_or_else(|error| {
+            tracing::warn!("ui_begin failed (non-fatal): {error:?}");
+            true
+        });
+        if show {
+            ipc_service.show_window();
+        }
+    }
+
+    /// Closes the candidate UI: releases the host's UI element (UILess) and
+    /// hides our own window, blanking the now-stale list. Everything here is
+    /// unconditional and advisory: hiding is safe even if we never showed,
+    /// and ui_end is a no-op with no live element.
+    fn close_candidate_ui(&self, ipc_service: &mut crate::engine::ipc_service::IPCService) {
+        if let Err(error) = self.ui_end() {
+            tracing::warn!("ui_end failed (non-fatal): {error:?}");
+        }
+        ipc_service.hide_window();
+        ipc_service.set_candidates(vec![]);
+    }
+
     /// Impure shell around the pure decision functions
     /// (engine::transition): reads the OS/COM state they need, decodes the
     /// key, and adapts the result. New key bindings belong in the
@@ -257,20 +288,10 @@ impl TextServiceFactory {
                 match action {
                     ClientAction::StartComposition => {
                         self.start_composition()?;
+                        // open after update_pos, so the host knows where the
+                        // caret is before deciding whether it draws
                         self.update_pos()?;
-                        // ask the host first -- after update_pos, so it knows
-                        // where the caret is before deciding. A host that
-                        // draws the candidates itself answers false and our
-                        // own window stays hidden.
-                        // advisory: if we cannot ask the host, show our own
-                        // window -- the pre-UILess behaviour
-                        let show = self.ui_begin().unwrap_or_else(|error| {
-                            tracing::warn!("ui_begin failed (non-fatal): {error:?}");
-                            true
-                        });
-                        if show {
-                            ipc_service.show_window();
-                        }
+                        self.open_candidate_ui(&mut ipc_service);
                     }
                     ClientAction::EndComposition | ClientAction::CancelComposition => {
                         // ending COMMITS whatever the range holds, so a
@@ -300,13 +321,7 @@ impl TextServiceFactory {
                         suffix.clear();
                         raw_input.clear();
                         raw_hiragana.clear();
-                        // unconditional: hiding is safe even if we never
-                        // showed, and ui_end is a no-op with no live element
-                        if let Err(error) = self.ui_end() {
-                            tracing::warn!("ui_end failed (non-fatal): {error:?}");
-                        }
-                        ipc_service.hide_window();
-                        ipc_service.set_candidates(vec![]);
+                        self.close_candidate_ui(&mut ipc_service);
                         let clear_result = ipc_service.clear_text();
 
                         // surface the first failure only after both the
@@ -383,21 +398,14 @@ impl TextServiceFactory {
                         self.end_composition()?;
 
                         // this arm clears the composition, so any candidate
-                        // element the host is holding is now stale.
-                        //
-                        // Advisory on purpose: propagating here aborted the
-                        // arm BEFORE apply_input_mode, so a failure to tear
-                        // down the element silently cancelled the mode
-                        // switch itself -- the user just could not leave the
-                        // current mode.
-                        //
-                        // (Pre-existing gap, left alone here: unlike the
-                        // End/CancelComposition arm this one never sends
-                        // hide_window, so our own window relies on the next
-                        // composition to reposition it.)
-                        if let Err(error) = self.ui_end() {
-                            tracing::warn!("ui_end failed (non-fatal): {error:?}");
-                        }
+                        // element the host is holding is stale — and our own
+                        // window must hide with it. This arm used to call
+                        // ui_end alone and skip hide_window, leaving the
+                        // candidate window floating over a composition that
+                        // no longer existed (issue #21). Advisory on purpose:
+                        // propagating aborted the arm BEFORE apply_input_mode,
+                        // silently cancelling the mode switch itself.
+                        self.close_candidate_ui(&mut ipc_service);
 
                         // publishes the mode to the langbar, the indicator,
                         // and the OS compartments (so the touch keyboard,
@@ -823,6 +831,48 @@ mod tests {
         assert!(
             calls.contains(&IpcCall::ClearText),
             "the server reading must be cleared: {calls:?}"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// Switching the IME mode clears the composition, so the candidate
+    /// window must hide with it. This arm used to call ui_end alone and
+    /// skip hide_window (issue #21), leaving our window floating over a
+    /// composition that no longer existed.
+    ///
+    /// The teardown runs before apply_input_mode, whose langbar update
+    /// needs a thread manager this fake environment does not provide — the
+    /// arm therefore errors afterwards, which is exactly why the teardown
+    /// must already have happened by then.
+    #[test]
+    fn set_ime_mode_hides_the_candidate_window() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(Candidates::default());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = unsafe { tip.as_impl() };
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Composing;
+            composition.preview = "わたし".to_string();
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        let _ = factory.handle_action(
+            &[ClientAction::SetIMEMode(InputMode::Kana)],
+            CompositionState::None,
+        );
+
+        let calls = recorded_calls(&fake);
+        assert!(
+            calls.contains(&IpcCall::HideWindow),
+            "a mode switch must hide the candidate window (issue #21): {calls:?}"
+        );
+        assert!(
+            calls.contains(&IpcCall::SetCandidates(vec![])),
+            "the stale list must be blanked on a mode switch: {calls:?}"
         );
 
         IMEState::get().unwrap().ipc_service = None;
