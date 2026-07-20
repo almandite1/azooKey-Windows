@@ -5,9 +5,9 @@ use windows::{
         System::Ole::CONNECT_E_CANNOTCONNECT,
         UI::{
             TextServices::{
-                ITfLangBarItemButton_Impl, ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu,
-                ITfSource_Impl, TfLBIClick, GUID_LBI_INPUTMODE, TF_LANGBARITEMINFO,
-                TF_LBI_STYLE_BTN_BUTTON,
+                ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
+                ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu, ITfSource_Impl, ITfThreadMgr,
+                TfLBIClick, GUID_LBI_INPUTMODE, TF_LANGBARITEMINFO, TF_LBI_STYLE_BTN_BUTTON,
             },
             WindowsAndMessaging::{LoadImageW, HICON, IMAGE_ICON, LR_DEFAULTCOLOR},
         },
@@ -24,7 +24,33 @@ use crate::{
 
 use anyhow::{Context as _, Result};
 
-use super::factory::TextServiceFactory_Impl;
+use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
+
+impl TextServiceFactory {
+    /// Adds our mode button to the host's language bar. Extracted so the
+    /// three sites that touch the langbar item (Activate, Deactivate via
+    /// `remove_langbar_item`, and `update_lang_bar`'s remove-then-add icon
+    /// refresh) share one AddItem/RemoveItem pair instead of open-coding the
+    /// `cast::<ITfLangBarItemMgr>()` + `this::<ITfLangBarItemButton>()` dance.
+    pub fn add_langbar_item(&self, thread_mgr: &ITfThreadMgr) -> Result<()> {
+        unsafe {
+            thread_mgr
+                .cast::<ITfLangBarItemMgr>()?
+                .AddItem(&self.this::<ITfLangBarItemButton>()?)?;
+        }
+        Ok(())
+    }
+
+    /// Removes our mode button from the host's language bar.
+    pub fn remove_langbar_item(&self, thread_mgr: &ITfThreadMgr) -> Result<()> {
+        unsafe {
+            thread_mgr
+                .cast::<ITfLangBarItemMgr>()?
+                .RemoveItem(&self.this::<ITfLangBarItemButton>()?)?;
+        }
+        Ok(())
+    }
+}
 
 const INFO: TF_LANGBARITEMINFO = TF_LANGBARITEMINFO {
     clsidService: GUID_TEXT_SERVICE,
