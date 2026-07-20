@@ -5,7 +5,7 @@ use std::{
 use windows::{
     core::{implement, BSTR, GUID},
     Win32::{
-        Foundation::{E_FAIL, E_POINTER, S_FALSE},
+        Foundation::{E_FAIL, E_INVALIDARG, E_POINTER, S_FALSE},
         UI::TextServices::{
             IEnumTfDisplayAttributeInfo, IEnumTfDisplayAttributeInfo_Impl, ITfDisplayAttributeInfo,
             ITfDisplayAttributeInfo_Impl, ITfDisplayAttributeProvider_Impl, TF_DISPLAYATTRIBUTE,
@@ -32,6 +32,11 @@ impl ITfDisplayAttributeProvider_Impl for TextServiceFactory_Impl {
         &self,
         guid: *const windows_core::GUID,
     ) -> windows::core::Result<ITfDisplayAttributeInfo> {
+        // a raw deref in a COM callback is a segfault, which catch_unwind
+        // cannot turn into an HRESULT (same guard as GetPageIndex)
+        if guid.is_null() {
+            return Err(windows::core::Error::from_hresult(E_INVALIDARG).into());
+        }
         let guid = unsafe { *guid };
         let attributes = EnumDisplayAttributeInfo::new();
         for attribute in attributes.attributes {
@@ -64,6 +69,11 @@ impl DisplayAttributeInfo {
 impl ITfDisplayAttributeInfo_Impl for DisplayAttributeInfo_Impl {
     #[macros::anyhow]
     fn GetAttributeInfo(&self, pda: *mut TF_DISPLAYATTRIBUTE) -> Result<()> {
+        // a raw deref in a COM callback is a segfault, which catch_unwind
+        // cannot turn into an HRESULT (same guard as GetPageIndex)
+        if pda.is_null() {
+            return Err(windows::core::Error::from_hresult(E_INVALIDARG).into());
+        }
         unsafe {
             *pda = self.attribute.get();
         }
@@ -88,6 +98,11 @@ impl ITfDisplayAttributeInfo_Impl for DisplayAttributeInfo_Impl {
 
     #[macros::anyhow]
     fn SetAttributeInfo(&self, pda: *const TF_DISPLAYATTRIBUTE) -> Result<()> {
+        // a raw deref in a COM callback is a segfault, which catch_unwind
+        // cannot turn into an HRESULT (same guard as GetPageIndex)
+        if pda.is_null() {
+            return Err(windows::core::Error::from_hresult(E_INVALIDARG).into());
+        }
         unsafe {
             self.attribute.set(*pda);
         }
@@ -267,6 +282,37 @@ mod tests {
         let _ = unsafe { e.Next(&mut second, &mut fetched2) };
         assert_eq!(fetched2, 0);
         assert!(second[0].is_none());
+    }
+
+    /// Null in/out pointers must come back as an error HRESULT. The safe
+    /// wrappers take references and can never pass null, so this goes
+    /// through the raw vtable the way a host would — without the guards the
+    /// raw deref is an access violation that takes the host process down.
+    #[test]
+    fn attribute_info_null_pointers_fail_instead_of_crashing() {
+        use windows::core::Interface;
+
+        let info: ITfDisplayAttributeInfo =
+            DisplayAttributeInfo::new(GUID_DISPLAY_ATTRIBUTE, DISPLAY_ATTRIBUTE).into();
+
+        let get = unsafe {
+            (Interface::vtable(&info).GetAttributeInfo)(
+                Interface::as_raw(&info),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            get.is_err(),
+            "GetAttributeInfo(null) must fail, got {get:?}"
+        );
+
+        let set = unsafe {
+            (Interface::vtable(&info).SetAttributeInfo)(Interface::as_raw(&info), std::ptr::null())
+        };
+        assert!(
+            set.is_err(),
+            "SetAttributeInfo(null) must fail, got {set:?}"
+        );
     }
 
     /// Skipping past the end must not leave the index out of range.
