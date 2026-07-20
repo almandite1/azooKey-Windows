@@ -19,6 +19,13 @@ pub struct IPCService {
     // candidate window server client
     window_client: WindowServiceClient<Channel>,
     runtime: Arc<tokio::runtime::Runtime>,
+    /// Test seam: when set, every RPC method delegates to this recorder
+    /// instead of the wire. The engine RPCs need a live server, so
+    /// handle_action's golden tests cannot run against the real clients.
+    /// Arc/Mutex because the service is shared through the global IMEState
+    /// (Send) and cloned per handle_action call.
+    #[cfg(test)]
+    fake: Option<Arc<std::sync::Mutex<FakeIpc>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -97,6 +104,32 @@ impl IPCService {
             azookey_client,
             window_client,
             runtime: Arc::new(runtime),
+            #[cfg(test)]
+            fake: None,
+        })
+    }
+
+    /// Builds a service whose RPCs are answered by a shared [`FakeIpc`]
+    /// recorder instead of the wire. The real lazy channels are still
+    /// constructed (they never connect) so the production fields stay
+    /// identical.
+    #[cfg(test)]
+    pub fn new_fake() -> Result<(Self, Arc<std::sync::Mutex<FakeIpc>>)> {
+        let fake = Arc::new(std::sync::Mutex::new(FakeIpc::default()));
+        let mut service = Self::new()?;
+        service.fake = Some(fake.clone());
+        Ok((service, fake))
+    }
+
+    /// Runs one call against the fake, if installed. `Some(result)` short-
+    /// circuits the caller; `None` means no fake — go to the wire.
+    #[cfg(test)]
+    fn fake_call<T>(&self, call: impl FnOnce(&mut FakeIpc) -> T) -> Option<T> {
+        self.fake.as_ref().map(|fake| {
+            let mut fake = fake
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            call(&mut fake)
         })
     }
 
@@ -115,10 +148,60 @@ impl IPCService {
     }
 }
 
+/// Recording double behind the `fake` seam: keeps every call in order and
+/// answers the engine RPCs from a script, so handle_action's golden tests
+/// can assert both the state written back AND the IPC traffic an action
+/// produced — without a live server or UI process.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct FakeIpc {
+    /// every RPC in call order
+    pub calls: Vec<IpcCall>,
+    /// what append_text/remove_text/shrink_text answer
+    pub scripted_candidates: Candidates,
+    /// when true, the engine RPCs fail like a dead server (window RPCs
+    /// stay silent, mirroring the real cosmetic/advisory split)
+    pub engine_fails: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum IpcCall {
+    AppendText(String),
+    RemoveText,
+    ClearText,
+    ShrinkText(i32),
+    SetContext(String),
+    ShowWindow,
+    HideWindow,
+    SetWindowPosition,
+    SetCandidates(Vec<String>),
+    SetSelection(i32),
+    SetInputMode(String),
+}
+
+#[cfg(test)]
+impl FakeIpc {
+    fn engine_answer(&mut self, call: IpcCall) -> anyhow::Result<Candidates> {
+        self.calls.push(call);
+        if self.engine_fails {
+            anyhow::bail!("fake engine is down");
+        }
+        Ok(self.scripted_candidates.clone())
+    }
+}
+
 // implement methods to interact with kkc server
 impl IPCService {
     #[tracing::instrument]
     pub fn append_text(&mut self, text: String) -> anyhow::Result<Candidates> {
+        #[cfg(test)]
+        if let Some(result) =
+            self.fake_call(|fake| fake.engine_answer(IpcCall::AppendText(text.clone())))
+        {
+            return result;
+        }
+
         let mut client = self.azookey_client.clone();
         let response = self.exec(async move {
             client
@@ -136,6 +219,11 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn remove_text(&mut self) -> anyhow::Result<Candidates> {
+        #[cfg(test)]
+        if let Some(result) = self.fake_call(|fake| fake.engine_answer(IpcCall::RemoveText)) {
+            return result;
+        }
+
         let mut client = self.azookey_client.clone();
         let response = self.exec(async move {
             client
@@ -151,6 +239,17 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn clear_text(&mut self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(result) = self.fake_call(|fake| {
+            fake.calls.push(IpcCall::ClearText);
+            if fake.engine_fails {
+                anyhow::bail!("fake engine is down");
+            }
+            Ok(())
+        }) {
+            return result;
+        }
+
         let mut client = self.azookey_client.clone();
         self.exec(async move {
             client
@@ -163,6 +262,12 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
+        #[cfg(test)]
+        if let Some(result) = self.fake_call(|fake| fake.engine_answer(IpcCall::ShrinkText(offset)))
+        {
+            return result;
+        }
+
         let mut client = self.azookey_client.clone();
         let response = self.exec(async move {
             client
@@ -179,6 +284,14 @@ impl IPCService {
     }
 
     pub fn set_context(&mut self, context: String) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(result) = self.fake_call(|fake| {
+            fake.calls.push(IpcCall::SetContext(context.clone()));
+            Ok(())
+        }) {
+            return result;
+        }
+
         let mut client = self.azookey_client.clone();
         self.exec(async move {
             client
@@ -198,6 +311,14 @@ impl IPCService {
 impl IPCService {
     #[tracing::instrument]
     pub fn show_window(&mut self) {
+        #[cfg(test)]
+        if self
+            .fake_call(|fake| fake.calls.push(IpcCall::ShowWindow))
+            .is_some()
+        {
+            return;
+        }
+
         let mut client = self.window_client.clone();
         let result = self.exec(async move {
             client
@@ -211,6 +332,14 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn hide_window(&mut self) {
+        #[cfg(test)]
+        if self
+            .fake_call(|fake| fake.calls.push(IpcCall::HideWindow))
+            .is_some()
+        {
+            return;
+        }
+
         let mut client = self.window_client.clone();
         let result = self.exec(async move {
             client
@@ -224,6 +353,14 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn set_window_position(&mut self, top: i32, left: i32, bottom: i32, right: i32) {
+        #[cfg(test)]
+        if self
+            .fake_call(|fake| fake.calls.push(IpcCall::SetWindowPosition))
+            .is_some()
+        {
+            return;
+        }
+
         let mut client = self.window_client.clone();
         let result = self.exec(async move {
             client
@@ -244,6 +381,14 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn set_candidates(&mut self, candidates: Vec<String>) {
+        #[cfg(test)]
+        if self
+            .fake_call(|fake| fake.calls.push(IpcCall::SetCandidates(candidates.clone())))
+            .is_some()
+        {
+            return;
+        }
+
         let mut client = self.window_client.clone();
         let result = self.exec(async move {
             client
@@ -259,6 +404,14 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn set_selection(&mut self, index: i32) {
+        #[cfg(test)]
+        if self
+            .fake_call(|fake| fake.calls.push(IpcCall::SetSelection(index)))
+            .is_some()
+        {
+            return;
+        }
+
         let mut client = self.window_client.clone();
         let result = self.exec(async move {
             client
@@ -274,6 +427,14 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn set_input_mode(&mut self, mode: &str) {
+        #[cfg(test)]
+        if self
+            .fake_call(|fake| fake.calls.push(IpcCall::SetInputMode(mode.to_string())))
+            .is_some()
+        {
+            return;
+        }
+
         let mut client = self.window_client.clone();
         let mode = mode.to_string();
         let result = self.exec(async move {
