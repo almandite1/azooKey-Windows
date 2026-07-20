@@ -141,6 +141,27 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             tracing::warn!("langbar AddItem failed (non-fatal): {error:?}");
         }
 
+        tracing::debug!("Initialize input-mode compartments");
+        // Advisory: a host without ITfCompartmentMgr (or one that refuses the
+        // compartments) must still get a working IME.
+        let adopted = match self.init_compartments(&mut text_service) {
+            Ok(adopted) => adopted,
+            Err(error) => {
+                tracing::warn!("compartment setup failed (non-fatal): {error:?}");
+                None
+            }
+        };
+
+        // The OS held a mode from before this activation; adopt it so the
+        // user's choice survives a profile switch. Must happen after the
+        // borrow is released -- apply_input_mode re-enters the RefCell.
+        drop(text_service);
+        if let Some(mode) = adopted {
+            if let Err(error) = self.apply_input_mode(mode, false) {
+                tracing::warn!("adopting the compartment mode failed (non-fatal): {error:?}");
+            }
+        }
+
         tracing::debug!("Activate success");
 
         Ok(())
@@ -230,11 +251,22 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                     self.unadvise_text_layout_sink(&mut text_service),
                 );
 
+                tracing::debug!("UnadviseCompartmentSinks");
+                record(
+                    &mut first_error,
+                    self.unadvise_compartment_sinks(&mut text_service),
+                );
+
                 // clear display attribute
                 text_service.display_attribute_atom.clear();
 
                 text_service.tid = 0;
                 text_service.thread_mgr = None;
+                // The OS compartment is the durable store for the mode now,
+                // and the next Activate adopts it back, so the cached copy
+                // must not outlive this activation.
+                text_service.input_mode = crate::engine::input_mode::InputMode::default();
+                text_service.suppress_compartment_echo = false;
                 // Also let go of the last document's context: handle_key
                 // re-sets it on every keystroke after the next Activate, and
                 // end_composition() above already ran, so nothing dereferences

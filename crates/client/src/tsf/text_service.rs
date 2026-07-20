@@ -6,7 +6,7 @@ use std::{
 
 use windows::{
     core::{Interface, GUID},
-    Win32::UI::TextServices::{ITfContext, ITfThreadMgr},
+    Win32::UI::TextServices::{ITfCompartment, ITfContext, ITfThreadMgr},
 };
 
 use anyhow::{Context, Result};
@@ -89,6 +89,16 @@ pub struct TextService {
     /// (one TIP per UI thread) — this was the last activation-scoped field
     /// left in the process-global IMEState.
     pub input_mode: InputMode,
+    /// Compartments this activation advised `ITfCompartmentEventSink` on,
+    /// paired with their cookies. Kept separate from `cookies` because that
+    /// map holds one cookie per sink IID, while this one sink is advised on
+    /// several compartments — and `UnadviseSink` must be called on the very
+    /// object that `AdviseSink` was called on.
+    pub compartment_sinks: Vec<(ITfCompartment, u32)>,
+    /// Set while we are writing our own mode into the compartments, so the
+    /// `OnChange` that TSF dispatches synchronously from inside `SetValue`
+    /// does not bounce straight back into another write.
+    pub suppress_compartment_echo: bool,
     // NOTE: no `this` self-reference here. The COM object is reachable from
     // any TSF callback via TextServiceFactory::this() (a QueryInterface on
     // the containing allocation); storing a strong interface pointer in the

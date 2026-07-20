@@ -102,6 +102,13 @@ impl TextServiceFactory {
             return Ok(None);
         };
 
+        // The host can switch input off for this context — a password field
+        // is the case that matters. Answering None hands the raw key back,
+        // which is the whole point: we must not compose here.
+        if self.is_input_disabled(context) {
+            return Ok(None);
+        }
+
         // a Ctrl or Alt chord is the host's shortcut: cancel any composition
         // so the shortcut actually works (issue #5), and never eat the key.
         // Without the Alt check, Alt+letter fell through to the ToUnicode
@@ -308,23 +315,10 @@ impl TextServiceFactory {
                         self.update_pos()?;
                         self.end_composition()?;
 
-                        // scope the borrow tightly: update_lang_bar re-enters
-                        // the TextService RefCell through AddItem -> GetIcon
-                        // (a try_borrow), which fails outright if we still
-                        // hold the mutable borrow here
-                        {
-                            self.borrow_mut()?.input_mode = mode.clone();
-                        }
-
-                        // update the language bar
-                        self.update_lang_bar()?;
-
-                        let mode = match mode {
-                            InputMode::Latin => "A",
-                            InputMode::Kana => "あ",
-                        };
-
-                        ipc_service.set_input_mode(mode);
+                        // publishes the mode to the langbar, the indicator,
+                        // and the OS compartments (so the touch keyboard,
+                        // IMM32 apps and the shell see it too)
+                        self.apply_input_mode(mode.clone(), true)?;
 
                         selection_index = 0;
                         corresponding_count = 0;
