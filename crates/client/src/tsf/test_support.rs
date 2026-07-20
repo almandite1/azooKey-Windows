@@ -28,16 +28,17 @@ use windows::{
         UI::TextServices::{
             IEnumITfCompositionView, IEnumTfContextViews, IEnumTfContexts, IEnumTfDocumentMgrs,
             IEnumTfFunctionProviders, IEnumTfLangBarItems, IEnumTfProperties, IEnumTfRanges,
-            ITfCompartment, ITfCompartmentEventSink, ITfCompartmentMgr, ITfCompartmentMgr_Impl,
-            ITfCompartment_Impl, ITfComposition, ITfCompositionSink, ITfCompositionView,
-            ITfComposition_Impl, ITfContext, ITfContextComposition, ITfContextComposition_Impl,
-            ITfContextView, ITfContextView_Impl, ITfContext_Impl, ITfDocumentMgr,
-            ITfDocumentMgr_Impl, ITfEditSession, ITfFunctionProvider, ITfInsertAtSelection,
-            ITfInsertAtSelection_Impl, ITfKeyEventSink, ITfKeystrokeMgr, ITfKeystrokeMgr_Impl,
-            ITfLangBarItem, ITfLangBarItemMgr, ITfLangBarItemMgr_Impl, ITfLangBarItemSink,
-            ITfProperty, ITfPropertyStore, ITfProperty_Impl, ITfRange, ITfRangeBackup,
-            ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl, ITfSource,
-            ITfSource_Impl, ITfThreadMgr, ITfThreadMgr_Impl, INSERT_TEXT_AT_SELECTION_FLAGS,
+            IEnumTfUIElements, ITfCompartment, ITfCompartmentEventSink, ITfCompartmentMgr,
+            ITfCompartmentMgr_Impl, ITfCompartment_Impl, ITfComposition, ITfCompositionSink,
+            ITfCompositionView, ITfComposition_Impl, ITfContext, ITfContextComposition,
+            ITfContextComposition_Impl, ITfContextView, ITfContextView_Impl, ITfContext_Impl,
+            ITfDocumentMgr, ITfDocumentMgr_Impl, ITfEditSession, ITfFunctionProvider,
+            ITfInsertAtSelection, ITfInsertAtSelection_Impl, ITfKeyEventSink, ITfKeystrokeMgr,
+            ITfKeystrokeMgr_Impl, ITfLangBarItem, ITfLangBarItemMgr, ITfLangBarItemMgr_Impl,
+            ITfLangBarItemSink, ITfProperty, ITfPropertyStore, ITfProperty_Impl, ITfRange,
+            ITfRangeBackup, ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl,
+            ITfSource, ITfSource_Impl, ITfThreadMgr, ITfThreadMgr_Impl, ITfUIElement,
+            ITfUIElementMgr, ITfUIElementMgr_Impl, INSERT_TEXT_AT_SELECTION_FLAGS,
             TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_SYNC, TF_E_SYNCHRONOUS, TF_HALTCOND,
             TF_LANGBARITEMINFO, TF_PRESERVEDKEY, TF_SELECTION, TF_S_ASYNC, TS_E_NOLAYOUT,
             TS_STATUS,
@@ -869,6 +870,51 @@ impl ITfComposition_Impl for FakeComposition_Impl {
     }
 }
 
+/// What a fake host's `ITfUIElementMgr` recorded, and how it answers.
+///
+/// `show` is the `pbShow` the host returns from `BeginUIElement` — the only
+/// gate that decides whether the TIP may draw its own candidate window.
+pub struct UiElementLog {
+    /// The host's answer to "may the TIP show its own UI?".
+    pub show: Cell<bool>,
+    pub begin_calls: Cell<usize>,
+    pub update_calls: Cell<usize>,
+    pub end_calls: Cell<usize>,
+    /// Ids handed out by `BeginUIElement`, and those passed to `EndUIElement`.
+    pub begun_ids: RefCell<Vec<u32>>,
+    pub ended_ids: RefCell<Vec<u32>>,
+    next_id: Cell<u32>,
+}
+
+impl Default for UiElementLog {
+    fn default() -> Self {
+        Self {
+            // a host that has no opinion lets the TIP draw
+            show: Cell::new(true),
+            begin_calls: Cell::new(0),
+            update_calls: Cell::new(0),
+            end_calls: Cell::new(0),
+            begun_ids: RefCell::new(Vec::new()),
+            ended_ids: RefCell::new(Vec::new()),
+            next_id: Cell::new(0x4100),
+        }
+    }
+}
+
+impl UiElementLog {
+    /// A host that draws the candidates itself (a UILess thread), so the TIP
+    /// must keep its own window hidden.
+    pub fn suppressing() -> Self {
+        let log = Self::default();
+        log.show.set(false);
+        log
+    }
+
+    pub fn live_elements(&self) -> usize {
+        self.begun_ids.borrow().len() - self.ended_ids.borrow().len()
+    }
+}
+
 /// Shared state behind every [`FakeCompartment`] a [`FakeThreadMgr`] hands
 /// out: the compartment values, and the sinks advised on them.
 ///
@@ -1033,7 +1079,8 @@ impl ThreadMgrLog {
     ITfKeystrokeMgr,
     ITfSource,
     ITfLangBarItemMgr,
-    ITfCompartmentMgr
+    ITfCompartmentMgr,
+    ITfUIElementMgr
 )]
 pub struct FakeThreadMgr {
     log: Rc<ThreadMgrLog>,
@@ -1043,11 +1090,12 @@ pub struct FakeThreadMgr {
     /// TIP unwinds the sinks it already advised (Activate rollback).
     fail_add_item: bool,
     compartments: Rc<CompartmentLog>,
+    ui_elements: Rc<UiElementLog>,
 }
 
 impl FakeThreadMgr {
     pub fn new(log: Rc<ThreadMgrLog>) -> ITfThreadMgr {
-        Self::build(log, None, false, Rc::new(CompartmentLog::default()))
+        Self::build(log, None, false, Default::default(), Default::default())
     }
 
     pub fn with_focus(log: Rc<ThreadMgrLog>, focus_context: ITfContext) -> ITfThreadMgr {
@@ -1055,7 +1103,8 @@ impl FakeThreadMgr {
             log,
             Some(focus_context),
             false,
-            Rc::new(CompartmentLog::default()),
+            Default::default(),
+            Default::default(),
         )
     }
 
@@ -1063,7 +1112,7 @@ impl FakeThreadMgr {
     /// the TIP's Activate must roll back the key-event and thread-manager
     /// sinks it advised earlier.
     pub fn with_failing_langbar(log: Rc<ThreadMgrLog>) -> ITfThreadMgr {
-        Self::build(log, None, true, Rc::new(CompartmentLog::default()))
+        Self::build(log, None, true, Default::default(), Default::default())
     }
 
     /// A thread manager sharing `compartments`, so a test can seed the
@@ -1072,7 +1121,14 @@ impl FakeThreadMgr {
         log: Rc<ThreadMgrLog>,
         compartments: Rc<CompartmentLog>,
     ) -> ITfThreadMgr {
-        Self::build(log, None, false, compartments)
+        Self::build(log, None, false, compartments, Default::default())
+    }
+
+    /// A thread manager whose `ITfUIElementMgr` the test controls — set
+    /// `show` on `ui_elements` to model a UILess host that draws the
+    /// candidates itself.
+    pub fn with_ui_elements(log: Rc<ThreadMgrLog>, ui_elements: Rc<UiElementLog>) -> ITfThreadMgr {
+        Self::build(log, None, false, Default::default(), ui_elements)
     }
 
     fn build(
@@ -1080,12 +1136,14 @@ impl FakeThreadMgr {
         focus_context: Option<ITfContext>,
         fail_add_item: bool,
         compartments: Rc<CompartmentLog>,
+        ui_elements: Rc<UiElementLog>,
     ) -> ITfThreadMgr {
         FakeThreadMgr {
             log,
             focus_context,
             fail_add_item,
             compartments,
+            ui_elements,
         }
         .into()
     }
@@ -1109,6 +1167,53 @@ impl ITfCompartmentMgr_Impl for FakeThreadMgr_Impl {
     }
 
     fn EnumCompartments(&self) -> WinResult<windows::Win32::System::Com::IEnumGUID> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
+impl ITfUIElementMgr_Impl for FakeThreadMgr_Impl {
+    fn BeginUIElement(
+        &self,
+        _pelement: Option<&ITfUIElement>,
+        pbshow: *mut BOOL,
+        pdwuielementid: *mut u32,
+    ) -> WinResult<()> {
+        let log = &self.ui_elements;
+        log.begin_calls.set(log.begin_calls.get() + 1);
+
+        let id = log.next_id.get() + 1;
+        log.next_id.set(id);
+        log.begun_ids.borrow_mut().push(id);
+
+        unsafe {
+            if !pbshow.is_null() {
+                *pbshow = log.show.get().into();
+            }
+            if !pdwuielementid.is_null() {
+                *pdwuielementid = id;
+            }
+        }
+        Ok(())
+    }
+
+    fn UpdateUIElement(&self, _dwuielementid: u32) -> WinResult<()> {
+        let log = &self.ui_elements;
+        log.update_calls.set(log.update_calls.get() + 1);
+        Ok(())
+    }
+
+    fn EndUIElement(&self, dwuielementid: u32) -> WinResult<()> {
+        let log = &self.ui_elements;
+        log.end_calls.set(log.end_calls.get() + 1);
+        log.ended_ids.borrow_mut().push(dwuielementid);
+        Ok(())
+    }
+
+    fn GetUIElement(&self, _dwuielementid: u32) -> WinResult<ITfUIElement> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn EnumUIElements(&self) -> WinResult<IEnumTfUIElements> {
         Err(E_NOTIMPL.into())
     }
 }

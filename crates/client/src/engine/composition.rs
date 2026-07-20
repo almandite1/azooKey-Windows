@@ -21,7 +21,10 @@ use windows::Win32::{
     Foundation::WPARAM,
     UI::{
         Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU},
-        TextServices::{ITfComposition, ITfCompositionSink_Impl, ITfContext},
+        TextServices::{
+            ITfComposition, ITfCompositionSink_Impl, ITfContext, TF_CLUIE_COUNT,
+            TF_CLUIE_CURRENTPAGE, TF_CLUIE_PAGEINDEX, TF_CLUIE_SELECTION, TF_CLUIE_STRING,
+        },
     },
 };
 
@@ -87,7 +90,41 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
     }
 }
 
+/// Flags for `ui_update` when the whole candidate list was replaced.
+const CANDIDATES_CHANGED: u32 = TF_CLUIE_COUNT
+    | TF_CLUIE_STRING
+    | TF_CLUIE_SELECTION
+    | TF_CLUIE_CURRENTPAGE
+    | TF_CLUIE_PAGEINDEX;
+
+/// Flags for `ui_update` when only the highlighted candidate moved.
+const SELECTION_CHANGED: u32 = TF_CLUIE_SELECTION | TF_CLUIE_CURRENTPAGE;
+
 impl TextServiceFactory {
+    /// Hands the candidate list to the host (UILess mode) and, unless the
+    /// host said it draws them itself, to our own window.
+    ///
+    /// Every candidate update goes through here so the two can never
+    /// disagree about what is displayed.
+    fn publish_candidates(
+        &self,
+        ipc_service: &mut crate::engine::ipc_service::IPCService,
+        candidates: &Candidates,
+        selection_index: i32,
+        updated_flags: u32,
+    ) -> Result<()> {
+        self.ui_update(candidates, selection_index, updated_flags)?;
+
+        if self.ui_should_show() {
+            if updated_flags & TF_CLUIE_STRING != 0 {
+                ipc_service.set_candidates(candidates.texts.clone());
+            }
+            ipc_service.set_selection(selection_index);
+        }
+
+        Ok(())
+    }
+
     /// Impure shell around the pure decision functions
     /// (engine::transition): reads the OS/COM state they need, decodes the
     /// key, and adapts the result. New key bindings belong in the
@@ -216,7 +253,13 @@ impl TextServiceFactory {
                     ClientAction::StartComposition => {
                         self.start_composition()?;
                         self.update_pos()?;
-                        ipc_service.show_window();
+                        // ask the host first -- after update_pos, so it knows
+                        // where the caret is before deciding. A host that
+                        // draws the candidates itself answers false and our
+                        // own window stays hidden.
+                        if self.ui_begin()? {
+                            ipc_service.show_window();
+                        }
                     }
                     ClientAction::EndComposition | ClientAction::CancelComposition => {
                         // ending COMMITS whatever the range holds, so a
@@ -246,8 +289,12 @@ impl TextServiceFactory {
                         suffix.clear();
                         raw_input.clear();
                         raw_hiragana.clear();
+                        // unconditional: hiding is safe even if we never
+                        // showed, and ui_end is a no-op with no live element
+                        let ui_result = self.ui_end();
                         ipc_service.hide_window();
                         ipc_service.set_candidates(vec![]);
+                        edit_result = edit_result.and(ui_result);
                         let clear_result = ipc_service.clear_text();
 
                         // surface the first failure only after both the
@@ -274,8 +321,12 @@ impl TextServiceFactory {
                         );
 
                         self.set_text(&preview, &suffix)?;
-                        ipc_service.set_candidates(candidates.texts.clone());
-                        ipc_service.set_selection(selection_index);
+                        self.publish_candidates(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            CANDIDATES_CHANGED,
+                        )?;
                     }
                     ClientAction::RemoveText => {
                         candidates = ipc_service.remove_text()?;
@@ -300,8 +351,12 @@ impl TextServiceFactory {
                             .collect();
 
                         self.set_text(&preview, &suffix)?;
-                        ipc_service.set_candidates(candidates.texts.clone());
-                        ipc_service.set_selection(selection_index);
+                        self.publish_candidates(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            CANDIDATES_CHANGED,
+                        )?;
                     }
                     ClientAction::MoveCursor(_offset) => {
                         // Deliberate no-op for now: the MoveCursor RPC and the
@@ -314,6 +369,14 @@ impl TextServiceFactory {
                         self.start_composition()?;
                         self.update_pos()?;
                         self.end_composition()?;
+
+                        // this arm clears the composition, so any candidate
+                        // element the host is holding is now stale.
+                        // (Pre-existing gap, left alone here: unlike the
+                        // End/CancelComposition arm this one never sends
+                        // hide_window, so our own window relies on the next
+                        // composition to reposition it.)
+                        self.ui_end()?;
 
                         // publishes the mode to the langbar, the indicator,
                         // and the OS compartments (so the touch keyboard,
@@ -346,7 +409,12 @@ impl TextServiceFactory {
                         }
                         .clamp(0, max(0, texts.len() as i32 - 1));
 
-                        ipc_service.set_selection(selection_index);
+                        self.publish_candidates(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            SELECTION_CHANGED,
+                        )?;
                         apply_selected_candidate(
                             &candidates,
                             selection_index,
@@ -386,8 +454,12 @@ impl TextServiceFactory {
                         );
                         self.shift_start(&previous_preview, &preview)?;
 
-                        ipc_service.set_candidates(candidates.texts.clone());
-                        ipc_service.set_selection(selection_index);
+                        self.publish_candidates(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            CANDIDATES_CHANGED,
+                        )?;
                         self.update_pos()?;
 
                         transition = CompositionState::Composing;

@@ -195,6 +195,12 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // end composition (releases the client-side handle even on failure)
         record(&mut first_error, self.end_composition());
 
+        // MANDATORY, not best-effort housekeeping: BeginUIElement made the
+        // host AddRef this object and hold it until EndUIElement. Leaving an
+        // element open across Deactivate pins the TIP in the host forever —
+        // the B15 leak shape all over again.
+        record(&mut first_error, self.ui_end());
+
         // key event sink + langbar removal need the thread manager
         match self.borrow() {
             Ok(text_service) => match text_service.thread_mgr() {
@@ -267,6 +273,9 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                 // must not outlive this activation.
                 text_service.input_mode = crate::engine::input_mode::InputMode::default();
                 text_service.suppress_compartment_echo = false;
+                // a stale flag would otherwise be inherited by a plain
+                // Activate() that carries no flags of its own
+                text_service.activate_flags = 0;
                 // Also let go of the last document's context: handle_key
                 // re-sets it on every keystroke after the next Activate, and
                 // end_composition() above already ran, so nothing dereferences
@@ -304,11 +313,21 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
 
 impl ITfTextInputProcessorEx_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
-    fn ActivateEx(&self, ptim: Option<&ITfThreadMgr>, tid: u32, _dwflags: u32) -> Result<()> {
+    fn ActivateEx(&self, ptim: Option<&ITfThreadMgr>, tid: u32, dwflags: u32) -> Result<()> {
         // called when the text service is activated
         // if this function is implemented, the Activate() function won't be called
         // so we need to call the Activate function manually
-        tracing::debug!("Activated(Ex) with tid: {tid}");
+        tracing::debug!("Activated(Ex) with tid: {tid}, flags: {dwflags:#x}");
+
+        // Diagnostics only: UI suppression is decided by BeginUIElement's
+        // pbShow, never by an activation flag. Scope the borrow — Activate
+        // takes its own borrow_mut straight away.
+        {
+            if let Ok(mut text_service) = self.borrow_mut() {
+                text_service.activate_flags = dwflags;
+            }
+        }
+
         self.Activate(ptim, tid)?;
         Ok(())
     }

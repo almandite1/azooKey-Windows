@@ -11,7 +11,7 @@ use windows::{
 
 use anyhow::{Context, Result};
 
-use crate::engine::{composition::Composition, input_mode::InputMode};
+use crate::engine::{composition::Composition, input_mode::InputMode, ipc_service::Candidates};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpdatePosState {
@@ -65,6 +65,29 @@ impl UpdatePosState {
     }
 }
 
+/// What the host is told about our candidate list, and what it may read back.
+///
+/// The candidate snapshot lives here rather than being read from
+/// `Composition` on demand, because the host calls `GetCount`/`GetString`
+/// **synchronously from inside** `BeginUIElement`/`UpdateUIElement` — and we
+/// issue those from inside `handle_action`'s dispatch loop, where
+/// `Composition` still holds the *previous* keystroke's candidates (the loop
+/// works on local copies and writes back only at the end, see
+/// engine/composition.rs). Reading `Composition` there would serve stale
+/// candidates to the host.
+#[derive(Default, Debug)]
+pub struct UiElementState {
+    /// `Some` once `BeginUIElement` succeeded; the id the host gave us.
+    pub id: Option<u32>,
+    /// The host's latest answer to "may our own window be shown?".
+    pub show: bool,
+    /// Reported by `GetUpdatedFlags`; the host reads it *after*
+    /// `UpdateUIElement` returns, so it must outlive the call.
+    pub updated_flags: u32,
+    pub candidates: Candidates,
+    pub selection_index: i32,
+}
+
 #[derive(Default, Debug)]
 pub struct TextService {
     pub tid: u32,
@@ -99,6 +122,11 @@ pub struct TextService {
     /// `OnChange` that TSF dispatches synchronously from inside `SetValue`
     /// does not bounce straight back into another write.
     pub suppress_compartment_echo: bool,
+    /// `ActivateEx`'s `dwflags`. Diagnostics only — the UI suppression gate
+    /// is `BeginUIElement`'s `pbShow`, never a flag.
+    pub activate_flags: u32,
+    /// UILess-mode state for the candidate list.
+    pub ui_element: UiElementState,
     // NOTE: no `this` self-reference here. The COM object is reachable from
     // any TSF callback via TextServiceFactory::this() (a QueryInterface on
     // the containing allocation); storing a strong interface pointer in the

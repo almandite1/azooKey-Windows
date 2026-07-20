@@ -9,9 +9,9 @@ use windows::{
         Foundation::{BOOL, E_NOINTERFACE},
         System::Com::{IClassFactory, IClassFactory_Impl},
         UI::TextServices::{
-            ITfCompartmentEventSink, ITfCompositionSink, ITfDisplayAttributeProvider,
-            ITfKeyEventSink, ITfLangBarItem, ITfLangBarItemButton, ITfSource,
-            ITfTextInputProcessor, ITfTextInputProcessorEx, ITfTextLayoutSink,
+            ITfCandidateListUIElement, ITfCompartmentEventSink, ITfCompositionSink,
+            ITfDisplayAttributeProvider, ITfKeyEventSink, ITfLangBarItem, ITfLangBarItemButton,
+            ITfSource, ITfTextInputProcessor, ITfTextInputProcessorEx, ITfTextLayoutSink,
             ITfThreadMgrEventSink,
         },
     },
@@ -36,7 +36,8 @@ use super::text_service::TextService;
     ITfLangBarItem,
     ITfLangBarItemButton,
     ITfSource,
-    ITfCompartmentEventSink
+    ITfCompartmentEventSink,
+    ITfCandidateListUIElement
 )]
 #[derive(Debug)]
 pub struct TextServiceFactory {
