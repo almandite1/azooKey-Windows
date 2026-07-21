@@ -97,7 +97,34 @@ $runtime = Get-ChildItem $runtimeRoot -Directory |
     Select-Object -First 1
 if ($null -eq $runtime) { throw "no Swift runtime found under $runtimeRoot" }
 Write-Host "bundling Swift runtime $($runtime.Name)"
-cp "$($runtime.FullName)/usr/bin/*" build
+
+# Copy only what actually differs. The runtime changes when the toolchain is
+# replaced and at no other time, so on a normal build every one of these files
+# is already byte-identical -- and copying them anyway is what breaks the
+# build: build/ is where the TIP DLL is registered from, so every process that
+# loaded the IME holds build/vcruntime140.dll through the DLL search path.
+# Stopping the engine does not release it; only closing every app that has
+# ever used the IME would. Skipping the identical case keeps that lock
+# irrelevant, and a real toolchain change still gets copied.
+$copied = 0
+foreach ($src in Get-ChildItem "$($runtime.FullName)/usr/bin" -File) {
+    $dest = Join-Path "build" $src.Name
+    if ((Test-Path $dest) -and
+        ((Get-Item $dest).Length -eq $src.Length) -and
+        ((Get-FileHash $dest).Hash -eq (Get-FileHash $src.FullName).Hash)) {
+        continue
+    }
+    try {
+        Copy-Item $src.FullName $dest -Force -ErrorAction Stop
+        $copied++
+    } catch [System.IO.IOException] {
+        throw "post_build: cannot replace build/$($src.Name) because a running " +
+              "process holds it. The IME is loaded into every app that has used " +
+              "it, and those apps pin this file. Close them (Explorer included) " +
+              "and build again. Underlying error: $($_.Exception.Message)"
+    }
+}
+Write-Host "Swift runtime: $copied of $((Get-ChildItem "$($runtime.FullName)/usr/bin" -File).Count) files needed updating"
 
 cp -Recurse -Force server-swift/azooKey_emoji_dictionary_storage/EmojiDictionary build
 cp -Recurse -Force server-swift/azooKey_dictionary_storage/Dictionary build
