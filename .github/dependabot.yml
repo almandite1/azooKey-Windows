@@ -1,0 +1,19 @@
+version: 2
+
+updates:
+  # Keeps the SHA pins in workflows/actions.yml current. Without this, a
+  # deprecation like the node20 one only surfaces as a run annotation that
+  # somebody has to notice; here it arrives as a PR that CI has already built.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # One PR for the whole set. taiki-e/install-action releases most weeks and
+    # each PR costs a ~25 min Windows build, so ungrouped updates would burn
+    # runner time to review the same workflow file several times over.
+    groups:
+      actions:
+        patterns:
+          - '*'
+    commit-message:
+      prefix: ci

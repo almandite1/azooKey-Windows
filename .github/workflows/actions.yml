@@ -1,8 +1,15 @@
 name: Rust
 
 on:
+  # a docs-only change cannot break a 25 min Windows build
   push:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
   workflow_dispatch:
 
 # a newer push to the same branch supersedes the running build
@@ -10,24 +17,35 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# nothing here writes back to the repository
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: windows-latest
+    # a healthy run is ~25 min; past an hour it is hung, not slow, and the
+    # 6 h default would sit on the runner until someone noticed
+    timeout-minutes: 60
 
+    # every `uses:` below is pinned to a full commit SHA rather than a tag,
+    # because tags can be moved after the fact. The downloads further down are
+    # SHA256-verified for the same reason; floating tags here would have been
+    # the weak link. Dependabot (.github/dependabot.yml) bumps the SHAs and
+    # rewrites the trailing version comment, so this stays maintainable.
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         submodules: recursive
 
     - name: Cache Rust
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
     # 6.3.3 matches the locally verified toolchain (devenv.bat); newer SDKs
     # no longer need the ucrt.modulemap patch the 6.0.2 setup fetched from a
-    # personal gist. The action itself is tag-pinned: binaries below are
-    # SHA256-pinned, so tracking a moving @main here undercut that.
+    # personal gist.
     - name: Install Swift
-      uses: compnerd/gha-setup-swift@v0.4.0
+      uses: compnerd/gha-setup-swift@eeda069c5bc95ac8a9ac5cea7d4f588ae5420ca5 # v0.4.0
       with:
         swift-version: swift-6.3.3-release
         swift-build: 6.3.3-RELEASE
@@ -35,20 +53,24 @@ jobs:
     # still node20 upstream (no newer release exists), so the runner forces it
     # onto node24 and warns; nothing to bump until arduino ships a node24 build
     - name: Install Protoc
-      uses: arduino/setup-protoc@v3
+      uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
 
     - name: Install x86 Rust target
       run: rustup target add i686-pc-windows-msvc
 
+    # a checksum-verified prebuilt binary; `cargo install` rebuilt it from
+    # source on every run and cost ~4.5 min of the ~25 min total
     - name: Install cargo-make
-      run: cargo install --force cargo-make
+      uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+      with:
+        tool: cargo-make
 
     # ~600 MB of pinned artifacts (three llama zips + the zenz model);
     # the key embeds the llama release tag and the zenz SHA256 prefix, so
     # bumping either in the download step below invalidates the cache
     - name: Cache prebuilt llama and zenz model
       id: cache-prebuilt
-      uses: actions/cache@v6
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           llama_cpu
@@ -123,8 +145,11 @@ jobs:
       run: cargo clippy --workspace --all-targets --release -- -D warnings
 
     - name: Upload Setup Artifact
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: azookey-setup
         path: build/azookey-setup.exe
         if-no-files-found: error
+        # the installer bundles the models and is large; nobody reaches for a
+        # build older than a couple of weeks, so do not keep it the full 90 days
+        retention-days: 14
