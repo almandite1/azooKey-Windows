@@ -1,5 +1,17 @@
 version: 2
 
+# Policy: dependencies track the newest release, not just the newest release
+# that closes a CVE. Security-only updates are a separate, always-on GitHub
+# feature; the entries here are *version* updates, which is what keeps the tree
+# from drifting far enough that a security bump turns into a migration. The
+# tauri/wry situation in issue 51 is what that drift costs.
+#
+# Minor and patch updates are grouped into one PR per ecosystem, because each
+# PR costs a ~16 min Windows build and six separate lockfile diffs buy nothing.
+# Major updates deliberately fall outside the groups and arrive one at a time:
+# those are the ones that break a build or change an API, and they are worth
+# looking at on their own.
+
 updates:
   # Keeps the SHA pins in workflows/actions.yml current. Without this, a
   # deprecation like the node20 one only surfaces as a run annotation that
@@ -8,12 +20,45 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    # One PR for the whole set. taiki-e/install-action releases most weeks and
-    # each PR costs a ~25 min Windows build, so ungrouped updates would burn
-    # runner time to review the same workflow file several times over.
     groups:
       actions:
         patterns:
           - '*'
     commit-message:
       prefix: ci
+
+  # The workspace lockfile, covering every crate including the shipped TIP DLL,
+  # the server and the candidate window.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: chore
+      include: scope
+
+  # The Tauri settings app. Its lockfile is separate from the Rust one, so it
+  # gets its own entry and its own PR.
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: chore
+      include: scope
