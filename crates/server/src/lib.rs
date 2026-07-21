@@ -8,10 +8,18 @@ use tokio::{
 };
 use tonic::transport::server::Connected;
 use windows::{
-    core::w,
-    Win32::Security::{
-        Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION},
-        PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    core::{HSTRING, PCWSTR, PWSTR},
+    Win32::{
+        Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL},
+        Security::{
+            Authorization::{
+                ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                SDDL_REVISION,
+            },
+            GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+            TOKEN_USER,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
 
@@ -82,6 +90,55 @@ impl AsyncWrite for TonicNamedPipeServer {
     }
 }
 
+/// SID string (e.g. `S-1-5-21-…`) of the user running this process. Used to
+/// scope the pipe DACL to the owning user instead of the whole Builtin Users
+/// group, so a different local user (RDP / fast user switching) cannot reach
+/// this session's pipe even though the pipe name is predictable.
+fn current_user_sid_string() -> io::Result<String> {
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .map_err(|e| io::Error::other(format!("OpenProcessToken failed: {e}")))?;
+
+        // Query TokenUser, then look up the SID, always closing the token.
+        let result = (|| {
+            let mut needed = 0u32;
+            // First call sizes the buffer; it is expected to fail with
+            // ERROR_INSUFFICIENT_BUFFER while writing the required length.
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+            if needed == 0 {
+                return Err(io::Error::other("GetTokenInformation returned zero length"));
+            }
+
+            let mut buffer = vec![0u8; needed as usize];
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buffer.as_mut_ptr() as *mut c_void),
+                needed,
+                &mut needed,
+            )
+            .map_err(|e| io::Error::other(format!("GetTokenInformation failed: {e}")))?;
+
+            let token_user = &*(buffer.as_ptr() as *const TOKEN_USER);
+            let mut sid_string = PWSTR::null();
+            ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string)
+                .map_err(|e| io::Error::other(format!("ConvertSidToStringSidW failed: {e}")))?;
+
+            let owned = sid_string
+                .to_string()
+                .map_err(|e| io::Error::other(format!("SID string was not valid UTF-16: {e}")));
+            // ConvertSidToStringSidW allocates with LocalAlloc; free it whether
+            // or not the UTF-16 decode succeeded.
+            let _ = LocalFree(HLOCAL(sid_string.0 as *mut c_void));
+            owned
+        })();
+
+        let _ = CloseHandle(token);
+        result
+    }
+}
+
 impl TonicNamedPipeServer {
     pub fn new(path: &str) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>>> {
         // set security attributes to allow ipc from sandboxed processes
@@ -91,23 +148,29 @@ impl TonicNamedPipeServer {
 
         let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
 
+        // DACL: sandboxed principals may CONNECT but not CREATE pipe instances.
+        // GENERIC_ALL (GA) includes FILE_CREATE_PIPE_INSTANCE, so the original
+        // all-GA descriptor let any AppContainer (AC) or restricted (RC)
+        // process stand up a rogue instance of this pipe and receive a peer
+        // client's connection — intercepting the raw keystroke stream
+        // (AppendText). AC/RC get 0x12019B (FILE_GENERIC_READ|FILE_GENERIC_WRITE
+        // minus FILE_APPEND_DATA == minus FILE_CREATE_PIPE_INSTANCE), which is
+        // exactly what the client opens with (see shared::pipe::
+        // PIPE_CLIENT_ACCESS), so connecting still works. The owning user's SID
+        // (not the whole BU group) keeps GA: the server runs as that user and
+        // must create instances, while a *different* local user — whose token
+        // lacks this SID — is no longer granted access, closing the RDP / fast-
+        // user-switching cross-session hole. SY/BA keep GA for SYSTEM and an
+        // elevated server. SACL unchanged: low-IL clients (sandboxed browsers)
+        // may still write up to the pipe.
+        let user_sid = current_user_sid_string()?;
+        let sddl = HSTRING::from(format!(
+            "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{user_sid})(A;;0x12019b;;;AC)(A;;0x12019b;;;RC)S:(ML;;NW;;;LW)"
+        ));
+
         unsafe {
-            // DACL: sandboxed principals may CONNECT but not CREATE pipe
-            // instances. GENERIC_ALL (GA) includes FILE_CREATE_PIPE_INSTANCE,
-            // so the original all-GA descriptor let any AppContainer (AC) or
-            // restricted (RC) process stand up a rogue instance of this pipe
-            // and receive a peer client's connection — intercepting the raw
-            // keystroke stream (AppendText). AC/RC now get 0x12019B
-            // (FILE_GENERIC_READ|FILE_GENERIC_WRITE minus FILE_APPEND_DATA ==
-            // minus FILE_CREATE_PIPE_INSTANCE), which is exactly what the
-            // client opens with (see shared::pipe::PIPE_CLIENT_ACCESS), so
-            // connecting still works. SY/BA/BU keep GA: the server itself runs
-            // as BU (or elevated BA) and must create instances, and a full
-            // same-user process is not a security boundary in Windows anyway.
-            // SACL unchanged: low-IL clients (sandboxed browsers) may still
-            // write up to the pipe.
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;BU)(A;;0x12019b;;;AC)(A;;0x12019b;;;RC)S:(ML;;NW;;;LW)"),
+                PCWSTR(sddl.as_ptr()),
                 SDDL_REVISION,
                 &mut security_descriptor,
                 None,
