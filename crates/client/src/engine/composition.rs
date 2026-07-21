@@ -237,7 +237,10 @@ impl TextServiceFactory {
     ///
     /// `Some` means the TIP eats the key and `handle_key` runs the attached
     /// actions; `None` hands the key to the host untouched.
-    #[tracing::instrument]
+    // skip(self, context): self's Debug is the entire composition including
+    // the candidate list — hundreds of entries per span, which buried the
+    // logs it was meant to illuminate
+    #[tracing::instrument(skip(self, context))]
     pub fn process_key(
         &self,
         context: Option<&ITfContext>,
@@ -294,12 +297,12 @@ impl TextServiceFactory {
     /// probes speculatively — without a following OnKeyDown — cannot
     /// disturb the composition. The actions run in `handle_key` when the
     /// host delivers the key for real.
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self, context))]
     pub fn test_key(&self, context: Option<&ITfContext>, wparam: WPARAM) -> Result<bool> {
         Ok(self.process_key(context, wparam)?.is_some())
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self, context))]
     pub fn handle_key(&self, context: Option<&ITfContext>, wparam: WPARAM) -> Result<bool> {
         if let Some(context) = context {
             self.borrow_mut()?.context = Some(context.clone());
@@ -315,7 +318,7 @@ impl TextServiceFactory {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     pub fn handle_action(
         &self,
         actions: &[ClientAction],

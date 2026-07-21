@@ -228,7 +228,10 @@ impl FakeIpc {
 
 // implement methods to interact with kkc server
 impl IPCService {
-    #[tracing::instrument]
+    // skip(self) on every RPC below: IPCService's Debug is the two tonic
+    // channels plus the tokio runtime, ~3 KB of boilerplate per span that
+    // says nothing about the call. The arguments are the interesting part.
+    #[tracing::instrument(skip(self))]
     pub fn append_text(&mut self, text: String) -> anyhow::Result<Candidates> {
         #[cfg(test)]
         if let Some(result) =
@@ -252,7 +255,7 @@ impl IPCService {
             .ok_or_else(|| anyhow::anyhow!("composing_text is None"))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     pub fn remove_text(&mut self) -> anyhow::Result<Candidates> {
         #[cfg(test)]
         if let Some(result) = self.fake_call(|fake| fake.engine_answer(IpcCall::RemoveText)) {
@@ -272,7 +275,7 @@ impl IPCService {
             .ok_or_else(|| anyhow::anyhow!("composing_text is None"))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     pub fn clear_text(&mut self) -> anyhow::Result<()> {
         #[cfg(test)]
         if let Some(result) = self.fake_call(|fake| {
@@ -295,7 +298,7 @@ impl IPCService {
         Ok(())
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     pub fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
         #[cfg(test)]
         if let Some(result) = self.fake_call(|fake| fake.engine_answer(IpcCall::ShrinkText(offset)))
@@ -344,7 +347,7 @@ impl IPCService {
 // window RPCs are cosmetic: a dead or slow UI process must not break text
 // input, so failures are logged and swallowed instead of propagated.
 impl IPCService {
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     pub fn show_window(&mut self) {
         #[cfg(test)]
         if self
@@ -365,7 +368,7 @@ impl IPCService {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     pub fn hide_window(&mut self) {
         #[cfg(test)]
         if self
@@ -386,7 +389,7 @@ impl IPCService {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     pub fn set_window_position(&mut self, top: i32, left: i32, bottom: i32, right: i32) {
         #[cfg(test)]
         if self
@@ -414,7 +417,7 @@ impl IPCService {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     pub fn set_candidates(&mut self, candidates: Vec<String>) {
         #[cfg(test)]
         if self
@@ -437,7 +440,7 @@ impl IPCService {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     pub fn set_selection(&mut self, index: i32) {
         #[cfg(test)]
         if self
@@ -460,7 +463,7 @@ impl IPCService {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     pub fn set_input_mode(&mut self, mode: &str) {
         #[cfg(test)]
         if self

@@ -15,3 +15,13 @@ linker_messages = "allow"
 syn = "2.0"
 quote = "1.0"
 proc-macro2 = "1.0"
+
+# the generated code names anyhow, tracing and windows; the integration
+# tests are a separate crate, so they need them to compile it
+[dev-dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies.windows]
+workspace = true
+features = ["Win32_Foundation"]

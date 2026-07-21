@@ -49,11 +49,19 @@ fn extract_ok_type(return_type: &ReturnType) -> Result<&Type, TokenStream> {
 ///     Ok(v) => Ok(v),
 ///     Err(e) => {
 ///       tracing::error!("Error: {:?}", e);
-///       Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
+///       // an HRESULT the callee chose is carried through; anything else
+///       // becomes E_FAIL
+///       match e.downcast_ref::<windows::core::Error>() {
+///         Some(win_err) => Err(win_err.clone()),
+///         None => Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL)),
+///       }
 ///     }
 ///   }
 /// }
 /// ```
+///
+/// Attributes written below `#[macros::anyhow]` and the function's
+/// visibility are preserved.
 pub fn anyhow(_: TokenStream, input: TokenStream) -> TokenStream {
     // parse the input function
     let input_fn = parse_macro_input!(input as ItemFn);
@@ -62,6 +70,12 @@ pub fn anyhow(_: TokenStream, input: TokenStream) -> TokenStream {
     let fn_name = &input_fn.sig.ident;
     let fn_inputs = &input_fn.sig.inputs;
     let fn_body = &input_fn.block;
+    // Attributes and visibility have to be re-emitted: anything the caller
+    // wrote *below* `#[macros::anyhow]` reaches us in `attrs`, and dropping
+    // them removes them silently. `#[tracing::instrument]` was the casualty
+    // — the key-event spans trace.rs is built around never fired.
+    let fn_attrs = &input_fn.attrs;
+    let fn_vis = &input_fn.vis;
 
     // check if the function has a return type
     let output = match &input_fn.sig.output {
@@ -85,7 +99,8 @@ pub fn anyhow(_: TokenStream, input: TokenStream) -> TokenStream {
     // across the COM (extern "system") boundary aborts the host process,
     // so it must be converted to an HRESULT here.
     let generated = quote! {
-        fn #fn_name(#fn_inputs) -> windows::core::Result<#output> {
+        #(#fn_attrs)*
+        #fn_vis fn #fn_name(#fn_inputs) -> windows::core::Result<#output> {
             let result: std::thread::Result<Result<#output>> =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| #fn_body));
 
@@ -93,7 +108,16 @@ pub fn anyhow(_: TokenStream, input: TokenStream) -> TokenStream {
                 Ok(Ok(v)) => Ok(v),
                 Ok(Err(e)) => {
                     tracing::error!("Error: {:?}", e);
-                    Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
+                    // A callee that deliberately built a windows::core::Error
+                    // chose that HRESULT — E_NOINTERFACE for an unknown riid,
+                    // say — and hosts branch on it. Collapsing everything to
+                    // E_FAIL threw that away; carry the original through
+                    // (cloned, so its message survives too) and fall back to
+                    // E_FAIL only for errors that never had an HRESULT.
+                    match e.downcast_ref::<windows::core::Error>() {
+                        Some(win_err) => Err(win_err.clone()),
+                        None => Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL)),
+                    }
                 }
                 Err(panic) => {
                     let message = panic

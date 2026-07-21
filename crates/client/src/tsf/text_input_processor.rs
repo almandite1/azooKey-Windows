@@ -151,7 +151,10 @@ impl TextServiceFactory {
 
 impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
-    #[tracing::instrument]
+    // skip(self): the #[implement]-generated TextServiceFactory_Impl has no
+    // Debug, and the factory's Debug output is a whole composition dump in
+    // any case — the tid is what identifies the activation
+    #[tracing::instrument(skip(self, ptim))]
     fn Activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
         tracing::debug!("Activated with tid: {tid}");
 
@@ -280,7 +283,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
     }
 
     #[macros::anyhow]
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     fn Deactivate(&self) -> Result<()> {
         tracing::debug!("Deactivated");
 

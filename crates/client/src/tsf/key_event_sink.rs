@@ -13,7 +13,10 @@ use super::factory::TextServiceFactory_Impl;
 // sink (aka event listener) for key events
 impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
-    #[tracing::instrument]
+    // skip(self, pic): TextServiceFactory_Impl has no Debug, and the context
+    // pointer says nothing a reader can act on. wparam — which key — is the
+    // field that makes these spans worth having.
+    #[tracing::instrument(skip(self, pic))]
     fn OnTestKeyDown(
         &self,
         pic: Option<&ITfContext>,
@@ -31,7 +34,7 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     }
 
     #[macros::anyhow]
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self, pic))]
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         // this function is called when a key is pressed
         // we can handle key events here
