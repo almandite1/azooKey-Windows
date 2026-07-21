@@ -143,6 +143,82 @@ fn uninstall_stops_the_running_processes() {
     }
 }
 
+/// Returns the body of a `[Code]` procedure/function, from its header to
+/// the next top-level declaration.
+fn code_block(iss: &str, header: &str) -> String {
+    let start = iss
+        .find(header)
+        .unwrap_or_else(|| panic!("Installer.iss should define {header}"));
+    let rest = &iss[start..];
+    let end = rest[1..]
+        .find("\nprocedure ")
+        .into_iter()
+        .chain(rest[1..].find("\nfunction "))
+        .min()
+        .map(|i| i + 1)
+        .unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// Issue #4: an upgrade installs over a running stack, whose executables
+/// are locked, so installation must stop it before the [Files] copies —
+/// not only on uninstall.
+#[test]
+fn install_stops_the_running_stack_before_copying() {
+    let iss = read("Installer.iss");
+
+    assert!(
+        iss.contains("function PrepareToInstall("),
+        "the stack must be stopped from PrepareToInstall, which also runs \
+         for a silent install (a wizard-page hook would not)"
+    );
+
+    let body = code_block(&iss, "procedure StopRunningStack");
+    for proc in [
+        "launcher.exe",
+        "ui.exe",
+        "azookey-server.exe",
+        "Azookey.exe",
+    ] {
+        assert!(
+            body.contains(proc),
+            "install-time taskkill must target {proc}: got {body}"
+        );
+    }
+    assert!(
+        body.contains("/End /TN \"Azookey Startup\""),
+        "the startup task must be ended, or it can relaunch the stack \
+         between the kill and the copies"
+    );
+}
+
+/// launcher.exe runs as administrator, and the startup task is
+/// machine-scope. `runascurrentuser` de-elevates the spawned process, so a
+/// taskkill carrying it silently fails to kill the launcher and the task
+/// deletion is denied — the exact lock the kill exists to prevent.
+#[test]
+fn process_teardown_is_not_de_elevated() {
+    let iss = read("Installer.iss");
+
+    let start = iss
+        .find("[UninstallRun]")
+        .expect("Installer.iss should have an [UninstallRun] section");
+    let rest = &iss[start..];
+    let end = rest[1..].find("\n[").map(|i| i + 1).unwrap_or(rest.len());
+    // directives only: an Inno comment line starts with ';', and the comment
+    // above these entries names the flag in order to explain its absence
+    let directives: String = rest[..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with(';'))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !directives.contains("runascurrentuser"),
+        "uninstall's taskkill/schtasks must stay elevated: got {directives}"
+    );
+}
+
 /// The build-directory glob must not re-copy the TIP DLL: it is already
 /// placed and registered as azookey.dll / azookey32.dll, so the glob would
 /// only add unregistered dead copies.

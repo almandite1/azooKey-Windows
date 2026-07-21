@@ -98,15 +98,20 @@ Type: files; Name: "{app}\launch.vbs"
 [UninstallRun]
 ; stop the running IME processes first, or their exe/dll files stay locked
 ; and {app} can't be removed (UninstallNeedRestart hides this by deferring
-; deletion to the reboot, but the unregistered DLL keeps loading until then)
+; deletion to the reboot, but the unregistered DLL keeps loading until then).
+; Azookey.exe is the settings app, whose NSIS uninstaller is chained from
+; usPostUninstall and cannot delete its own running exe either.
+; NOT runascurrentuser: that de-elevates the child, and launcher.exe runs as
+; administrator — a de-elevated taskkill cannot touch it, and only an
+; elevated schtasks may delete a machine-scope task.
 Filename: "taskkill"; \
   RunOnceId: "KillAzookeyProcs"; \
-  Parameters: "/F /IM launcher.exe /IM ui.exe /IM azookey-server.exe"; \
-  Flags: runhidden runascurrentuser
+  Parameters: "/F /IM launcher.exe /IM ui.exe /IM azookey-server.exe /IM Azookey.exe"; \
+  Flags: runhidden
 Filename: "schtasks"; \
   RunOnceId: "DelAzookeyStartupTask"; \
   Parameters: "/Delete /TN ""Azookey Startup"" /F"; \
-  Flags: runhidden runascurrentuser
+  Flags: runhidden
 
 [Code]
 function InitializeSetup: Boolean;
@@ -205,6 +210,45 @@ begin
   end;
 end;
 
+
+// An upgrade installs over a running stack: launcher.exe, ui.exe and
+// azookey-server.exe hold the installed executables open, so the [Files]
+// copies land on in-use files and turn into a Restart Manager prompt, a
+// forced app close, or an outright failure. The uninstaller already stops
+// these processes; installation has to do the same first.
+//
+// Deliberately elevated — no runascurrentuser / ShellExecAsOriginalUser:
+// launcher.exe runs as administrator, so a de-elevated taskkill cannot
+// touch it.
+//
+// Note this does not unload azookey.dll from the text applications that
+// have it loaded; those are the host's processes, not ours, and Inno's
+// Restart Manager handling already covers that case.
+//
+// Line comments, not brace comments: a { } comment mentioning an Inno
+// constant would be closed early by the constant's own closing brace.
+procedure StopRunningStack();
+var
+  Dummy: Integer;
+begin
+  // End the startup task first: it is what would put a fresh launcher back
+  // between the kill and the copies.
+  ShellExec('', 'schtasks', '/End /TN "Azookey Startup"', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
+  // Azookey.exe is the settings app, installed by the chained Tauri NSIS,
+  // which cannot replace its own running exe either.
+  ShellExec('', 'taskkill', '/F /IM launcher.exe /IM ui.exe /IM azookey-server.exe /IM Azookey.exe', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
+  // taskkill returns once termination has been requested; the file handles
+  // close a moment later. Nothing to wait on, so give the OS that moment.
+  Sleep(1500);
+end;
+
+// Runs just before the file copies, and unlike a wizard-page hook it also
+// runs for a silent install.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  StopRunningStack();
+  Result := '';
+end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
