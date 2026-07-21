@@ -13,9 +13,7 @@ use super::{
     ipc_service::{Candidates, IPCService, ServerUnavailable},
     state::IMEState,
     text_util::{to_half_katakana, to_katakana},
-    transition::{
-        is_modifier_key, shortcut_transition, transition, KeyDisposition, KeystrokeContext,
-    },
+    transition::{is_modifier_key, shortcut_transition, transition, KeystrokeContext},
 };
 use windows::Win32::{
     Foundation::WPARAM,
@@ -236,12 +234,15 @@ impl TextServiceFactory {
     /// (engine::transition): reads the OS/COM state they need, decodes the
     /// key, and adapts the result. New key bindings belong in the
     /// transition table, not here.
+    ///
+    /// `Some` means the TIP eats the key and `handle_key` runs the attached
+    /// actions; `None` hands the key to the host untouched.
     #[tracing::instrument]
     pub fn process_key(
         &self,
         context: Option<&ITfContext>,
         wparam: WPARAM,
-    ) -> Result<Option<(Vec<ClientAction>, CompositionState, KeyDisposition)>> {
+    ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
         if context.is_none() {
             return Ok(None);
         };
@@ -253,12 +254,15 @@ impl TextServiceFactory {
             return Ok(None);
         }
 
-        // a Ctrl or Alt chord is the host's shortcut: cancel any composition
-        // so the shortcut actually works (issue #5), and never eat the key.
-        // Without the Alt check, Alt+letter fell through to the ToUnicode
-        // decoder, which translates it like a WM_SYSCHAR — the TIP ate the
-        // host's menu accelerator and turned it into composition input.
-        // (AltGr arrives as Ctrl+Alt, so it took this branch already.)
+        // A Ctrl or Alt chord is the host's shortcut. During a composition
+        // the TIP owns the keyboard (MS-IME convention): the chord is eaten
+        // and cancels the composition, and the next press — or the chord's
+        // own autorepeat, since the state is None by then — passes through
+        // and fires the shortcut (issue #5). Without the Alt check,
+        // Alt+letter fell through to the ToUnicode decoder, which translates
+        // it like a WM_SYSCHAR — the TIP ate the host's menu accelerator and
+        // turned it into composition input. (AltGr arrives as Ctrl+Alt, so
+        // it took this branch already.)
         if VK_CONTROL.is_pressed() || VK_MENU.is_pressed() {
             let state = {
                 let text_service = self.borrow()?;
@@ -266,7 +270,7 @@ impl TextServiceFactory {
                 state
             };
             return Ok(shortcut_transition(&state, is_modifier_key(wparam.0))
-                .map(|(next_state, actions)| (actions, next_state, KeyDisposition::PassThrough)));
+                .map(|(next_state, actions)| (actions, next_state)));
         }
 
         let ctx = {
@@ -282,28 +286,17 @@ impl TextServiceFactory {
 
         let action = UserAction::try_from(wparam.0)?;
 
-        Ok(transition(&ctx, action)
-            .map(|(next_state, actions)| (actions, next_state, KeyDisposition::Eat)))
+        Ok(transition(&ctx, action).map(|(next_state, actions)| (actions, next_state)))
     }
 
-    /// Answers OnTestKeyDown. Pass-through actions (canceling the
-    /// composition on a shortcut) must run HERE: once we answer "not
-    /// eaten", the host processes the key itself and never calls
-    /// OnKeyDown. Canceling twice is harmless (a no-op without a live
-    /// composition), so a host that probes speculatively stays safe.
+    /// Answers OnTestKeyDown. A pure query, as the ITfKeyEventSink contract
+    /// requires (issue #26): it decides but never acts, so a host that
+    /// probes speculatively — without a following OnKeyDown — cannot
+    /// disturb the composition. The actions run in `handle_key` when the
+    /// host delivers the key for real.
     #[tracing::instrument]
     pub fn test_key(&self, context: Option<&ITfContext>, wparam: WPARAM) -> Result<bool> {
-        match self.process_key(context, wparam)? {
-            None => Ok(false),
-            Some((actions, next_state, KeyDisposition::PassThrough)) => {
-                if let Some(context) = context {
-                    self.borrow_mut()?.context = Some(context.clone());
-                }
-                self.handle_action(&actions, next_state)?;
-                Ok(false)
-            }
-            Some((_, _, KeyDisposition::Eat)) => Ok(true),
-        }
+        Ok(self.process_key(context, wparam)?.is_some())
     }
 
     #[tracing::instrument]
@@ -314,9 +307,9 @@ impl TextServiceFactory {
             return Ok(false);
         };
 
-        if let Some((actions, transition, disposition)) = self.process_key(context, wparam)? {
+        if let Some((actions, transition)) = self.process_key(context, wparam)? {
             self.handle_action(&actions, transition)?;
-            Ok(disposition == KeyDisposition::Eat)
+            Ok(true)
         } else {
             Ok(false)
         }

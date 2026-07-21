@@ -20,10 +20,11 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<BOOL> {
-        // TRUE = we will handle this key in OnKeyDown. FALSE hands the key
-        // to the host — which then never calls OnKeyDown, so pass-through
-        // side effects (canceling the composition on a Ctrl shortcut,
-        // issue #5) run inside test_key before we answer.
+        // TRUE = we will handle this key in OnKeyDown. A pure query, as the
+        // contract requires (issue #26): a Ctrl/Alt chord during a
+        // composition answers TRUE, and the cancel runs in OnKeyDown when
+        // the host delivers the key — never here, so a speculative probe
+        // cannot discard the user's composition.
         let result = self.test_key(pic, wparam)?;
 
         Ok(result.into())

@@ -31,16 +31,6 @@ pub struct KeystrokeContext {
     pub suffix_is_empty: bool,
 }
 
-/// What the host should be told about a keystroke after the TIP decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyDisposition {
-    /// The TIP consumed the key; the host must not process it.
-    Eat,
-    /// The key belongs to the host application. Any actions attached to
-    /// it (e.g. canceling the composition on a shortcut) run first.
-    PassThrough,
-}
-
 /// True for keydowns of the modifier keys themselves (Shift/Ctrl/Alt and
 /// their L/R variants). While Ctrl or Alt is held these arrive too —
 /// including the modifier's own autorepeat — and must never be treated as
@@ -58,9 +48,13 @@ pub fn is_modifier_key(key_code: usize) -> bool {
 /// composition still open, and hosts ignore shortcuts while composing;
 /// Alt chords are menu accelerators and get the same treatment).
 ///
-/// During a composition the TIP cancels its input and hands the key to
-/// the host; outside a composition the key simply passes through. The
-/// disposition is always [`KeyDisposition::PassThrough`].
+/// During a composition the chord is eaten and cancels the input — the
+/// MS-IME convention that the composition owns the keyboard — so the next
+/// press (or the chord's own autorepeat) finds no composition, passes
+/// through, and fires the host's shortcut. Outside a composition (`None`
+/// here) the key passes through untouched. Running the cancel on the
+/// *eaten* side is what keeps OnTestKeyDown pure (issue #26): a
+/// speculative probe gets an answer, never a side effect.
 pub fn shortcut_transition(
     state: &CompositionState,
     key_is_modifier: bool,
@@ -498,9 +492,10 @@ mod tests {
         }
     }
 
-    /// Upstream issue #5: a Ctrl shortcut during a composition must cancel
-    /// the input (so the host's shortcut actually works) — from both
-    /// Composing and Previewing.
+    /// Upstream issue #5: a Ctrl shortcut during a composition is eaten
+    /// and cancels the input, so the next press finds no composition and
+    /// the host's shortcut actually works — from both Composing and
+    /// Previewing.
     #[test]
     fn a_shortcut_during_a_composition_cancels_the_input() {
         for state in [CompositionState::Composing, CompositionState::Previewing] {
