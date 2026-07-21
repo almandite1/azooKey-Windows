@@ -127,7 +127,14 @@ impl AppConfig {
             }
         }
 
-        let config_str = serde_json::to_string_pretty(self)
+        // whatever version the caller happens to be holding, what lands on
+        // disk is this build's schema — the settings app round-trips the
+        // whole config through the frontend, version field included
+        let stamped = AppConfig {
+            version: CONFIG_VERSION.to_string(),
+            ..self.clone()
+        };
+        let config_str = serde_json::to_string_pretty(&stamped)
             .map_err(|e| format!("failed to serialize settings: {e}"))?;
         std::fs::write(&config_path, config_str)
             .map_err(|e| format!("failed to write {}: {e}", config_path.display()))
@@ -156,7 +163,11 @@ impl AppConfig {
                 return LoadOutcome::Malformed;
             }
         };
-        match serde_json::from_str(&config_str) {
+        // Windows editors readily save UTF-8 with a BOM, and serde_json
+        // rejects one — without this a hand-edit through Notepad looks like a
+        // corrupt file and costs the user their settings
+        let config_str = config_str.strip_prefix('\u{feff}').unwrap_or(&config_str);
+        match serde_json::from_str(config_str) {
             Ok(config) => LoadOutcome::Parsed(config),
             Err(e) => {
                 eprintln!("invalid {}: {e}", config_path.display());
@@ -369,6 +380,38 @@ mod tests {
             original,
             "an unknown version is not safe to rewrite"
         );
+    }
+
+    #[test]
+    fn a_utf8_bom_is_tolerated() {
+        let root = TempConfigRoot::new();
+        root.write_settings(
+            "\u{feff}{\"version\":\"0.1.0\",\"zenzai\":{\"enable\":true,\"profile\":\"p\",\"backend\":\"cpu\"}}",
+        );
+
+        let config = AppConfig::new_in(root.path());
+
+        assert!(config.zenzai.enable, "a BOM is not corruption");
+        assert!(
+            !root.path().join(SETTINGS_BACKUP_FILENAME).exists(),
+            "a BOM must not trigger the malformed path"
+        );
+    }
+
+    #[test]
+    fn writing_always_stamps_the_current_version() {
+        let root = TempConfigRoot::new();
+        // a caller holding a version it read elsewhere must not be able to
+        // push that version onto a file this build wrote
+        let config = AppConfig {
+            version: "99.0.0".to_string(),
+            ..AppConfig::default()
+        };
+
+        config.write_to(root.path()).expect("write");
+
+        let written = AppConfig::new_in(root.path());
+        assert_eq!(written.version, CONFIG_VERSION);
     }
 
     #[test]
