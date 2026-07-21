@@ -11,6 +11,25 @@ use tonic::transport::Channel;
 /// request instead of freezing the host application forever.
 const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Marker error meaning the conversion server could not be reached: it
+/// crashed, is restarting (the launcher supervises and relaunches it), or
+/// hung past [`RPC_TIMEOUT`]. Distinct from a server-side logic error so the
+/// composition layer can tell "the server lost my state" (reset the client
+/// composition) from "the server rejected this request" (surface as-is). The
+/// engine RPCs tag their transport/timeout failures with this; a normal RPC
+/// on a live server never produces it, so reacting to it cannot disturb the
+/// happy typing path.
+#[derive(Debug)]
+pub struct ServerUnavailable;
+
+impl std::fmt::Display for ServerUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "azookey server is unavailable")
+    }
+}
+
+impl std::error::Error for ServerUnavailable {}
+
 // connect to kkc server
 #[derive(Debug, Clone)]
 pub struct IPCService {
@@ -133,17 +152,26 @@ impl IPCService {
         })
     }
 
-    /// Runs one RPC on the internal runtime with a hard deadline.
+    /// Runs one RPC on the internal runtime with a hard deadline. A timeout or
+    /// a transport-level failure (`Unavailable` — the pipe is gone because the
+    /// server crashed/restarted) is tagged [`ServerUnavailable`] so callers can
+    /// recover the composition; a server-side status (e.g. `InvalidArgument`)
+    /// is surfaced unchanged.
     fn exec<T>(
         &self,
         fut: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     ) -> Result<T> {
         self.runtime.block_on(async {
-            time::timeout(RPC_TIMEOUT, fut)
-                .await
-                .map_err(|_| anyhow::anyhow!("IPC request timed out after {RPC_TIMEOUT:?}"))?
-                .map_err(anyhow::Error::from)
-                .map(|response| response.into_inner())
+            match time::timeout(RPC_TIMEOUT, fut).await {
+                Err(_) => Err(anyhow::Error::new(ServerUnavailable)
+                    .context(format!("IPC request timed out after {RPC_TIMEOUT:?}"))),
+                Ok(Err(status)) if status.code() == tonic::Code::Unavailable => {
+                    Err(anyhow::Error::new(ServerUnavailable)
+                        .context(format!("IPC transport error: {status}")))
+                }
+                Ok(Err(status)) => Err(anyhow::Error::from(status)),
+                Ok(Ok(response)) => Ok(response.into_inner()),
+            }
         })
     }
 }
@@ -162,6 +190,10 @@ pub struct FakeIpc {
     /// when true, the engine RPCs fail like a dead server (window RPCs
     /// stay silent, mirroring the real cosmetic/advisory split)
     pub engine_fails: bool,
+    /// when true, the engine RPCs fail with [`ServerUnavailable`], simulating
+    /// a crashed/restarting server (transport gone) rather than a generic
+    /// error — the trigger for the composition-reset recovery path
+    pub engine_unavailable: bool,
 }
 
 #[cfg(test)]
@@ -184,6 +216,9 @@ pub enum IpcCall {
 impl FakeIpc {
     fn engine_answer(&mut self, call: IpcCall) -> anyhow::Result<Candidates> {
         self.calls.push(call);
+        if self.engine_unavailable {
+            return Err(anyhow::Error::new(ServerUnavailable).context("fake server unavailable"));
+        }
         if self.engine_fails {
             anyhow::bail!("fake engine is down");
         }
