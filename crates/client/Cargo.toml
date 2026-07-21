@@ -58,4 +58,4 @@ features = [
 ]
 
 [build-dependencies]
-embed-resource = "3.0.1"
+embed-resource = { workspace = true }

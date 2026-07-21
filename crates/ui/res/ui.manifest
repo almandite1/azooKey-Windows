@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="Azookey.UI" version="1.0.0.0" processorArchitecture="*"/>
+  <description>azooKey candidate window and input mode indicator</description>
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <!-- uiAccess stays false: the UIAccess privilege is acquired at
+             runtime from a duplicated winlogon token (src/uiaccess.rs),
+             because the manifest route would need a signed binary in a
+             secure location. -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- Declared here rather than left to tao's runtime
+           SetProcessDpiAwarenessContext: that call must beat the first
+           top-level window and silently loses to whoever set the context
+           first, so the awareness would be one windowing-library upgrade
+           away from changing underneath the clamping logic, which computes
+           every candidate-window coordinate from scale_factor(). -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+      <!-- Pre-1607 fallback; ignored when dpiAwareness above is understood. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+    </windowsSettings>
+  </application>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10/11: without it the OS reports a capped version and
+           declines the newer per-monitor behaviour. -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>

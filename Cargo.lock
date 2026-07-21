@@ -4476,6 +4476,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "azookey-server",
+ "embed-resource",
  "serde",
  "serde_json",
  "shared",
