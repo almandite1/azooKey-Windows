@@ -3,6 +3,12 @@ name: Rust
 on:
   # a docs-only change cannot break a 25 min Windows build
   push:
+    # only the long-lived branches: a push to a PR branch is already covered by
+    # the pull_request trigger below, and without this filter every Dependabot
+    # rebase costs two full Windows builds of the same commit
+    branches:
+      - dev
+      - master
     paths-ignore:
       - '**.md'
       - 'LICENSE'
@@ -54,6 +60,12 @@ jobs:
     # onto node24 and warns; nothing to bump until arduino ships a node24 build
     - name: Install Protoc
       uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+      with:
+        # this action resolves the protoc release through the GitHub API, and
+        # unauthenticated it shares an hourly quota with every other build on
+        # the runner's IP. That is what failed PR #41's push run. The token
+        # only needs the read access the job already has.
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Install x86 Rust target
       run: rustup target add i686-pc-windows-msvc
