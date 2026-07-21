@@ -10,7 +10,7 @@ use super::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
     full_width::{to_fullwidth, to_fullwidth_ascii, to_halfwidth},
     input_mode::InputMode,
-    ipc_service::{Candidates, IPCService},
+    ipc_service::{Candidates, IPCService, ServerUnavailable},
     state::IMEState,
     text_util::{to_half_katakana, to_katakana},
     transition::{
@@ -52,6 +52,13 @@ pub struct Composition {
 
     pub state: CompositionState,
     pub tip_composition: Option<ITfComposition>,
+}
+
+/// True when `error` (or any of its causes) is a [`ServerUnavailable`] tag,
+/// i.e. an engine RPC failed because the conversion server was unreachable
+/// rather than because it rejected the request.
+fn is_server_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ServerUnavailable>())
 }
 
 /// Mirrors candidate entry `index` into the client-side composition
@@ -380,12 +387,60 @@ impl TextServiceFactory {
             Ok(())
         })();
 
+        // If the batch failed because the conversion server became
+        // unreachable (crash/restart/hang), the client composition can no
+        // longer be trusted to mirror the server: the server's per-connection
+        // reading is gone, but the client still holds the old preview/reading.
+        // Continuing would append the next keystroke onto a reading the fresh
+        // server never had (raw_input and the server state silently diverge).
+        // Reset the composition locally so the next keystroke opens a clean one
+        // against the fresh server session, and swallow this keystroke's error
+        // (we handled it) so the host does not also process the key.
+        let recovered = matches!(&result, Err(err) if is_server_unavailable(err));
+        if recovered {
+            self.reset_composition_after_server_loss(&mut edit, &mut ipc_service);
+        }
+
         // write back the state of the last successful action even when a
         // later action failed, keeping the client consistent with the server
         let text_service = self.borrow()?;
         let mut composition = text_service.borrow_mut_composition()?;
         edit.write_back(&mut composition);
-        result
+        drop(composition);
+        drop(text_service);
+
+        if recovered {
+            Ok(())
+        } else {
+            result
+        }
+    }
+
+    /// Locally tears down the composition after the server became unreachable
+    /// mid-batch. Releases the TSF composition handle and hides the candidate
+    /// window, then blanks the working copy so the write-back leaves the client
+    /// in the `None` state. Deliberately issues NO conversion-server RPC (that
+    /// pipe is the one that just failed — another call would only time out
+    /// again); the candidate-window RPCs go to the separate, still-live ui
+    /// process. Best-effort: we are already on an error path.
+    fn reset_composition_after_server_loss(
+        &self,
+        edit: &mut CompositionEdit,
+        ipc_service: &mut IPCService,
+    ) {
+        if let Err(error) = self.end_composition() {
+            tracing::warn!("end_composition during server-loss reset failed: {error:?}");
+        }
+        self.close_candidate_ui(ipc_service);
+
+        edit.state = CompositionState::None;
+        edit.selection_index = 0;
+        edit.corresponding_count = 0;
+        edit.preview.clear();
+        edit.suffix.clear();
+        edit.raw_input.clear();
+        edit.raw_hiragana.clear();
+        edit.candidates = Candidates::default();
     }
 
     /// Begins a TSF composition and opens the candidate UI. `open_candidate_ui`
@@ -1047,6 +1102,78 @@ mod tests {
             composition.corresponding_count, 9,
             "all typed input elements (watashino) correspond to the shown \
              text, so a following ShrinkText must drop them all"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// A server crash/restart mid-composition must not wedge input. The
+    /// engine RPC comes back `ServerUnavailable` (the launcher is restarting
+    /// the crashed server, whose per-connection reading is now empty); the
+    /// client would otherwise keep its old preview/reading and append the next
+    /// keystroke onto a reading the fresh server never had. Instead the arm
+    /// resets the composition to None locally — releasing the TSF composition
+    /// and hiding the candidate window — and swallows the error so the host
+    /// does not also process the key. The next keystroke then starts clean.
+    #[test]
+    fn append_resets_the_composition_when_the_server_becomes_unavailable() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(scripted(&["水"], "みず", &[4]));
+        // the server crashed: the next engine RPC fails as ServerUnavailable
+        fake.lock().unwrap().engine_unavailable = true;
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = unsafe { tip.as_impl() };
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Composing;
+            composition.preview = "水".to_string();
+            composition.raw_input = "mizu".to_string();
+            composition.raw_hiragana = "みず".to_string();
+            composition.corresponding_count = 4;
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        // the crashing keystroke is swallowed, not surfaced as an error
+        factory
+            .handle_action(
+                &[ClientAction::AppendText("ka".to_string())],
+                CompositionState::Composing,
+            )
+            .expect("a server-loss recovery must be swallowed, not surfaced");
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(
+            composition.state,
+            CompositionState::None,
+            "the composition must reset to None after the server was lost"
+        );
+        assert!(
+            composition.preview.is_empty()
+                && composition.suffix.is_empty()
+                && composition.raw_input.is_empty()
+                && composition.raw_hiragana.is_empty(),
+            "the stale reading must be cleared so the next keystroke starts fresh"
+        );
+        assert!(
+            composition.tip_composition.is_none(),
+            "the TSF composition handle must be released"
+        );
+        drop(composition);
+        drop(text_service);
+
+        // the candidate window was torn down (server pipe was NOT touched
+        // again — only the still-live ui process)
+        let calls = recorded_calls(&fake);
+        assert!(
+            calls.contains(&IpcCall::HideWindow),
+            "the candidate window must hide on a server-loss reset: {calls:?}"
+        );
+        assert!(
+            !calls.contains(&IpcCall::ClearText),
+            "the reset must not call the unreachable server again: {calls:?}"
         );
 
         IMEState::get().unwrap().ipc_service = None;
