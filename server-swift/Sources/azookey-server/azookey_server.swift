@@ -215,8 +215,9 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let pointer = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>.allocate(capacity: max(list.count, 1))
     for (i, item) in list.enumerated() {
-        pointer[i] = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
-        pointer[i]?.pointee = item
+        let element = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
+        element.initialize(to: item)
+        pointer[i] = element
     }
     return pointer
 }
