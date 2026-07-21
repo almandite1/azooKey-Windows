@@ -91,17 +91,42 @@ impl DllModule {
     }
 
     pub fn get_path() -> anyhow::Result<String> {
-        let path = {
-            let dll_instance = DllModule::get()?.hinst;
+        let dll_instance = DllModule::get()?
+            .hinst
+            .context("Dll instance not found")?;
 
-            let mut buffer: [u16; MAX_PATH as usize] = [0; MAX_PATH as usize];
-            let length = unsafe {
-                GetModuleFileNameW(dll_instance.context("Dll instance not found")?, &mut buffer)
-            };
+        // GetModuleFileNameW does not report the required length: it fills the
+        // buffer, and if the path does not fit it truncates and returns the
+        // buffer size. A single fixed MAX_PATH call therefore silently yields a
+        // truncated path for deep install locations. Grow the buffer until the
+        // returned length is strictly less than its size (i.e. it fit).
+        let mut buffer: Vec<u16> = vec![0; MAX_PATH as usize];
+        loop {
+            let length = unsafe { GetModuleFileNameW(dll_instance, &mut buffer) } as usize;
 
-            String::from_utf16_lossy(&buffer[..length as usize])
-        };
-        Ok(path)
+            if length == 0 {
+                return Err(anyhow::anyhow!(
+                    "GetModuleFileNameW failed: {:?}",
+                    unsafe { windows::Win32::Foundation::GetLastError() }
+                ));
+            }
+
+            if length < buffer.len() {
+                buffer.truncate(length);
+                return Ok(String::from_utf16_lossy(&buffer));
+            }
+
+            // length == buffer.len(): the path was truncated. Cap growth at the
+            // Windows extended-length maximum (32767 + NUL) so a wrong result
+            // cannot loop forever.
+            if buffer.len() >= 0x8000 {
+                return Err(anyhow::anyhow!(
+                    "module path exceeds {} UTF-16 code units",
+                    buffer.len()
+                ));
+            }
+            buffer.resize(buffer.len() * 2, 0);
+        }
     }
 
     pub fn add_ref(&mut self) -> usize {

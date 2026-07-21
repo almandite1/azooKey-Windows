@@ -28,9 +28,13 @@ impl StringExt for &str {
     }
 
     fn to_wide(&self) -> Vec<u8> {
-        self.encode_utf16()
+        // REG_SZ requires a two-byte (UTF-16) NUL terminator. Build the wide
+        // string with a U+0000 terminator first, then widen to bytes, so the
+        // result stays even-length; appending a single 0 byte would leave an
+        // odd-length buffer with a one-byte terminator.
+        self.to_wide_16()
+            .into_iter()
             .flat_map(|c| c.to_le_bytes())
-            .chain(Some(0))
             .collect()
     }
 }
@@ -131,5 +135,33 @@ pub trait VKeyExt {
 impl VKeyExt for VIRTUAL_KEY {
     fn is_pressed(self) -> bool {
         unsafe { GetKeyState(self.0 as i32) as u16 & 0x8000 != 0 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StringExt;
+
+    #[test]
+    fn to_wide_is_even_length_with_two_byte_nul_terminator() {
+        let bytes = "ab".to_wide();
+        // 2 chars * 2 bytes + 2-byte NUL = 6 bytes, even length.
+        assert_eq!(bytes, vec![0x61, 0x00, 0x62, 0x00, 0x00, 0x00]);
+        assert_eq!(bytes.len() % 2, 0);
+        assert_eq!(&bytes[bytes.len() - 2..], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn to_wide_terminates_empty_string_with_two_byte_nul() {
+        assert_eq!("".to_wide(), vec![0x00, 0x00]);
+    }
+
+    #[test]
+    fn to_wide_keeps_even_length_for_non_ascii() {
+        let bytes = "あ🌟".to_wide();
+        // Non-BMP characters widen to surrogate pairs; the buffer must stay
+        // even-length and end in a two-byte NUL regardless.
+        assert_eq!(bytes.len() % 2, 0);
+        assert_eq!(&bytes[bytes.len() - 2..], &[0x00, 0x00]);
     }
 }
