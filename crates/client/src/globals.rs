@@ -91,9 +91,7 @@ impl DllModule {
     }
 
     pub fn get_path() -> anyhow::Result<String> {
-        let dll_instance = DllModule::get()?
-            .hinst
-            .context("Dll instance not found")?;
+        let dll_instance = DllModule::get()?.hinst.context("Dll instance not found")?;
 
         // GetModuleFileNameW does not report the required length: it fills the
         // buffer, and if the path does not fit it truncates and returns the
@@ -105,10 +103,9 @@ impl DllModule {
             let length = unsafe { GetModuleFileNameW(dll_instance, &mut buffer) } as usize;
 
             if length == 0 {
-                return Err(anyhow::anyhow!(
-                    "GetModuleFileNameW failed: {:?}",
-                    unsafe { windows::Win32::Foundation::GetLastError() }
-                ));
+                return Err(anyhow::anyhow!("GetModuleFileNameW failed: {:?}", unsafe {
+                    windows::Win32::Foundation::GetLastError()
+                }));
             }
 
             if length < buffer.len() {
