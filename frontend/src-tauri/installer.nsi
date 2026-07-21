@@ -13,6 +13,12 @@ ManifestDPIAwareness PerMonitorV2
   SetCompressor /SOLID "{{compression}}"
 !endif
 
+; Keep above !include to stay ahead of any plugin command
+; see https://github.com/tauri-apps/tauri/pull/15422#discussion_r3289239624
+{{#if signed_plugins_path}}
+!addplugindir "{{signed_plugins_path}}"
+{{/if}}
+
 !include MUI2.nsh
 !include FileFunc.nsh
 !include x64.nsh
@@ -41,13 +47,15 @@ ${StrLoc}
 !define INSTALLERICON "{{installer_icon}}"
 !define SIDEBARIMAGE "{{sidebar_image}}"
 !define HEADERIMAGE "{{header_image}}"
+!define UNINSTALLERICON "{{uninstaller_icon}}"
+!define UNINSTALLERHEADERIMAGE "{{uninstaller_header_image}}"
 !define MAINBINARYNAME "{{main_binary_name}}"
 !define MAINBINARYSRCPATH "{{main_binary_path}}"
 !define BUNDLEID "{{bundle_id}}"
 !define COPYRIGHT "{{copyright}}"
 !define OUTFILE "{{out_file}}"
 !define ARCH "{{arch}}"
-!define PLUGINSPATH "{{additional_plugins_path}}"
+!define ADDITIONALPLUGINSPATH "{{additional_plugins_path}}"
 !define ALLOWDOWNGRADES "{{allow_downgrades}}"
 !define DISPLAYLANGUAGESELECTOR "{{display_language_selector}}"
 !define INSTALLWEBVIEW2MODE "{{install_webview2_mode}}"
@@ -85,10 +93,8 @@ VIAddVersionKey "LegalCopyright" "${COPYRIGHT}"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 
-; Plugins path, currently exists for linux only
-!if "${PLUGINSPATH}" != ""
-    !addplugindir "${PLUGINSPATH}"
-!endif
+# additional plugins
+!addplugindir "${ADDITIONALPLUGINSPATH}"
 
 ; Uninstaller signing command
 !if "${UNINSTALLERSIGNCOMMAND}" != ""
@@ -97,7 +103,7 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 
 ; Handle install mode, `perUser`, `perMachine` or `both`
 !if "${INSTALLMODE}" == "perMachine"
-  RequestExecutionLevel highest
+  RequestExecutionLevel admin
 !endif
 
 !if "${INSTALLMODE}" == "currentUser"
@@ -131,10 +137,26 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
   !define MUI_WELCOMEFINISHPAGE_BITMAP "${SIDEBARIMAGE}"
 !endif
 
-; Installer header image
+; Enable header images for installer and uninstaller pages when either image is configured.
 !if "${HEADERIMAGE}" != ""
   !define MUI_HEADERIMAGE
-  !define MUI_HEADERIMAGE_BITMAP  "${HEADERIMAGE}"
+!else if "${UNINSTALLERHEADERIMAGE}" != ""
+  !define MUI_HEADERIMAGE
+!endif
+
+; Installer header image
+!if "${HEADERIMAGE}" != ""
+  !define MUI_HEADERIMAGE_BITMAP "${HEADERIMAGE}"
+!endif
+
+; Uninstaller header image
+!if "${UNINSTALLERHEADERIMAGE}" != ""
+  !define MUI_HEADERIMAGE_UNBITMAP "${UNINSTALLERHEADERIMAGE}"
+!endif
+
+; Uninstaller icon
+!if "${UNINSTALLERICON}" != ""
+  !define MUI_UNICON "${UNINSTALLERICON}"
 !endif
 
 ; Define registry key to store installer language
@@ -389,6 +411,9 @@ Var AppStartMenuFolder
 !define MUI_FINISHPAGE_SHOWREADME_TEXT "$(createDesktop)"
 !define MUI_FINISHPAGE_SHOWREADME_FUNCTION CreateOrUpdateDesktopShortcut
 ; Show run app after installation.
+; Local change, carried across template updates: the settings app is not what a
+; user wants launched after installing an IME -- the engine is started by
+; launcher.exe as administrator -- so the finish page offers no run checkbox.
 ; !define MUI_FINISHPAGE_RUN
 ; !define MUI_FINISHPAGE_RUN_FUNCTION RunMainBinary
 ; !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
@@ -620,7 +645,7 @@ Section Install
     !insertmacro NSIS_HOOK_PREINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning
+  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
@@ -630,12 +655,12 @@ Section Install
     CreateDirectory "$INSTDIR\\{{this}}"
   {{/each}}
   {{#each resources}}
-    File /a "/oname={{this.[1]}}" "{{@key}}"
+    File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
   {{/each}}
 
   ; Copy external binaries
   {{#each binaries}}
-    File /a "/oname={{this}}" "{{@key}}"
+    File /a "/oname={{this}}" "{{no-escape @key}}"
   {{/each}}
 
   ; Create file associations
@@ -757,7 +782,7 @@ Section Uninstall
     !insertmacro NSIS_HOOK_PREUNINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning
+  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; Delete the app directory and its content from disk
   ; Copy main executable

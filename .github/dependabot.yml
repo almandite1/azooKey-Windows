@@ -52,12 +52,16 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
-    # Every @tauri-apps package is tied to the Rust crates in Cargo.lock, which
-    # the wry pin in issue 51 holds at tauri 2.5. `tauri build` rejects a JS
-    # package whose major.minor differs from its crate, and the CLI is worse
-    # than that: 2.11 emits an installer.nsi calling CheckIfAppIsRunning with
-    # no arguments, which the macro shipped for 2.5 rejects, so the NSIS bundle
-    # fails after a clean compile. The whole scope moves when issue 51 lands.
+    # Every @tauri-apps package has to sit on the same major.minor as its Rust
+    # crate in Cargo.lock. `tauri build` rejects a mismatched api or plugin
+    # outright, and a mismatched CLI is worse: it emits an installer.nsi whose
+    # CheckIfAppIsRunning call the other version's macro refuses, so the NSIS
+    # bundle fails after a clean compile.
+    #
+    # Dependabot updates cargo and npm as separate ecosystems and cannot move
+    # the two halves in one PR, so this scope stays out of its hands and is
+    # bumped by hand whenever the cargo group moves tauri. Both halves are on
+    # the newest release as of this writing; `npx tauri info` lists the pairs.
     ignore:
       - dependency-name: '@tauri-apps/*'
     groups:

@@ -5,8 +5,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true }
-tao = "0.31.0"
-wry = "0.47.2"
+tao = "0.35.0"
+wry = "0.55.0"
 tokio = { workspace = true, features = ["full"] }
 tonic = { workspace = true }
 tonic-health = { workspace = true }
@@ -18,8 +18,14 @@ serde_json = { workspace = true }
 [dependencies.windows]
 workspace = true
 features = [
+    # monitor geometry for clamping the candidate window to the work area;
+    # another feature this crate used to get only by unification, this time
+    # from the pre-0.55 wry
+    "Win32_Graphics_Gdi",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Environment",
+    # PRIVILEGE_SET_ALL_NECESSARY, for the UIAccess token check
+    "Win32_System_SystemServices",
     # the UIAccess supervision shim ties its re-exec child to a
     # kill-on-close job, like the launcher does for its children
     "Win32_System_JobObjects",
