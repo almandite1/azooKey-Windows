@@ -40,8 +40,11 @@ fn update_config(state: tauri::State<AppState>, new_config: AppConfig) -> Result
             .settings
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // refused when settings.json was written by a newer build — report it
+        // instead of silently dropping the keys we do not know about, and
+        // leave the in-memory state matching what is on disk
+        new_config.write()?;
         *config = new_config;
-        config.write();
     }
 
     // the settings file is already saved at this point; notifying the

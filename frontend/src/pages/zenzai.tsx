@@ -89,7 +89,9 @@ export const Zenzai = () => {
             await invoke("update_config", { newConfig: data });
             return data;
         } catch (error) {
-            toast("設定の更新に失敗しました");
+            // the reason matters here: a settings.json written by a newer
+            // version is refused rather than overwritten
+            toast(`設定の更新に失敗しました: ${error}`);
             return null;
         }
     };
