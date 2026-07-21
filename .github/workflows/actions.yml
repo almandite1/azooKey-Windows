@@ -44,6 +44,14 @@ jobs:
       with:
         submodules: recursive
 
+    # first, because it compiles nothing and so reports a formatting problem in
+    # seconds rather than after the Swift toolchain and a full build. `cargo
+    # make build` starts with a plain `cargo fmt`, which rewrites files on the
+    # runner and would let unformatted code merge unnoticed; this is the gate
+    # that actually fails.
+    - name: Format
+      run: cargo fmt --all -- --check
+
     - name: Cache Rust
       uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
@@ -155,6 +163,17 @@ jobs:
 
     - name: Clippy
       run: cargo clippy --workspace --all-targets --release -- -D warnings
+
+    # The x86 TIP DLL was built but never checked. Everything above runs on the
+    # host x64 only, so nothing caught code that is correct at 64-bit pointer
+    # width and wrong at 32-bit — the class of bug the FFI pointer-width fix
+    # dealt with. Both steps reuse the release artifacts cargo make already
+    # produced for this target, and the 32-bit test binary runs under WOW64.
+    - name: Clippy (x86)
+      run: cargo clippy -p azookey-windows --target i686-pc-windows-msvc --all-targets --release -- -D warnings
+
+    - name: Test (x86)
+      run: cargo test -p azookey-windows --target i686-pc-windows-msvc --release
 
     - name: Upload Setup Artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
