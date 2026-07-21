@@ -15,7 +15,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         submodules: recursive
 
@@ -29,9 +29,11 @@ jobs:
     - name: Install Swift
       uses: compnerd/gha-setup-swift@v0.4.0
       with:
-        branch: swift-6.3.3-release
-        tag: 6.3.3-RELEASE
+        swift-version: swift-6.3.3-release
+        swift-build: 6.3.3-RELEASE
 
+    # still node20 upstream (no newer release exists), so the runner forces it
+    # onto node24 and warns; nothing to bump until arduino ships a node24 build
     - name: Install Protoc
       uses: arduino/setup-protoc@v3
 
@@ -46,7 +48,7 @@ jobs:
     # bumping either in the download step below invalidates the cache
     - name: Cache prebuilt llama and zenz model
       id: cache-prebuilt
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           llama_cpu
@@ -121,7 +123,7 @@ jobs:
       run: cargo clippy --workspace --all-targets --release -- -D warnings
 
     - name: Upload Setup Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: azookey-setup
         path: build/azookey-setup.exe
