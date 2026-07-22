@@ -21,6 +21,25 @@ struct EngineConfig {
     var zenzaiProfile = ""
 }
 
+/// Reads and decodes `%APPDATA%\Azookey\settings.json`, or returns nil when
+/// it cannot. A missing file is normal (first run) and a corrupt one must
+/// not stop the engine, so both degrade to nil and the caller keeps the
+/// current config. Only the file I/O and parsing live here; applying the
+/// result to `config` stays with the LoadConfig export.
+func loadSettingsFile() -> SettingsFile? {
+    guard let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] else {
+        return nil
+    }
+    let settingsPath = URL(filePath: appDataPath).appendingPathComponent("Azookey/settings.json")
+    do {
+        let data = try Data(contentsOf: settingsPath)
+        return try JSONDecoder().decode(SettingsFile.self, from: data)
+    } catch {
+        print("Failed to read settings: \(error)")
+        return nil
+    }
+}
+
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
     let zenzaiEnabled = config.zenzaiEnabled
     let zenzaiProfile = config.zenzaiProfile

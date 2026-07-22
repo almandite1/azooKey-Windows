@@ -16,24 +16,15 @@ import ffi
 
 @_cdecl("LoadConfig")
 @MainActor public func load_config() {
-    if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
-        let settingsPath = URL(filePath: appDataPath).appendingPathComponent("Azookey/settings.json")
-
-        do {
-            let data = try Data(contentsOf: settingsPath)
-            let settings = try JSONDecoder().decode(SettingsFile.self, from: data)
-            // only override keys that are present, matching the previous
-            // behavior: a partial file keeps the current values
-            if let zenzai = settings.zenzai {
-                if let enable = zenzai.enable {
-                    config.zenzaiEnabled = enable
-                }
-                if let profile = zenzai.profile {
-                    config.zenzaiProfile = profile
-                }
-            }
-        } catch {
-            print("Failed to read settings: \(error)")
+    guard let settings = loadSettingsFile() else { return }
+    // only override keys that are present, matching the previous
+    // behavior: a partial file keeps the current values
+    if let zenzai = settings.zenzai {
+        if let enable = zenzai.enable {
+            config.zenzaiEnabled = enable
+        }
+        if let profile = zenzai.profile {
+            config.zenzaiProfile = profile
         }
     }
 }
