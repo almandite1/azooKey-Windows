@@ -1,10 +1,33 @@
 use crate::extension::VKeyExt;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, ToUnicode, VK_KANA, VK_SHIFT};
+
+/// Interprets what `ToUnicode` wrote, given what it returned.
+///
+/// A negative count is a dead key. The buffer holds the accent on its own,
+/// and treating that as typed text — which is what reading `units[0]`
+/// unconditionally did — puts a stray `^` into the reading. A dead key has
+/// no text of its own, so it decodes to nothing and reaches the host, whose
+/// own dead-key handling is the only thing that can compose it: our call
+/// passes TOUNICODE_NO_KBD_STATE_CHANGE and so never advances the kernel's
+/// dead-key state machine (it cannot: this runs twice per keystroke).
+///
+/// Zero means the key produces no character. Otherwise the buffer holds
+/// `count` UTF-16 units, which is more than one for a non-BMP character
+/// (a surrogate pair) or for a key that produces several characters.
+fn decoded_text(count: i32, units: &[u16]) -> Option<String> {
+    let units = units.get(..usize::try_from(count).ok()?)?;
+    let text = String::from_utf16(units).ok()?;
+
+    (!text.is_empty()).then_some(text)
+}
 
 #[derive(Debug)]
 pub enum UserAction {
-    Input(char),
+    /// The text this keystroke produced. A `String` rather than a `char`
+    /// because one keystroke can yield several characters, and because a
+    /// non-BMP character arrives as two UTF-16 units.
+    Input(String),
     Backspace,
     Enter,
     Space,
@@ -102,35 +125,34 @@ impl TryFrom<usize> for UserAction {
 
                     key_state
                 };
-                let unicode = {
+                let text = {
                     // Bit 2 = "do not change keyboard state" (Win10 1607+;
                     // ignored and harmless on older builds). Without it,
                     // ToUnicode consumes kernel dead-key state — and this
                     // path runs TWICE per keystroke (OnTestKeyDown and
                     // OnKeyDown both call process_key), so on layouts with
                     // dead keys (e.g. US-International) the state was
-                    // double-consumed and output garbled (B17). Known,
-                    // pre-existing limitations left as-is: the return value
-                    // is ignored (-1 dead key / 2+ chars are not handled)
-                    // and the 1-unit buffer cannot represent non-BMP output.
+                    // double-consumed and output garbled (B17).
                     const TOUNICODE_NO_KBD_STATE_CHANGE: u32 = 0x4;
-                    let mut unicode = [0u16; 1];
-                    unsafe {
+                    // Room for a surrogate pair and then some: ToUnicode can
+                    // answer with several UTF-16 units, and a buffer of one
+                    // silently truncated everything above the BMP.
+                    let mut units = [0u16; 8];
+                    let count = unsafe {
                         ToUnicode(
                             key_code as u32,
                             0,
                             Some(&key_state),
-                            &mut unicode,
+                            &mut units,
                             TOUNICODE_NO_KBD_STATE_CHANGE,
                         )
                     };
-                    unicode[0]
+                    decoded_text(count, &units)
                 };
 
-                if unicode != 0 {
-                    UserAction::Input(char::from_u32(unicode as u32).context("Invalid char")?)
-                } else {
-                    UserAction::Unknown
+                match text {
+                    Some(text) => UserAction::Input(text),
+                    None => UserAction::Unknown,
                 }
             }
         };
@@ -143,6 +165,61 @@ impl TryFrom<usize> for UserAction {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A dead key (US-International `^`, `¨`, …) leaves the bare accent in
+    /// the buffer and reports it with a negative count. Reading the buffer
+    /// regardless — what the one-unit version did — typed that accent into
+    /// the reading (issue #28).
+    #[test]
+    fn a_dead_key_produces_no_text() {
+        assert_eq!(decoded_text(-1, &[0x005E, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn a_key_with_no_character_produces_no_text() {
+        assert_eq!(decoded_text(0, &[0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn a_single_unit_is_the_character_itself() {
+        assert_eq!(decoded_text(1, &[0x0061, 0, 0, 0]), Some("a".to_string()));
+    }
+
+    /// A non-BMP character arrives as a surrogate pair. The one-unit buffer
+    /// could only ever hold the high surrogate, so these were unproducible.
+    #[test]
+    fn a_surrogate_pair_becomes_one_character() {
+        // U+1F600 GRINNING FACE
+        let text = decoded_text(2, &[0xD83D, 0xDE00, 0, 0]).expect("a valid surrogate pair");
+
+        assert_eq!(text, "\u{1F600}");
+        assert_eq!(text.chars().count(), 1);
+    }
+
+    /// Some keys and layouts answer with several characters at once; the
+    /// count says how many units are meant, and the rest of the buffer is
+    /// not ours to read.
+    #[test]
+    fn several_units_become_several_characters() {
+        assert_eq!(
+            decoded_text(2, &[0x0061, 0x0062, 0x0063, 0]),
+            Some("ab".to_string())
+        );
+    }
+
+    /// A lone surrogate is not text; refusing it keeps the caller on the
+    /// "no character" path instead of panicking or inventing a replacement.
+    #[test]
+    fn an_unpaired_surrogate_is_refused() {
+        assert_eq!(decoded_text(1, &[0xD83D, 0, 0, 0]), None);
+    }
+
+    /// ToUnicode never writes past the buffer it was given, but the count
+    /// drives a slice index and must not be trusted blindly.
+    #[test]
+    fn a_count_past_the_buffer_is_refused() {
+        assert_eq!(decoded_text(9, &[0x0061; 4]), None);
+    }
 
     /// The host editing keys must decode to EditingKey — falling through to
     /// the ToUnicode branch instead would make them Unknown and pass them

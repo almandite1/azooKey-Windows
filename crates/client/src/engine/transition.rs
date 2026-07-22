@@ -79,11 +79,11 @@ pub fn transition(
 ) -> Option<(CompositionState, Vec<ClientAction>)> {
     let result = match ctx.state {
         CompositionState::None => match action {
-            UserAction::Input(char) if ctx.mode == InputMode::Kana => (
+            UserAction::Input(text) if ctx.mode == InputMode::Kana => (
                 CompositionState::Composing,
                 vec![
                     ClientAction::StartComposition,
-                    ClientAction::AppendText(char.to_string()),
+                    ClientAction::AppendText(text),
                 ],
             ),
             UserAction::Number(number) if ctx.mode == InputMode::Kana => (
@@ -115,10 +115,7 @@ pub fn transition(
             };
 
             match action {
-                UserAction::Input(char) => (
-                    CompositionState::Composing,
-                    vec![input_action(char.to_string())],
-                ),
+                UserAction::Input(text) => (CompositionState::Composing, vec![input_action(text)]),
                 UserAction::Number(number) => (
                     CompositionState::Composing,
                     vec![input_action(number.to_string())],
@@ -234,8 +231,11 @@ mod tests {
 
     #[test]
     fn idle_kana_input_starts_a_composition() {
-        let (next, actions) =
-            transition(&kana(CompositionState::None), UserAction::Input('a')).unwrap();
+        let (next, actions) = transition(
+            &kana(CompositionState::None),
+            UserAction::Input("a".to_string()),
+        )
+        .unwrap();
         assert_eq!(next, CompositionState::Composing);
         assert_eq!(
             actions,
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn idle_latin_input_is_passed_through_to_the_host() {
         let latin = ctx(CompositionState::None, InputMode::Latin);
-        assert!(transition(&latin, UserAction::Input('a')).is_none());
+        assert!(transition(&latin, UserAction::Input("a".to_string())).is_none());
         assert!(transition(&latin, UserAction::Number(5)).is_none());
     }
 
@@ -301,13 +301,19 @@ mod tests {
 
     #[test]
     fn composing_input_appends_but_previewing_input_commits_first() {
-        let (next, actions) =
-            transition(&kana(CompositionState::Composing), UserAction::Input('k')).unwrap();
+        let (next, actions) = transition(
+            &kana(CompositionState::Composing),
+            UserAction::Input("k".to_string()),
+        )
+        .unwrap();
         assert_eq!(next, CompositionState::Composing);
         assert_eq!(actions, vec![ClientAction::AppendText("k".to_string())]);
 
-        let (next, actions) =
-            transition(&kana(CompositionState::Previewing), UserAction::Input('k')).unwrap();
+        let (next, actions) = transition(
+            &kana(CompositionState::Previewing),
+            UserAction::Input("k".to_string()),
+        )
+        .unwrap();
         assert_eq!(next, CompositionState::Composing);
         assert_eq!(actions, vec![ClientAction::ShrinkText("k".to_string())]);
     }
