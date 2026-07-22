@@ -52,20 +52,24 @@ pub struct Candidates {
     pub texts: Vec<String>,
     pub sub_texts: Vec<String>,
     pub hiragana: String,
+    /// romaji keystrokes each candidate covers, for `raw_input`
     pub corresponding_count: Vec<i32>,
+    /// kana of the reading each candidate covers, for `ShrinkText`
+    pub surface_count: Vec<i32>,
 }
 
 impl Candidates {
-    /// Returns (text, sub_text, corresponding_count) for the given index.
-    /// The engine can return an empty candidate list (and the three vecs are
-    /// not guaranteed to have equal lengths), so out-of-bounds access must
-    /// degrade to empty values instead of panicking — a panic here unwinds
-    /// out of a COM callback and aborts the host application.
-    pub fn entry(&self, index: usize) -> (String, String, i32) {
+    /// Returns (text, sub_text, corresponding_count, surface_count) for the
+    /// given index. The engine can return an empty candidate list (and the
+    /// vecs are not guaranteed to have equal lengths), so out-of-bounds
+    /// access must degrade to empty values instead of panicking — a panic
+    /// here unwinds out of a COM callback and aborts the host application.
+    pub fn entry(&self, index: usize) -> (String, String, i32, i32) {
         (
             self.texts.get(index).cloned().unwrap_or_default(),
             self.sub_texts.get(index).cloned().unwrap_or_default(),
             self.corresponding_count.get(index).copied().unwrap_or(0),
+            self.surface_count.get(index).copied().unwrap_or(0),
         )
     }
 }
@@ -88,6 +92,11 @@ impl From<shared::proto::ComposingText> for Candidates {
                 .suggestions
                 .iter()
                 .map(|s| s.corresponding_count)
+                .collect(),
+            surface_count: composing_text
+                .suggestions
+                .iter()
+                .map(|s| s.surface_count)
                 .collect(),
         }
     }
@@ -299,9 +308,13 @@ impl IPCService {
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
+    /// `surface_offset` is a count of kana in the reading, not of keystrokes:
+    /// a candidate can end inside a romaji cluster and only the kana
+    /// boundary can say where.
+    pub fn shrink_text(&mut self, surface_offset: i32) -> anyhow::Result<Candidates> {
         #[cfg(test)]
-        if let Some(result) = self.fake_call(|fake| fake.engine_answer(IpcCall::ShrinkText(offset)))
+        if let Some(result) =
+            self.fake_call(|fake| fake.engine_answer(IpcCall::ShrinkText(surface_offset)))
         {
             return result;
         }
@@ -310,7 +323,7 @@ impl IPCService {
         let response = self.exec(async move {
             client
                 .shrink_text(tonic::Request::new(shared::proto::ShrinkTextRequest {
-                    offset,
+                    surface_offset,
                 }))
                 .await
         })?;

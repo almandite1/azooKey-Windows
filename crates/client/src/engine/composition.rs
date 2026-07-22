@@ -43,7 +43,10 @@ pub struct Composition {
     pub raw_input: String,
     pub raw_hiragana: String,
 
-    pub corresponding_count: i32, // corresponding count of the preview
+    /// romaji keystrokes the preview covers, spent on `raw_input`
+    pub corresponding_count: i32,
+    /// kana of the reading the preview covers, spent on `ShrinkText`
+    pub surface_count: i32,
 
     pub selection_index: i32,
     pub candidates: Candidates,
@@ -70,9 +73,11 @@ fn apply_selected_candidate(
     suffix: &mut String,
     raw_hiragana: &mut String,
     corresponding_count: &mut i32,
+    surface_count: &mut i32,
 ) {
-    let (text, sub_text, count) = candidates.entry(index as usize);
+    let (text, sub_text, count, surface) = candidates.entry(index as usize);
     *corresponding_count = count;
+    *surface_count = surface;
     *preview = text;
     *suffix = sub_text;
     *raw_hiragana = candidates.hiragana.clone();
@@ -92,6 +97,7 @@ struct CompositionEdit {
     raw_input: String,
     raw_hiragana: String,
     corresponding_count: i32,
+    surface_count: i32,
     candidates: Candidates,
     selection_index: i32,
     /// the state the composition moves to once the batch finishes
@@ -108,6 +114,7 @@ impl CompositionEdit {
             raw_input: composition.raw_input.clone(),
             raw_hiragana: composition.raw_hiragana.clone(),
             corresponding_count: composition.corresponding_count,
+            surface_count: composition.surface_count,
             candidates: composition.candidates.clone(),
             selection_index: composition.selection_index,
             state,
@@ -125,6 +132,7 @@ impl CompositionEdit {
             &mut self.suffix,
             &mut self.raw_hiragana,
             &mut self.corresponding_count,
+            &mut self.surface_count,
         );
     }
 
@@ -139,6 +147,7 @@ impl CompositionEdit {
         composition.candidates = self.candidates;
         composition.suffix = self.suffix;
         composition.corresponding_count = self.corresponding_count;
+        composition.surface_count = self.surface_count;
     }
 }
 
@@ -435,6 +444,7 @@ impl TextServiceFactory {
         edit.state = CompositionState::None;
         edit.selection_index = 0;
         edit.corresponding_count = 0;
+        edit.surface_count = 0;
         edit.preview.clear();
         edit.suffix.clear();
         edit.raw_input.clear();
@@ -478,6 +488,7 @@ impl TextServiceFactory {
 
         edit.selection_index = 0;
         edit.corresponding_count = 0;
+        edit.surface_count = 0;
         edit.preview.clear();
         edit.suffix.clear();
         edit.raw_input.clear();
@@ -580,6 +591,7 @@ impl TextServiceFactory {
 
         edit.selection_index = 0;
         edit.corresponding_count = 0;
+        edit.surface_count = 0;
         edit.preview.clear();
         edit.suffix.clear();
         edit.raw_input.clear();
@@ -644,7 +656,9 @@ impl TextServiceFactory {
             .skip(edit.corresponding_count as usize)
             .collect();
 
-        ipc_service.shrink_text(edit.corresponding_count)?;
+        // kana, not keystrokes: only the reading can express a candidate
+        // that ends inside a romaji cluster
+        ipc_service.shrink_text(edit.surface_count)?;
         let text = match mode {
             InputMode::Kana => to_fullwidth(text, false),
             InputMode::Latin => text.to_string(),
@@ -693,9 +707,10 @@ impl TextServiceFactory {
 
         edit.preview = text;
         edit.suffix.clear();
-        // the conversion covers every input element typed so far, so a
-        // following ShrinkText must drop them all
+        // the conversion covers everything typed so far, so a following
+        // ShrinkText must drop it all — each count in its own unit
         edit.corresponding_count = edit.raw_input.chars().count() as i32;
+        edit.surface_count = edit.raw_hiragana.chars().count() as i32;
         Ok(())
     }
 }
@@ -724,12 +739,17 @@ mod tests {
         fake
     }
 
-    fn scripted(texts: &[&str], hiragana: &str, counts: &[i32]) -> Candidates {
+    /// `counts` are keystrokes (what raw_input is measured in), `surfaces`
+    /// are kana of the reading (what ShrinkText spends) — the engine reports
+    /// both because they disagree whenever a candidate ends inside a romaji
+    /// cluster.
+    fn scripted(texts: &[&str], hiragana: &str, counts: &[i32], surfaces: &[i32]) -> Candidates {
         Candidates {
             texts: texts.iter().map(|s| s.to_string()).collect(),
             sub_texts: texts.iter().map(|_| String::new()).collect(),
             hiragana: hiragana.to_string(),
             corresponding_count: counts.to_vec(),
+            surface_count: surfaces.to_vec(),
         }
     }
 
@@ -743,7 +763,7 @@ mod tests {
     #[test]
     fn append_text_applies_the_engine_answer_and_publishes_the_list() {
         let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["水", "未"], "みず", &[4, 4]));
+        let fake = install_fake_ipc(scripted(&["水", "未"], "みず", &[4, 4], &[2, 2]));
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
         let factory = unsafe { tip.as_impl() };
@@ -793,7 +813,7 @@ mod tests {
     #[test]
     fn append_text_resets_a_selection_carried_over_from_previewing() {
         let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["水", "未"], "みず", &[4, 4]));
+        let fake = install_fake_ipc(scripted(&["水", "未"], "みず", &[4, 4], &[2, 2]));
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
         let factory = unsafe { tip.as_impl() };
@@ -855,7 +875,7 @@ mod tests {
     #[test]
     fn remove_text_resets_the_selection_and_truncates_raw_input() {
         let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["水"], "みず", &[4]));
+        let fake = install_fake_ipc(scripted(&["水"], "みず", &[4], &[2]));
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
         let factory = unsafe { tip.as_impl() };
@@ -896,7 +916,7 @@ mod tests {
     #[test]
     fn shrink_text_commits_and_returns_to_composing() {
         let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["ん"], "ん", &[1]));
+        let fake = install_fake_ipc(scripted(&["ん"], "ん", &[1], &[1]));
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
         let factory = unsafe { tip.as_impl() };
@@ -907,6 +927,7 @@ mod tests {
             composition.preview = "水".to_string();
             composition.raw_input = "mizu".to_string();
             composition.corresponding_count = 4;
+            composition.surface_count = 2; // みず — two kana, four keystrokes
             composition.tip_composition = Some(FakeComposition::new());
         }
 
@@ -935,8 +956,8 @@ mod tests {
         let calls = recorded_calls(&fake);
         let shrink = calls
             .iter()
-            .position(|c| *c == IpcCall::ShrinkText(4))
-            .expect("shrink_text must be sent with the committed element count");
+            .position(|c| *c == IpcCall::ShrinkText(2))
+            .expect("shrink_text must be sent the committed KANA count, not the keystrokes");
         let append = calls
             .iter()
             .position(|c| *c == IpcCall::AppendText("n".to_string()))
@@ -963,7 +984,7 @@ mod tests {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
             composition.state = CompositionState::Previewing;
-            composition.candidates = scripted(&["a", "b", "c"], "あ", &[1, 1, 1]);
+            composition.candidates = scripted(&["a", "b", "c"], "あ", &[1, 1, 1], &[1, 1, 1]);
             composition.selection_index = 2;
             composition.tip_composition = Some(FakeComposition::new());
         }
@@ -1288,7 +1309,7 @@ mod tests {
     #[test]
     fn append_resets_the_composition_when_the_server_becomes_unavailable() {
         let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["水"], "みず", &[4]));
+        let fake = install_fake_ipc(scripted(&["水"], "みず", &[4], &[2]));
         // the server crashed: the next engine RPC fails as ServerUnavailable
         fake.lock().unwrap().engine_unavailable = true;
 

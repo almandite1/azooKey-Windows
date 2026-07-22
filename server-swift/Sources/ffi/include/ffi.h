@@ -27,10 +27,17 @@
  *   the Swift side; the caller copies them and hands them back to
  *   FreeString / FreeComposedText
  */
+/*
+ * A candidate, with the reading it covers counted in both units: kana for
+ * the engine (ShrinkText spends it) and romaji keystrokes for the client
+ * (it drops that many characters from its raw input). They differ whenever
+ * a clause boundary falls inside a romaji cluster.
+ */
 struct FFICandidate {
     char *text;
     char *subtext;
     int correspondingCount;
+    int surfaceCount;
 };
 
 /* engine lifecycle */
@@ -42,7 +49,7 @@ void SetContext(int64_t session, const char *context);
 char *AppendText(int64_t session, const char *input, int32_t *cursorPtr);
 char *RemoveText(int64_t session, int32_t *cursorPtr);
 char *MoveCursor(int64_t session, int32_t offset, int32_t *cursorPtr);
-char *ShrinkText(int64_t session, int32_t offset);
+char *ShrinkText(int64_t session, int32_t surfaceOffset);
 void ClearText(int64_t session);
 struct FFICandidate **GetComposedText(int64_t session, int32_t *lengthPtr);
 void RemoveSession(int64_t session);

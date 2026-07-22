@@ -144,12 +144,12 @@ func kanaReading(_ convertTarget: String) -> String {
 /// This is a copy: the session keeps its unresolved `n`, so the very next
 /// keystroke can still turn it into な行.
 ///
-/// `correspondingCount` stays usable against the session's text even though
-/// it is measured here. Candidate boundaries fall on kana boundaries, so a
-/// candidate that stops before the ん counts the same input elements in
-/// both, and one that covers the ん counts the extra `n` too — which
-/// `prefixComplete` clamps to the session's length, consuming exactly the
-/// reading that produced the ん.
+/// The counts measured here stay usable against the session's text. The
+/// surface count `ShrinkText` spends transfers exactly: the two readings
+/// differ only in that last character, `n` for ん, one for one. The
+/// keystroke count the client spends can be one too high for a candidate
+/// that covers the ん — it counts the `n` we typed on its behalf — which is
+/// harmless, the client's `raw_input` has nothing left to drop by then.
 ///
 /// Only when the cursor is at the end: `insertAtCursorPosition` would
 /// otherwise splice the `n` into the middle of the reading.
@@ -162,21 +162,103 @@ func kanaReading(_ convertTarget: String) -> String {
     return completed
 }
 
-/// What is left of `target` after a candidate covering `composingCount` is
-/// committed, and how many input elements that took.
+/// Commits the front of `text`, spending a count that came from outside —
+/// the converter, or the client over the FFI — and is therefore not trusted.
 ///
-/// The count crossing the FFI is, and has to stay, a count of input elements
-/// (romaji keystrokes): the client spends it on its own `raw_input` and hands
-/// it back to `ShrinkText`, which spends it as `.inputCount`. A candidate's
-/// `composingCount` is no longer that number — since the engine grew
-/// `ComposingCount` it is usually a *surface* (kana) count, and for a
-/// multi-clause candidate a composite of several counts, so `にゅうりょく`
-/// reports 6 where the input holds 9 elements. Rather than reimplement the
-/// enum's arithmetic, let the engine spend the count and measure what it took.
-func remainder(of target: ComposingText, after composingCount: ComposingCount) -> (text: ComposingText, inputCount: Int) {
+/// Every part is clamped to what the text can actually give, because this
+/// process is the engine every application on the desktop shares and each
+/// unclamped end takes all of their compositions down with it:
+///
+/// - a negative count reaches `Array.removeFirst` / `String.dropFirst`, both
+///   of which trap outright
+/// - a surface count past the end of the reading is accepted quietly and
+///   drives `convertTargetCursorPosition` negative (`prefixComplete`
+///   subtracts the count it was given, not the count it could use), so the
+///   next keystroke traps in `prefix(_:)` instead — a delayed trap in an
+///   unrelated call. `.inputCount` clamps itself; `.surfaceCount` does not.
+///
+/// A composite spends its parts in order, each clamped against what the
+/// preceding one left.
+func spend(_ composingCount: ComposingCount, from text: inout ComposingText) {
+    switch composingCount {
+    case .inputCount(let count):
+        text.prefixComplete(composingCount: .inputCount(min(max(0, count), text.input.count)))
+    case .surfaceCount(let count):
+        text.prefixComplete(
+            composingCount: .surfaceCount(min(max(0, count), text.convertTarget.count))
+        )
+    case .composite(let lhs, let rhs):
+        spend(lhs, from: &text)
+        spend(rhs, from: &text)
+    }
+}
+
+/// The reading left behind by every keystroke count, so index `k` holds the
+/// result of spending `.inputCount(k)` on `target`.
+///
+/// The same table serves every candidate of one conversion request, which is
+/// why it is built by the caller rather than inside `remainder`.
+func shrinkReadings(of target: ComposingText) -> [String] {
+    (0...target.input.count).map { count in
+        var text = target
+        text.prefixComplete(composingCount: .inputCount(count))
+        return text.convertTarget
+    }
+}
+
+/// What is left of `target` after a candidate covering `composingCount` is
+/// committed, and how much of the reading that takes — measured twice,
+/// because the engine and the client count in different units.
+///
+/// `surfaceCount` is kana, and it is the one that decides: `ShrinkText`
+/// spends it on the session's own text, so the reading left composing is
+/// exactly the `text` returned here. `inputCount` is romaji keystrokes and
+/// exists for the client alone, which drops that many characters from its
+/// `raw_input` (the string F9/F10 turn into latin).
+///
+/// A candidate's `composingCount` is neither number directly: since the
+/// engine grew `ComposingCount` it is usually a surface count but can be an
+/// input count or a composite of several, so let the engine spend it and
+/// measure the difference.
+///
+/// For keystrokes, measuring what the engine spent does not work. The engine
+/// looks candidates up by surface index too, so a clause boundary can fall
+/// inside one romaji cluster: `henkansuru` is `{he}{nka}{nsuru}` and 「変換」
+/// stops after 4 kana, in the middle of the last segment. Spending that
+/// surface count re-encodes the whole segment into kana elements
+/// (`forceGetInputCursorPosition`), so the input array shrinks for a reason
+/// that has nothing to do with the candidate — `henkansuru` measured 7
+/// keystrokes for a boundary that sits after 6.
+///
+/// So look the reading up instead: the answer is the keystroke count whose
+/// own remaining reading is the one the candidate leaves. `readings` is
+/// `shrinkReadings(of: target)`.
+///
+/// Not every boundary has one. かんしゃ is `{ka}{nsha}`, so no prefix of the
+/// input leaves ゃ behind, and there the measurement stands — `raw_input`
+/// keeps a keystroke too many or too few, which only shows if the user then
+/// asks F9 to re-render the remainder as latin. The reading itself, on both
+/// sides, stays right.
+func remainder(
+    of target: ComposingText,
+    after composingCount: ComposingCount,
+    readings: [String]
+) -> (text: ComposingText, surfaceCount: Int, inputCount: Int) {
     var remaining = target
-    remaining.prefixComplete(composingCount: composingCount)
-    return (remaining, target.input.count - remaining.input.count)
+    spend(composingCount, from: &remaining)
+
+    let surfaceCount = target.convertTarget.count - remaining.convertTarget.count
+    let measured = min(max(0, target.input.count - remaining.input.count), target.input.count)
+    let inputCount = readings.firstIndex(of: remaining.convertTarget) ?? measured
+
+    return (remaining, surfaceCount, inputCount)
+}
+
+func remainder(
+    of target: ComposingText,
+    after composingCount: ComposingCount
+) -> (text: ComposingText, surfaceCount: Int, inputCount: Int) {
+    remainder(of: target, after: composingCount, readings: shrinkReadings(of: target))
 }
 
 func constructCandidateString(candidate: Candidate, hiragana: String) -> String {
@@ -343,6 +425,8 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         return to_list_pointer([])
     }
     let converted = converter.requestCandidates(target, options: options)
+    // one table for the whole request: it depends only on the reading
+    let readings = shrinkReadings(of: target)
     var result: [FFICandidate] = []
 
     for i in 0..<converted.mainResults.count {
@@ -350,13 +434,21 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
         let text = _strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
 
-        let (afterComposingText, correspondingCount) = remainder(
+        let (afterComposingText, surfaceCount, correspondingCount) = remainder(
             of: target,
-            after: candidate.composingCount
+            after: candidate.composingCount,
+            readings: readings
         )
         let subtext = _strdup(kanaReading(afterComposingText.convertTarget))
 
-        result.append(FFICandidate(text: text, subtext: subtext, correspondingCount: Int32(correspondingCount)))
+        result.append(
+            FFICandidate(
+                text: text,
+                subtext: subtext,
+                correspondingCount: Int32(correspondingCount),
+                surfaceCount: Int32(surfaceCount)
+            )
+        )
     }
 
     lengthPtr.pointee = Int32(result.count)
@@ -367,16 +459,19 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 @_cdecl("ShrinkText")
 @MainActor public func shrink_text(
     session: Int64,
-    offset: Int32
+    surfaceOffset: Int32
 ) -> UnsafeMutablePointer<CChar>? {
     withSession(session) { state in
         var afterComposingText = state.composingText
-        // .inputCount is the same operation the pre-traits engine performed
-        // for a bare Int, so the client's offsets keep their meaning.
-        // prefixComplete clamps the count from above (min with input.count)
-        // but a negative count traps in Array.removeFirst and takes the
-        // whole server down — clamp from below here, at the FFI boundary
-        afterComposingText.prefixComplete(composingCount: .inputCount(max(0, Int(offset))))
+        // A surface (kana) count, not the keystroke count this used to take:
+        // a candidate can end inside a romaji cluster (かんし|ゃ), and only
+        // the kana boundary can express that. It transfers to the session's
+        // own text even though it was measured on the pending-`n` copy —
+        // kanaReading replaces one character with one character.
+        //
+        // `spend` clamps it at both ends; the count is whatever the client
+        // sent, and this is the FFI boundary
+        spend(.surfaceCount(Int(surfaceOffset)), from: &afterComposingText)
         state.composingText = afterComposingText
 
         return _strdup(kanaReading(state.composingText.convertTarget))

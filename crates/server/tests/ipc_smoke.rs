@@ -147,11 +147,12 @@ async fn long_composition_shrink_does_not_kill_the_server() {
         .await
         .expect("clear_text failed");
 
-    // 130 roman keystrokes (65 x "ka"): the shrink offset is a count of
-    // keystrokes, so a long composition pushes it past 127. A former
-    // `as i8` truncation wrapped such counts negative, and the negative
-    // count made the Swift engine trap (Array.removeFirst), killing the
-    // whole server process.
+    // 130 roman keystrokes (65 x "ka") = 65 kana. Two counts that must not
+    // kill the engine follow: 130, which is past 127 (a former `as i8`
+    // truncation wrapped such counts negative, and a negative count traps
+    // the Swift engine outright) and is also past the end of this reading
+    // (an unclamped surface count leaves the cursor negative and traps on
+    // the NEXT keystroke instead), then -1.
     for _ in 0..65 {
         for key in ["k", "a"] {
             client
@@ -164,13 +165,15 @@ async fn long_composition_shrink_does_not_kill_the_server() {
     }
 
     client
-        .shrink_text(shared::proto::ShrinkTextRequest { offset: 130 })
+        .shrink_text(shared::proto::ShrinkTextRequest {
+            surface_offset: 130,
+        })
         .await
         .expect("shrink_text with a >127 offset failed (server crash?)");
 
     // a hostile negative offset must be clamped, not trap the engine
     client
-        .shrink_text(shared::proto::ShrinkTextRequest { offset: -1 })
+        .shrink_text(shared::proto::ShrinkTextRequest { surface_offset: -1 })
         .await
         .expect("shrink_text with a negative offset failed (server crash?)");
 
@@ -229,6 +232,71 @@ async fn conversion_yields_the_expected_candidate() {
     assert!(
         candidates.contains(&"水"),
         "水 should be among the candidates for みず, got {candidates:?}"
+    );
+
+    client
+        .clear_text(shared::proto::ClearTextRequest {})
+        .await
+        .expect("clear_text failed");
+}
+
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment"]
+async fn committing_a_clause_leaves_the_rest_of_the_reading() {
+    // The half of the shrink contract only a live engine can prove: the
+    // count a candidate reports must, spent on the engine's own composition,
+    // leave exactly the reading the candidate advertised as its subtext.
+    //
+    // へんかんする is the case that broke. The engine offers 「変換」for the
+    // first four kana, but ん-す-る is one romaji cluster, so the boundary
+    // has no keystroke count — sending one left うる composing while the
+    // candidate window promised する.
+    let mut client = connect().await;
+    client
+        .clear_text(shared::proto::ClearTextRequest {})
+        .await
+        .expect("clear_text failed");
+
+    let mut composing = None;
+    for key in "henkansuru".chars() {
+        composing = Some(
+            client
+                .append_text(shared::proto::AppendTextRequest {
+                    text_to_append: key.to_string(),
+                })
+                .await
+                .expect("append_text failed")
+                .into_inner()
+                .composing_text
+                .expect("composing_text missing"),
+        );
+    }
+    let composing = composing.expect("no keystrokes were sent");
+    assert_eq!(composing.hiragana, "へんかんする");
+
+    let clause = composing
+        .suggestions
+        .iter()
+        .find(|s| s.text == "変換")
+        .expect("変換 should be among the candidates for へんかんする");
+    assert_eq!(
+        clause.subtext, "する",
+        "the candidate window is told 変換 leaves する"
+    );
+
+    let after = client
+        .shrink_text(shared::proto::ShrinkTextRequest {
+            surface_offset: clause.surface_count,
+        })
+        .await
+        .expect("shrink_text failed")
+        .into_inner()
+        .composing_text
+        .expect("composing_text missing");
+
+    assert_eq!(
+        after.hiragana, "する",
+        "committing 変換 must leave exactly the reading it promised"
     );
 
     client
