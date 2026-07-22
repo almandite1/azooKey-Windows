@@ -15,6 +15,25 @@ swift build -c release
 cp .build/x86_64-unknown-windows-msvc/release/azookey-server.lib ../
 """
 
+[tasks.test_swift]
+description = "Run the Swift package tests (the runner loads llama.dll at start)"
+script_runner = "powershell"
+script_extension = "ps1"
+script = """
+$ErrorActionPreference = "Stop"
+# the test runner links the engine, which pulls in llama.dll at load time;
+# it ships in llama_cpu/ and is not on PATH. Forward slashes on purpose:
+# a multi-line TOML string processes backslash escapes.
+$env:Path = "$PWD/llama_cpu;$env:Path"
+cd server-swift
+swift test
+if ($LASTEXITCODE -ne 0) { throw "swift test failed with exit code $LASTEXITCODE" }
+"""
+
+# Deliberately NOT in the `build` flow below: that flow is the release
+# pipeline, and `swift test` builds the dependency graph again with
+# testability enabled — output post_build must never pick up.
+
 [tasks.build_x64]
 command = "cargo"
 args = ["build", "${@}"]
