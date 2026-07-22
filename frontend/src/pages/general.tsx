@@ -22,7 +22,7 @@ export const General = () => {
                         </p>
                     </div>
                     <Button  variant="secondary">
-                        <a href="https://github.com/fkunn1326/azooKey-Windows/releases" className="flex items-center gap-x-2" target="_blank" rel="noopener noreferrer">
+                        <a href="https://github.com/almandite1/azooKey-Windows/releases" className="flex items-center gap-x-2" target="_blank" rel="noopener noreferrer">
                             <ExternalLink />
                             更新を確認する
                         </a>

@@ -2,11 +2,27 @@
 
 [AzooKeyKanaKanjiConverter](https://github.com/azooKey/AzooKeyKanaKanjiConverter)を利用したWindows版IMEです。
 
+> [!NOTE]
+> これは [fkunn1326/azooKey-Windows](https://github.com/fkunn1326/azooKey-Windows) のフォークです。
+> Windows版IMEとして本家を移植してくださった fkunn1326 さんと、変換エンジンを開発されている
+> ensan-hcl (Miwa) さんに感謝します。
+>
+> このフォークでは主に安定性とTSF準拠を進めています。ホストアプリを巻き込まないための
+> エラー処理、UILessモードやアクセシビリティなどのTSF要件への対応、ショートカットや
+> 編集キーまわりの入力挙動の修正などです。変更点は
+> [Issues](https://github.com/almandite1/azooKey-Windows/issues?q=is%3Aissue+is%3Aclosed) と
+> リリースノートを参照してください。
+
 > [!WARNING]
 > 現在開発中であるため、安定性や機能に関しては保証できません。使用する際は自己責任でお願いします。
 
 # インストール方法
-[Release](https://github.com/fkunn1326/azooKey-Windows/releases)から`azookey-setup.exe`をダウンロードし、インストーラーを実行してください。
+[Release](https://github.com/almandite1/azooKey-Windows/releases)から`azookey-setup.exe`をダウンロードし、インストーラーを実行してください。
+
+> [!IMPORTANT]
+> 現在、配布物にはコード署名がありません（[issue #13](https://github.com/almandite1/azooKey-Windows/issues/13)）。
+> セキュリティソフトによっては、IMEのDLLがブラウザなどの保護されたプロセスに
+> 読み込まれるのをブロックすることがあります。
 
 # 機能
 
@@ -55,7 +71,7 @@
 
 #### リポジトリのクローン
 ```
-git clone https://github.com/fkunn1326/azookey-Windows --recursive
+git clone https://github.com/almandite1/azooKey-Windows --recursive
 ```
 `--recursive`オプションを付けて、サブモジュールも一緒にクローンしてください。
 
@@ -87,6 +103,7 @@ regsvr32.exe "path/to/build/x86/azookey_windows.dll" /s
 
 # 関連
 
+- [fkunn1326/azooKey-Windows](https://github.com/fkunn1326/azooKey-Windows): 本リポジトリのフォーク元
 - [azooKey/azooKey](https://github.com/azooKey/azooKey): iOS / iPadOS向けの日本語キーボードアプリ
 - [7ka-Hiira/fcitx5-hazkey](https://github.com/7ka-Hiira/fcitx5-hazkey): fcitx5向けのLinux版azooKey
 - [azooKey/AzookeyKanakanjiConverter](https://github.com/azooKey/AzooKeyKanaKanjiConverter): azooKeyの変換エンジン
