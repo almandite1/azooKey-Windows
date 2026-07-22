@@ -59,6 +59,37 @@ fn classify_text_ext(
     Ok(PositionUpdate::Sent)
 }
 
+/// Measures `range` on the context's active view and publishes the rect as
+/// the caret position. Shared by the two callers that have a range worth
+/// reporting: the composition (`update_pos`) and, with none, the selection
+/// (`update_pos_from_selection`).
+///
+/// Must run inside an edit session — `cookie` is what proves that.
+fn send_range_position(
+    context: &ITfContext,
+    cookie: u32,
+    range: &ITfRange,
+) -> Result<PositionUpdate> {
+    let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() else {
+        return Ok(PositionUpdate::NoIpc);
+    };
+
+    unsafe {
+        let view = context.GetActiveView()?;
+
+        let mut rect = RECT::default();
+        let mut clipped = false.into();
+        let measured = view.GetTextExt(cookie, range, &mut rect, &mut clipped);
+
+        let outcome = classify_text_ext(measured, clipped)?;
+        if outcome == PositionUpdate::Sent {
+            ipc_service.set_window_position(rect.top, rect.left, rect.bottom, rect.right);
+        }
+
+        Ok(outcome)
+    }
+}
+
 #[implement(ITfEditSession)]
 struct EditSession<'a, T> {
     callback: Rc<dyn Fn(u32) -> anyhow::Result<T>>,
@@ -428,29 +459,9 @@ impl TextServiceFactory {
                     Rc::new({
                         let context = context.clone();
 
-                        move |cookie| unsafe {
-                            let view = context.GetActiveView()?;
-                            let range = tip_composition.GetRange()?;
-
-                            let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() else {
-                                return Ok(PositionUpdate::NoIpc);
-                            };
-
-                            let mut rect = RECT::default();
-                            let mut clipped = false.into();
-                            let measured = view.GetTextExt(cookie, &range, &mut rect, &mut clipped);
-
-                            let outcome = classify_text_ext(measured, clipped)?;
-                            if outcome == PositionUpdate::Sent {
-                                ipc_service.set_window_position(
-                                    rect.top,
-                                    rect.left,
-                                    rect.bottom,
-                                    rect.right,
-                                );
-                            }
-
-                            Ok(outcome)
+                        move |cookie| {
+                            let range = unsafe { tip_composition.GetRange()? };
+                            send_range_position(&context, cookie, &range)
                         }
                     }),
                 )?;
@@ -480,6 +491,75 @@ impl TextServiceFactory {
 
         if let Err(error) = result {
             tracing::warn!("Failed to update composition window position: {error:?}");
+        }
+
+        Ok(())
+    }
+
+    /// Publishes the CARET position measured from the current selection.
+    ///
+    /// `update_pos` only ever measures the composition range, so with no
+    /// composition there is no fresh position at all and the mode indicator
+    /// flashes wherever the last composition happened to leave it — a stale
+    /// spot, or the screen origin if nothing has been composed yet (issue
+    /// #55). Switching input mode outside a composition is exactly when that
+    /// happens.
+    ///
+    /// Advisory, like `update_pos`: every failure is logged and swallowed.
+    /// Nothing here may break typing.
+    #[tracing::instrument]
+    pub fn update_pos_from_selection(&self) -> Result<()> {
+        let result: Result<()> = (|| {
+            let (tid, context, composing) = {
+                let text_service = self.borrow()?;
+                let composition = text_service.borrow_composition()?;
+                // No focused document yet — Activate adopts the OS mode
+                // before any context exists. Normal, not a failure, so it
+                // must not reach the warn below.
+                let Ok(context) = text_service.context::<ITfContext>() else {
+                    tracing::debug!("No context yet; skipping the caret position update");
+                    return Ok(());
+                };
+                (
+                    text_service.tid,
+                    context,
+                    composition.tip_composition.is_some(),
+                )
+            };
+
+            // While composing, the composition range is the better anchor and
+            // update_pos already keeps it current — measuring the selection
+            // instead would fight it.
+            if composing {
+                return Ok(());
+            }
+
+            let outcome = edit_session(
+                tid,
+                context.clone(),
+                Rc::new({
+                    let context = context.clone();
+
+                    move |cookie| {
+                        let Some(range) = selected_range(&context, cookie)? else {
+                            // no selection to anchor to (an empty document
+                            // view, or a host that reports none)
+                            return Ok(PositionUpdate::NoIpc);
+                        };
+                        send_range_position(&context, cookie, &range)
+                    }
+                }),
+            )?;
+
+            if let Some(PositionUpdate::PendingLayout) = outcome {
+                tracing::debug!("Caret layout not ready yet; keeping the current position");
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            tracing::warn!("Failed to update the caret position: {error:?}");
         }
 
         Ok(())
@@ -572,6 +652,80 @@ mod tests {
         );
         assert_eq!(log.live_ranges(), 0, "no range may leak from update_pos");
         IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// Issue #55: with no composition there is nothing for `update_pos` to
+    /// measure, so a mode switch outside one had no position to flash the
+    /// indicator at. The selection is the anchor in that case, and it must
+    /// be measured on the active view like any other range.
+    #[test]
+    fn the_caret_position_comes_from_the_selection_without_a_composition() {
+        let _guard = global_state_lock();
+        let log = Rc::new(RangeLog::default());
+        let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
+        let tip = factory_with_context(context.clone());
+        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        // deliberately NO tip_composition: this is the non-composing case
+        IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
+
+        factory.update_pos_from_selection().unwrap();
+
+        let view = unsafe { fake_context_of(&context) }.view_log();
+        assert_eq!(
+            view.get_text_ext_calls.get(),
+            1,
+            "the selection must be measured on the active view"
+        );
+        assert_eq!(
+            log.live_ranges(),
+            0,
+            "the range GetSelection handed out must be released"
+        );
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// While composing, `update_pos` owns the position and measures the
+    /// composition range. Measuring the selection too would fight it, so the
+    /// selection path must stand down.
+    #[test]
+    fn the_selection_is_not_measured_while_composing() {
+        let _guard = global_state_lock();
+        let log = Rc::new(RangeLog::default());
+        let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
+        let tip = factory_with_context(context.clone());
+        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        factory
+            .borrow()
+            .unwrap()
+            .borrow_mut_composition()
+            .unwrap()
+            .tip_composition = Some(FakeComposition::with_log(log.clone()));
+        IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
+
+        factory.update_pos_from_selection().unwrap();
+
+        let view = unsafe { fake_context_of(&context) }.view_log();
+        assert_eq!(
+            view.get_text_ext_calls.get(),
+            0,
+            "update_pos already anchors to the composition while it is live"
+        );
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// Activate adopts the OS compartment mode before any document has
+    /// focus, so this path runs with no context on every activation. That is
+    /// normal: it must no-op quietly rather than warn.
+    #[test]
+    fn no_context_is_not_a_failure_for_the_caret_position() {
+        let _guard = global_state_lock();
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        factory.borrow_mut().unwrap().context = None;
+
+        factory
+            .update_pos_from_selection()
+            .expect("a missing context is a skip, not an error");
     }
 
     /// C-1: `TS_E_NOLAYOUT` means "layout is not ready yet, wait for

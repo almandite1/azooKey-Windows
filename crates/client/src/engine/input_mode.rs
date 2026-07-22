@@ -31,6 +31,13 @@ impl TextServiceFactory {
 
         self.update_lang_bar()?;
 
+        // Before the mode is published, not after: ui.exe flashes the
+        // indicator on SetInputMode and positions it on SetPosition, so the
+        // other order flashes it at the stale spot and then moves it.
+        // Outside a composition nothing else refreshes that position at all
+        // (issue #55).
+        self.update_pos_from_selection()?;
+
         if let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() {
             ipc_service.set_input_mode(match mode {
                 InputMode::Latin => "A",
