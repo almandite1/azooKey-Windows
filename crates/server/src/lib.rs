@@ -2,6 +2,7 @@ use async_stream::stream;
 use futures_core::stream::Stream;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::{ffi::c_void, pin::Pin, ptr::addr_of_mut};
+use tokio::sync::mpsc;
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
     net::windows::named_pipe::{NamedPipeServer, ServerOptions},
@@ -36,6 +37,23 @@ unsafe impl Sync for UnsafeSecurityAttributes {}
 pub struct TonicNamedPipeServer {
     inner: NamedPipeServer,
     session_id: i64,
+    /// Told which session ended when this connection is dropped. `None` for
+    /// servers built with [`TonicNamedPipeServer::new`], which is every
+    /// server that does not care (the conversion server evicts idle sessions
+    /// on a timer instead).
+    disconnect_tx: Option<mpsc::UnboundedSender<i64>>,
+}
+
+/// tonic drops the connection's I/O object when the connection ends, which
+/// includes the client process dying — the only signal a server gets that an
+/// application is gone. Unbounded because a `Drop` cannot await.
+impl Drop for TonicNamedPipeServer {
+    fn drop(&mut self) {
+        if let Some(tx) = &self.disconnect_tx {
+            // the receiver is gone during shutdown; nothing to do about it
+            let _ = tx.send(self.session_id);
+        }
+    }
 }
 
 /// Identifies one accepted pipe connection. tonic clones this into every
@@ -140,7 +158,27 @@ fn current_user_sid_string() -> io::Result<String> {
 }
 
 impl TonicNamedPipeServer {
+    /// Accepts connections on `path`, with no interest in when they end.
     pub fn new(path: &str) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>>> {
+        Self::build(path, None)
+    }
+
+    /// Accepts connections on `path` and sends the session id of each one
+    /// down `disconnect_tx` when it ends. For state that has to be undone
+    /// when a client goes away rather than aged out — the candidate window
+    /// is only ever hidden by an RPC, so a host application killed
+    /// mid-composition used to leave it on screen forever.
+    pub fn with_disconnect_notify(
+        path: &str,
+        disconnect_tx: mpsc::UnboundedSender<i64>,
+    ) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>>> {
+        Self::build(path, Some(disconnect_tx))
+    }
+
+    fn build(
+        path: &str,
+        disconnect_tx: Option<mpsc::UnboundedSender<i64>>,
+    ) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>>> {
         // set security attributes to allow ipc from sandboxed processes
         // see https://nathancorvussolis.blogspot.com/2018/05/windows-ime-security.html
 
@@ -203,6 +241,7 @@ impl TonicNamedPipeServer {
                             yield Ok(TonicNamedPipeServer {
                                 inner: server,
                                 session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+                                disconnect_tx: disconnect_tx.clone(),
                             });
                         }
                         Err(e) => {
