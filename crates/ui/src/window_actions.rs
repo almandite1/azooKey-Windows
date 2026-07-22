@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::ipc::WindowAction;
-use crate::utils::{self, CaretRect};
+use crate::utils::{self, CandidatePlacement, CaretRect, ShowDecision};
 use crate::window::{is_visible, notify_ime_event, pin_topmost, set_visibility};
 use crate::UserEvent;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -38,13 +38,27 @@ pub fn reposition_candidate(
     candidate_window.set_outer_position(PhysicalPosition::new(x, y));
 }
 
+/// How long a `Show` waits for the position that belongs to it before giving
+/// up and showing anyway. Long enough for the `OnLayoutChange` that follows a
+/// `TS_E_NOLAYOUT`, short enough not to read as lag.
+const POSITION_GRACE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Makes the candidate window visible, announcing the transition only when it
+/// really is one: the TIP sends Show/Hide freely, and announcing every
+/// request buried listeners in redundant events.
+pub fn show_candidate(candidate_window: &Window) {
+    if !set_visibility(candidate_window.hwnd(), true) {
+        notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_SHOW);
+    }
+}
+
 pub fn handle_window_action(
     action: WindowAction,
     candidate_window: &Window,
     indicator_window: &Window,
     indicator_flash: &Arc<Mutex<Option<JoinHandle<()>>>>,
     proxy: &EventLoopProxy<UserEvent>,
-    last_caret: &mut Option<CaretRect>,
+    placement: &mut CandidatePlacement,
 ) {
     let indicator_hwnd = indicator_window.hwnd();
 
@@ -63,13 +77,23 @@ pub fn handle_window_action(
                 set_visibility(indicator_hwnd, false);
             }
 
-            // only on a real transition: the TIP sends Show/Hide freely, and
-            // announcing every request buried listeners in redundant events
-            if !set_visibility(candidate_window.hwnd(), true) {
-                notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_SHOW);
+            match placement.on_show() {
+                ShowDecision::ShowNow => show_candidate(candidate_window),
+                // No position for THIS composition yet: showing now would
+                // put the window at the last one's caret (issue #59). Arm
+                // the grace period so a host that never reports a layout
+                // still gets its candidates.
+                ShowDecision::Defer => {
+                    let proxy = proxy.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(POSITION_GRACE).await;
+                        let _ = proxy.send_event(UserEvent::ShowDeadline);
+                    });
+                }
             }
         }
         WindowAction::Hide => {
+            placement.on_hide();
             if set_visibility(candidate_window.hwnd(), false) {
                 notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_HIDE);
             }
@@ -87,8 +111,9 @@ pub fn handle_window_action(
                 right,
             };
             // remembered so later RESIZES (SetCandidate width, UpdateHeight,
-            // DPI changes) can re-clamp against the same caret (issue #3)
-            *last_caret = Some(caret);
+            // DPI changes) can re-clamp against the same caret (issue #3),
+            // and marked fresh so a Show may now be honoured (issue #59)
+            let release_deferred_show = placement.on_position(caret);
 
             pin_topmost(candidate_window.hwnd());
             pin_topmost(indicator_hwnd);
@@ -96,7 +121,7 @@ pub fn handle_window_action(
             let size = candidate_window.inner_size();
             reposition_candidate(
                 candidate_window,
-                last_caret,
+                &placement.caret,
                 size.width as i32,
                 size.height as i32,
             );
@@ -109,6 +134,12 @@ pub fn handle_window_action(
                 indicator_size.height as i32,
             );
             indicator_window.set_outer_position(PhysicalPosition::new(ix, iy));
+
+            // the window is placed now, so a Show that was waiting on this
+            // position can finally be honoured (issue #59)
+            if release_deferred_show {
+                show_candidate(candidate_window);
+            }
 
             if is_visible(candidate_window.hwnd()) {
                 notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_CHANGE);
@@ -137,7 +168,7 @@ pub fn handle_window_action(
             let physical = new_size.to_physical::<i32>(scale);
             reposition_candidate(
                 candidate_window,
-                last_caret,
+                &placement.caret,
                 physical.width,
                 physical.height,
             );
