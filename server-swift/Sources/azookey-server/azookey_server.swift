@@ -11,7 +11,14 @@ import ffi
 // The canonical declaration of every exported signature is
 // Sources/ffi/include/ffi.h; keep the @_cdecl exports below (and the Rust
 // mirror in crates/server/src/ffi.rs) in sync with it.
-@MainActor let converter = KanaKanjiConverter()
+//
+// The converter is created in `Initialize`, not here: since the engine
+// adopted per-instance dictionaries the dictionary directory is an init
+// argument, and it is only known once the Rust side hands us the
+// installation path. Nothing may convert before that call, but this is the
+// FFI boundary — a call that arrives early returns an empty candidate list
+// instead of trapping and taking the server down.
+@MainActor var converter: KanaKanjiConverter?
 
 // Per-client composing state, keyed by the session id the Rust server
 // assigns to each pipe connection. Every application hosting the IME has
@@ -61,7 +68,7 @@ struct EngineConfig {
 // The ./test placeholder predates this refactor: with learningType
 // .nothing the memory/shared-container dirs are never written — they
 // become real, configurable paths when the learning feature lands.
-let emojiDictionaryFileName = "emoji_all_E15.1.txt"
+let emojiDictionaryFileName = "emoji_all_E16.0.txt"
 let placeholderDataDirectory = URL(filePath: "./test")
 let zenzaiInferenceLimit = 1
 
@@ -69,16 +76,18 @@ let zenzaiInferenceLimit = 1
     let zenzaiEnabled = config.zenzaiEnabled
     let zenzaiProfile = config.zenzaiProfile
     return ConvertRequestOptions(
-        requireJapanesePrediction: true,
-        requireEnglishPrediction: false,
+        requireJapanesePrediction: .autoMix,
+        requireEnglishPrediction: .disabled,
         keyboardLanguage: .ja_JP,
         learningType: .nothing,
-        dictionaryResourceURL: execURL.appendingPathComponent("Dictionary"),
         memoryDirectoryURL: placeholderDataDirectory,
         sharedContainerURL: placeholderDataDirectory,
         textReplacer: .init {
             return execURL.appendingPathComponent("EmojiDictionary").appendingPathComponent(emojiDictionaryFileName)
         },
+        // nil, not [] — the converter substitutes its own default set, which
+        // is what the engine used before the providers became an argument
+        specialCandidateProviders: nil,
         // zenzai
         zenzaiMode: zenzaiEnabled ? .on(
             weight: execURL.appendingPathComponent("zenz.gguf"),
@@ -153,6 +162,23 @@ func kanaReading(_ convertTarget: String) -> String {
     return completed
 }
 
+/// What is left of `target` after a candidate covering `composingCount` is
+/// committed, and how many input elements that took.
+///
+/// The count crossing the FFI is, and has to stay, a count of input elements
+/// (romaji keystrokes): the client spends it on its own `raw_input` and hands
+/// it back to `ShrinkText`, which spends it as `.inputCount`. A candidate's
+/// `composingCount` is no longer that number — since the engine grew
+/// `ComposingCount` it is usually a *surface* (kana) count, and for a
+/// multi-clause candidate a composite of several counts, so `にゅうりょく`
+/// reports 6 where the input holds 9 elements. Rather than reimplement the
+/// enum's arithmetic, let the engine spend the count and measure what it took.
+func remainder(of target: ComposingText, after composingCount: ComposingCount) -> (text: ComposingText, inputCount: Int) {
+    var remaining = target
+    remaining.prefixComplete(composingCount: composingCount)
+    return (remaining, target.input.count - remaining.input.count)
+}
+
 func constructCandidateString(candidate: Candidate, hiragana: String) -> String {
     var remainingHiragana = hiragana
     var result = ""
@@ -202,15 +228,24 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
     load_config()
 
+    // the dictionary belongs to the converter instance now, so this is the
+    // earliest point it can be built: `path` is where the installer put
+    // Dictionary/ and EmojiDictionary/
+    let engine = KanaKanjiConverter(
+        dictionaryURL: execURL.appendingPathComponent("Dictionary"),
+        preloadDictionary: true
+    )
+    converter = engine
+
     // warm up the converter (and the zenzai model when enabled)
     var warmup = ComposingText()
     warmup.insertAtCursorPosition("a", inputStyle: .roman2kana)
-    converter.requestCandidates(warmup, options: getOptions())
+    _ = engine.requestCandidates(warmup, options: getOptions())
 
     // a missing/corrupt zenz.gguf degrades silently to non-neural
     // conversion inside the converter; surface its status in the log
-    if !converter.zenzStatus.isEmpty {
-        print("zenzai status: \(converter.zenzStatus)")
+    if !engine.zenzStatus.isEmpty {
+        print("zenzai status: \(engine.zenzStatus)")
     }
 }
 
@@ -261,11 +296,25 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     withSession(session) { state in
         state.composingText = ComposingText()
     }
+    endComposition()
 }
 
 @_cdecl("RemoveSession")
 @MainActor public func remove_session(session: Int64) {
     sessions.removeValue(forKey: session)
+    endComposition()
+}
+
+/// Drops the converter's own per-composition caches (lattice, zenzai
+/// sequence, last committed data).
+///
+/// The converter keeps that state internally and keys it on nothing we
+/// control — one instance is shared by every application, so a reading left
+/// behind by one app is what the next lookup is incrementally built on.
+/// Upstream resets it when a composition ends; ours end at ClearText and at
+/// RemoveSession, so those are the two places to say so.
+@MainActor func endComposition() {
+    converter?.stopComposition()
 }
 
 func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
@@ -289,6 +338,10 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let target = conversionTarget(composingText)
     let hiragana = kanaReading(target.convertTarget)
     let options = getOptions(context: contextString)
+    guard let converter else {
+        lengthPtr.pointee = 0
+        return to_list_pointer([])
+    }
     let converted = converter.requestCandidates(target, options: options)
     var result: [FFICandidate] = []
 
@@ -296,13 +349,11 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let candidate = converted.mainResults[i]
 
         let text = _strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
-        let correspondingCount = candidate.correspondingCount
 
-        var afterComposingText = target
-        // same guard as ShrinkText below: prefixComplete clamps from above
-        // but a negative correspondingCount traps in removeFirst, and this
-        // one comes from the converter rather than from us
-        afterComposingText.prefixComplete(correspondingCount: max(0, correspondingCount))
+        let (afterComposingText, correspondingCount) = remainder(
+            of: target,
+            after: candidate.composingCount
+        )
         let subtext = _strdup(kanaReading(afterComposingText.convertTarget))
 
         result.append(FFICandidate(text: text, subtext: subtext, correspondingCount: Int32(correspondingCount)))
@@ -320,10 +371,12 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 ) -> UnsafeMutablePointer<CChar>? {
     withSession(session) { state in
         var afterComposingText = state.composingText
+        // .inputCount is the same operation the pre-traits engine performed
+        // for a bare Int, so the client's offsets keep their meaning.
         // prefixComplete clamps the count from above (min with input.count)
         // but a negative count traps in Array.removeFirst and takes the
         // whole server down — clamp from below here, at the FFI boundary
-        afterComposingText.prefixComplete(correspondingCount: max(0, Int(offset)))
+        afterComposingText.prefixComplete(composingCount: .inputCount(max(0, Int(offset))))
         state.composingText = afterComposingText
 
         return _strdup(kanaReading(state.composingText.convertTarget))
