@@ -1,5 +1,12 @@
 # azooKey for Windows
 
+[![CI](https://github.com/almandite1/azooKey-Windows/actions/workflows/actions.yml/badge.svg?branch=dev)](https://github.com/almandite1/azooKey-Windows/actions/workflows/actions.yml)
+[![Release](https://img.shields.io/github/v/release/almandite1/azooKey-Windows?include_prereleases&label=release)](https://github.com/almandite1/azooKey-Windows/releases)
+[![License](https://img.shields.io/github/license/almandite1/azooKey-Windows)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D4?logo=windows&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-CE422B?logo=rust&logoColor=white)
+![Swift](https://img.shields.io/badge/Swift-F05138?logo=swift&logoColor=white)
+
 [AzooKeyKanaKanjiConverter](https://github.com/azooKey/AzooKeyKanaKanjiConverter)を利用したWindows版IMEです。
 
 > [!NOTE]
