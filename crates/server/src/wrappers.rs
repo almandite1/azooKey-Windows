@@ -156,3 +156,56 @@ pub(crate) fn get_composed_text(session: i64) -> Vec<Suggestion> {
 
     suggestions
 }
+
+#[cfg(test)]
+mod tests {
+    //! IMPORTANT: nothing here may reference an FFI symbol, directly or
+    //! through a helper that calls one.
+    //!
+    //! `build.rs` links `azookey-server.lib` into the whole crate, but the
+    //! test binary only ends up DEPENDING on the Swift DLL if it actually
+    //! references an imported symbol — otherwise MSVC's `/OPT:REF` drops the
+    //! import and the tests run with no Swift runtime present. That is why
+    //! these can run in CI at all. Testing `consume_cstr` (it calls
+    //! `FreeString`) or any of the `pub(crate)` wrappers would break every
+    //! test in the crate, not just the new one.
+
+    use super::{cstr_or_empty, to_cstring};
+    use std::ffi::CString;
+
+    #[test]
+    fn plain_and_multibyte_text_round_trips() {
+        assert_eq!(to_cstring("abc").as_bytes(), b"abc");
+        assert_eq!(to_cstring("にほんご").as_bytes(), "にほんご".as_bytes());
+    }
+
+    /// Requests arrive over a pipe any local process can open, so an interior
+    /// NUL is untrusted input rather than a bug: it is stripped, never a
+    /// panic.
+    #[test]
+    fn interior_nul_bytes_are_stripped() {
+        assert_eq!(to_cstring("a\0b").as_bytes(), b"ab");
+        assert_eq!(to_cstring("\0").as_bytes(), b"");
+        assert_eq!(to_cstring("a\0\0b").as_bytes(), b"ab");
+    }
+
+    #[test]
+    fn empty_string_is_an_empty_cstring() {
+        assert_eq!(to_cstring("").as_bytes(), b"");
+    }
+
+    #[test]
+    fn cstr_or_empty_tolerates_null() {
+        assert_eq!(unsafe { cstr_or_empty(std::ptr::null()) }, "");
+    }
+
+    /// The engine's strings are not guaranteed valid UTF-8; pin the
+    /// `to_string_lossy` contract so a future rewrite cannot turn a bad byte
+    /// into a panic inside a gRPC handler.
+    #[test]
+    fn cstr_or_empty_replaces_invalid_utf8() {
+        let bad = CString::new([b'a', 0xFF, b'b']).expect("no interior NUL");
+
+        assert_eq!(unsafe { cstr_or_empty(bad.as_ptr()) }, "a\u{FFFD}b");
+    }
+}

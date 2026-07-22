@@ -166,6 +166,13 @@ jobs:
     - name: Test
       run: cargo test --workspace --release
 
+    # the Swift package's own suite (swift-testing); `cargo test` above only
+    # covers the Rust side. After Build so the package graph is already
+    # fetched and the installer is already packaged — this build enables
+    # testability and must not feed post_build.
+    - name: Test (Swift)
+      run: cargo make test_swift
+
     - name: Clippy
       run: cargo clippy --workspace --all-targets --release -- -D warnings
 
