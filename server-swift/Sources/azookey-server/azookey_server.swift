@@ -97,6 +97,62 @@ let zenzaiInferenceLimit = 1
     )
 }
 
+/// The reading as the user should see it, with a pending romaji `n`
+/// resolved to ん.
+///
+/// `ComposingText.convertTarget` keeps a trailing `n` as the latin letter
+/// because it is still ambiguous — `nihon` can continue into `nihona` — and
+/// that is the right thing for the engine to hold onto. But this string is
+/// also what we hand back as the candidate text, as the remaining reading,
+/// and as the reading F6 shows, so the letter reached the document: `nihon`
+/// then Enter committed `にほn`, and conversion offered `仁保n` instead of
+/// 日本 (issue #38).
+///
+/// On its own an `n` is ん, so it resolves. Other trailing consonants are
+/// not kana by themselves and stay as they are — `nihok` shows and commits
+/// `にほk`, which is what MS-IME does too. Uppercase `N` is left alone: the
+/// roman2kana table is lowercase, so an `N` in the reading is literal text
+/// the user asked for.
+///
+/// One character replaces one character, so this cannot shift the
+/// ruby-length arithmetic in `constructCandidateString`.
+func kanaReading(_ convertTarget: String) -> String {
+    guard convertTarget.hasSuffix("n") else {
+        return convertTarget
+    }
+    return convertTarget.dropLast() + "ん"
+}
+
+/// The text to ask the converter about: the session's own composing text,
+/// except that a pending romaji `n` is completed first.
+///
+/// The engine deliberately leaves that `n` unresolved — `nihon` can still
+/// become `nihona` — but the dictionary then never sees ニホン, so `nihon`
+/// offered 仁保 and 二歩 and could not convert to 日本 at all (issue #38).
+/// Completing it the way a user would, by typing the second `n`, is enough
+/// to make the lookup work.
+///
+/// This is a copy: the session keeps its unresolved `n`, so the very next
+/// keystroke can still turn it into な行.
+///
+/// `correspondingCount` stays usable against the session's text even though
+/// it is measured here. Candidate boundaries fall on kana boundaries, so a
+/// candidate that stops before the ん counts the same input elements in
+/// both, and one that covers the ん counts the extra `n` too — which
+/// `prefixComplete` clamps to the session's length, consuming exactly the
+/// reading that produced the ん.
+///
+/// Only when the cursor is at the end: `insertAtCursorPosition` would
+/// otherwise splice the `n` into the middle of the reading.
+@MainActor func conversionTarget(_ composingText: ComposingText) -> ComposingText {
+    guard composingText.isAtEndIndex, composingText.convertTarget.hasSuffix("n") else {
+        return composingText
+    }
+    var completed = composingText
+    completed.insertAtCursorPosition("n", inputStyle: .roman2kana)
+    return completed
+}
+
 func constructCandidateString(candidate: Candidate, hiragana: String) -> String {
     var remainingHiragana = hiragana
     var result = ""
@@ -169,7 +225,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         state.composingText.insertAtCursorPosition(inputString, inputStyle: .roman2kana)
 
         cursorPtr.pointee = Int32(state.composingText.convertTargetCursorPosition)
-        return _strdup(state.composingText.convertTarget)
+        return _strdup(kanaReading(state.composingText.convertTarget))
     }
 }
 
@@ -182,7 +238,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         state.composingText.deleteBackwardFromCursorPosition(count: 1)
 
         cursorPtr.pointee = Int32(state.composingText.convertTargetCursorPosition)
-        return _strdup(state.composingText.convertTarget)
+        return _strdup(kanaReading(state.composingText.convertTarget))
     }
 }
 
@@ -196,7 +252,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         let cursor = state.composingText.moveCursorFromCursorPosition(count: Int(offset))
 
         cursorPtr.pointee = Int32(cursor)
-        return _strdup(state.composingText.convertTarget)
+        return _strdup(kanaReading(state.composingText.convertTarget))
     }
 }
 
@@ -230,9 +286,10 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let (composingText, contextString) = withSession(session) { state in
         (state.composingText, state.context)
     }
-    let hiragana = composingText.convertTarget
+    let target = conversionTarget(composingText)
+    let hiragana = kanaReading(target.convertTarget)
     let options = getOptions(context: contextString)
-    let converted = converter.requestCandidates(composingText, options: options)
+    let converted = converter.requestCandidates(target, options: options)
     var result: [FFICandidate] = []
 
     for i in 0..<converted.mainResults.count {
@@ -241,9 +298,9 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let text = _strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
         let correspondingCount = candidate.correspondingCount
 
-        var afterComposingText = composingText
+        var afterComposingText = target
         afterComposingText.prefixComplete(correspondingCount: correspondingCount)
-        let subtext = _strdup(afterComposingText.convertTarget)
+        let subtext = _strdup(kanaReading(afterComposingText.convertTarget))
 
         result.append(FFICandidate(text: text, subtext: subtext, correspondingCount: Int32(correspondingCount)))
     }
@@ -266,7 +323,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         afterComposingText.prefixComplete(correspondingCount: max(0, Int(offset)))
         state.composingText = afterComposingText
 
-        return _strdup(state.composingText.convertTarget)
+        return _strdup(kanaReading(state.composingText.convertTarget))
     }
 }
 

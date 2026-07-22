@@ -422,8 +422,12 @@ async fn remove_text_drains_the_reading_one_kana_per_call() {
             .expect("composing_text missing")
             .hiragana;
     }
-    // a lone trailing n stays roman until a follow-up key resolves it
-    assert_eq!(reading, "さいげんてじゅn");
+    // The engine holds the trailing n unresolved — a follow-up key can
+    // still make it な行 — but reports it as ん: this reading is what F6
+    // shows and what a commit writes, so it must not carry a latin letter
+    // (issue #38). Either way it is one character, which is what the
+    // per-kana contract below actually depends on.
+    assert_eq!(reading, "さいげんてじゅん");
 
     let mut expected = reading.chars().count();
     while expected > 0 {
