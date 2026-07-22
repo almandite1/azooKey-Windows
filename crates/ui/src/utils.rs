@@ -31,6 +31,72 @@ impl CaretRect {
     }
 }
 
+/// Whether a `Show` can be honoured right now or has to wait for a position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowDecision {
+    ShowNow,
+    Defer,
+}
+
+/// Where the candidate window may appear, and whether it is allowed to yet.
+///
+/// The TIP sends `SetPosition` before `Show` (`act_start_composition`), but
+/// `update_pos` can come back with `TS_E_NOLAYOUT` — the host has no layout
+/// for the range yet and answers later, via `OnLayoutChange`. The `Show`
+/// still arrives on time, so the window used to become visible at the
+/// PREVIOUS composition's caret, or at the origin on the first one, and only
+/// then jump to the caret (issue #59).
+///
+/// So a position is not merely remembered, it is remembered as *fresh* or
+/// not: fresh means "reported since the last hide", i.e. belonging to the
+/// composition being shown.
+#[derive(Default, Debug)]
+pub struct CandidatePlacement {
+    /// The last caret rect the TIP reported. Outlives the hide on purpose —
+    /// resizes re-clamp against it (issue #3).
+    pub caret: Option<CaretRect>,
+    /// Whether `caret` belongs to the composition currently being shown.
+    fresh: bool,
+    /// A `Show` arrived before any fresh position did.
+    deferred: bool,
+}
+
+impl CandidatePlacement {
+    /// A `Show` request. Deferring returns the window's visibility decision
+    /// to `on_position` (or to `on_deadline`, so a host that never reports a
+    /// layout still gets its candidates).
+    pub fn on_show(&mut self) -> ShowDecision {
+        if self.fresh {
+            self.deferred = false;
+            ShowDecision::ShowNow
+        } else {
+            self.deferred = true;
+            ShowDecision::Defer
+        }
+    }
+
+    /// A `SetPosition`. Returns true when it releases a deferred `Show`.
+    pub fn on_position(&mut self, caret: CaretRect) -> bool {
+        self.caret = Some(caret);
+        self.fresh = true;
+        std::mem::take(&mut self.deferred)
+    }
+
+    /// A `Hide`. The rect stays for re-clamping; its freshness does not — the
+    /// next composition's `Show` must wait for a position of its own.
+    pub fn on_hide(&mut self) {
+        self.fresh = false;
+        self.deferred = false;
+    }
+
+    /// The grace period ran out. Returns true when a `Show` is still waiting,
+    /// which must now be honoured regardless: no candidates at all is worse
+    /// than candidates in a stale spot.
+    pub fn on_deadline(&mut self) -> bool {
+        std::mem::take(&mut self.deferred)
+    }
+}
+
 /// Logical (CSS px) width of the candidate window for the longest candidate,
 /// in characters. The webview lays out in CSS px, so this must be applied as
 /// a `LogicalSize` — applying it as physical px left the window too small on
@@ -268,6 +334,89 @@ mod tests {
             "a degenerate rect leaves the monitor choice to how \
              MonitorFromRect happens to treat empty input"
         );
+    }
+
+    const CARET: CaretRect = CaretRect {
+        top: 100,
+        left: 200,
+        bottom: 140,
+        right: 260,
+    };
+
+    /// Issue #59: the ordinary path. The TIP positions before it shows, so
+    /// the position is already fresh and the Show needs no deferral.
+    #[test]
+    fn a_show_after_a_position_is_immediate() {
+        let mut placement = CandidatePlacement::default();
+        placement.on_position(CARET);
+
+        assert_eq!(placement.on_show(), ShowDecision::ShowNow);
+    }
+
+    /// Issue #59: with no position yet — the first composition, or one whose
+    /// update_pos came back TS_E_NOLAYOUT — showing would put the window at
+    /// the origin. The Show waits, and the position releases it.
+    #[test]
+    fn a_show_without_a_position_waits_for_one() {
+        let mut placement = CandidatePlacement::default();
+
+        assert_eq!(placement.on_show(), ShowDecision::Defer);
+        assert!(
+            placement.on_position(CARET),
+            "the position must release the deferred show"
+        );
+        assert!(
+            !placement.on_deadline(),
+            "and it must not be shown a second time when the grace period ends"
+        );
+    }
+
+    /// The freshness is per composition: a rect from the PREVIOUS one is
+    /// exactly the stale spot this exists to avoid, so a hide must invalidate
+    /// it even though the rect itself is kept for re-clamping (issue #3).
+    #[test]
+    fn a_hide_invalidates_the_position_but_keeps_the_rect() {
+        let mut placement = CandidatePlacement::default();
+        placement.on_position(CARET);
+        placement.on_hide();
+
+        assert_eq!(
+            placement.on_show(),
+            ShowDecision::Defer,
+            "the next composition must wait for a position of its own"
+        );
+        assert!(
+            placement.caret.is_some(),
+            "the rect stays available for re-clamping"
+        );
+    }
+
+    /// A host that never reports a layout would otherwise never show
+    /// candidates at all, which is worse than showing them in a stale spot.
+    #[test]
+    fn the_grace_period_shows_a_deferred_window_anyway() {
+        let mut placement = CandidatePlacement::default();
+        placement.on_show();
+
+        assert!(
+            placement.on_deadline(),
+            "the deferred show must be honoured"
+        );
+        assert!(
+            !placement.on_deadline(),
+            "but only once — a later deadline must not re-show a hidden window"
+        );
+    }
+
+    /// A deadline landing after the composition was cancelled must not pop
+    /// the window back up.
+    #[test]
+    fn a_deadline_after_a_hide_shows_nothing() {
+        let mut placement = CandidatePlacement::default();
+        placement.on_show();
+        placement.on_hide();
+
+        assert!(!placement.on_deadline());
     }
 
     #[test]

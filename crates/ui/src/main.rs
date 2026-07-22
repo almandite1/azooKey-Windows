@@ -33,6 +33,8 @@ pub enum UserEvent {
     WindowAction(WindowAction),
     /// liveness probe: proves the event loop is still processing events
     Heartbeat,
+    /// the grace period a deferred Show is waiting on has elapsed (issue #59)
+    ShowDeadline,
 }
 
 /// Where WebView2 keeps its profile. Left unset it defaults to
@@ -182,10 +184,11 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // the caret rect the TIP last positioned the candidate window at; kept
-    // so resizes (SetCandidate width, UpdateHeight, DPI changes) can
-    // re-clamp the grown window into the work area (issue #3)
-    let mut last_caret: Option<utils::CaretRect> = None;
+    // where the candidate window may appear: the caret rect the TIP last
+    // reported (kept so resizes can re-clamp the grown window into the work
+    // area, issue #3) plus whether that rect belongs to the composition being
+    // shown (issue #59)
+    let mut placement = utils::CandidatePlacement::default();
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -202,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
                 // to have (inner_size() still reports the old one here)
                 window_actions::reposition_candidate(
                     &candidate_window,
-                    &last_caret,
+                    &placement.caret,
                     new_inner_size.width as i32,
                     new_inner_size.height as i32,
                 );
@@ -266,10 +269,18 @@ async fn main() -> anyhow::Result<()> {
                     let physical = new_size.to_physical::<i32>(scale);
                     window_actions::reposition_candidate(
                         &candidate_window,
-                        &last_caret,
+                        &placement.caret,
                         physical.width,
                         physical.height,
                     );
+                }
+                UserEvent::ShowDeadline => {
+                    // the position never came (a host that reports no layout
+                    // for the range). Candidates in a stale spot still beat
+                    // no candidates at all (issue #59).
+                    if placement.on_deadline() {
+                        window_actions::show_candidate(&candidate_window);
+                    }
                 }
                 UserEvent::Heartbeat => {
                     // test hook: simulate a stalled event loop (inert unless
@@ -289,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
                         &indicator_window,
                         &task_guard,
                         &event_loop_proxy,
-                        &mut last_caret,
+                        &mut placement,
                     );
                 }
             },
