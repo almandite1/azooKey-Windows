@@ -60,11 +60,19 @@ Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll
 Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit
 ; exclude the installer's own output (OutputDir is also ../build): a stale
 ; azookey-setup.exe would otherwise be bundled into — or clash with — the new one.
-; also exclude azookey_windows.dll: it's already placed and registered above as
-; azookey.dll / azookey32.dll, so the glob would only add unregistered dead copies
+; also exclude azookey_windows*.dll: the TIP is already placed and registered
+; above as azookey.dll / azookey32.dll, so the glob would only add unregistered
+; dead copies. The wildcard matters as much as the bare name: a working tree
+; accumulates versioned deploy copies (azookey_windows_batch10.dll and
+; friends, one per regsvr32 target), and shipping those is ~100 MB of dead
+; weight plus a stale DLL sitting next to the live one for a future regsvr32
+; to pick by mistake. CI builds from a clean checkout and never had them.
+; *.bak is the same story in a different shape: hand-made backups of a
+; binary before swapping it (ui.exe.pre-aria.bak and the like) are working-
+; tree leftovers, never runtime assets.
 ; ui.exe.WebView2 is runtime state (the WebView2 profile ui.exe creates
 ; next to itself when the stack is run from build/) — never ship it
-Source: "../build/*"; Excludes: "azookey-setup.exe,azookey_windows.dll,\ui.exe.WebView2\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "../build/*"; Excludes: "azookey-setup.exe,azookey_windows*.dll,*.bak,\ui.exe.WebView2\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "../target/release/bundle/nsis/{#TauriSetupExe}"; Flags: dontcopy noencryption
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files

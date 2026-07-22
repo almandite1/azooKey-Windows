@@ -222,8 +222,14 @@ fn process_teardown_is_not_de_elevated() {
 /// The build-directory glob must not re-copy the TIP DLL: it is already
 /// placed and registered as azookey.dll / azookey32.dll, so the glob would
 /// only add unregistered dead copies.
+///
+/// Issue #53: the exclusion has to be a wildcard, not the bare filename. A
+/// working tree accumulates versioned deploy copies — one per regsvr32
+/// target — and an exact-name exclusion shipped every one of them: ~100 MB
+/// of dead weight, and a stale DLL next to the live one for a future
+/// regsvr32 to pick by mistake.
 #[test]
-fn build_glob_excludes_the_registered_dll() {
+fn build_glob_excludes_every_tip_dll_copy() {
     let iss = read("Installer.iss");
 
     let glob_line = iss
@@ -231,9 +237,36 @@ fn build_glob_excludes_the_registered_dll() {
         .find(|l| l.contains(r#"Source: "../build/*""#))
         .expect("Installer.iss should have a build/* glob");
 
+    let excludes = glob_line
+        .split_once("Excludes: \"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(list, _)| list)
+        .expect("the build/* glob should carry an Excludes list");
+
+    let pattern = excludes
+        .split(',')
+        .find(|p| p.contains("azookey_windows"))
+        .unwrap_or_else(|| panic!("the glob must exclude the TIP DLL: got {excludes}"));
+
     assert!(
-        glob_line.contains("azookey_windows.dll"),
-        "the build/* glob must exclude azookey_windows.dll: got {glob_line}"
+        pattern.contains('*'),
+        "the exclusion must be a wildcard, or the versioned deploy copies \
+         (azookey_windows_batch10.dll and friends) ship too: got {pattern}"
+    );
+
+    // the pattern must still cover the plain name the [Files] entries above
+    // place as azookey.dll / azookey32.dll
+    let prefix = pattern.split('*').next().unwrap_or_default();
+    assert!(
+        "azookey_windows.dll".starts_with(prefix),
+        "the exclusion must still match azookey_windows.dll itself: got {pattern}"
+    );
+
+    // hand-made backups of a binary before swapping it are the same kind of
+    // working-tree leftover, and two of them were shipping
+    assert!(
+        excludes.split(',').any(|p| p.trim() == "*.bak"),
+        "the build/* glob must exclude *.bak: got {excludes}"
     );
 }
 
