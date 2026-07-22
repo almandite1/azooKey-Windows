@@ -102,6 +102,16 @@ impl From<shared::proto::ComposingText> for Candidates {
     }
 }
 
+/// Unwraps the `composing_text` an engine RPC answers with into `Candidates`.
+/// A `None` is a protocol error — the caller always sent text to convert, so
+/// the server owed a reading back — and becomes an ordinary error rather than
+/// a silent empty list.
+fn candidates_or_missing(composing_text: Option<shared::proto::ComposingText>) -> Result<Candidates> {
+    composing_text
+        .map(Candidates::from)
+        .ok_or_else(|| anyhow::anyhow!("composing_text is None"))
+}
+
 impl IPCService {
     pub fn new() -> Result<Self> {
         let runtime = tokio::runtime::Runtime::new()?;
@@ -183,6 +193,22 @@ impl IPCService {
             }
         })
     }
+
+    /// The wire tail shared by every candidate-window RPC: clone the window
+    /// client, run one call through `exec`, and swallow any failure with a
+    /// warning. Window RPCs are cosmetic — a dead or slow UI process must not
+    /// break text input — so unlike the engine RPCs they never propagate. The
+    /// `#[cfg(test)]` recording stays in each method because the `IpcCall`
+    /// variants differ; this is only the production path.
+    fn window_rpc<T, Fut>(&self, name: &str, call: impl FnOnce(WindowServiceClient<Channel>) -> Fut)
+    where
+        Fut: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    {
+        let client = self.window_client.clone();
+        if let Err(e) = self.exec(call(client)) {
+            tracing::warn!("{name} failed: {e}");
+        }
+    }
 }
 
 /// Recording double behind the `fake` seam: keeps every call in order and
@@ -258,10 +284,7 @@ impl IPCService {
                 .await
         })?;
 
-        response
-            .composing_text
-            .map(Candidates::from)
-            .ok_or_else(|| anyhow::anyhow!("composing_text is None"))
+        candidates_or_missing(response.composing_text)
     }
 
     #[tracing::instrument(skip(self))]
@@ -278,10 +301,7 @@ impl IPCService {
                 .await
         })?;
 
-        response
-            .composing_text
-            .map(Candidates::from)
-            .ok_or_else(|| anyhow::anyhow!("composing_text is None"))
+        candidates_or_missing(response.composing_text)
     }
 
     #[tracing::instrument(skip(self))]
@@ -328,10 +348,7 @@ impl IPCService {
                 .await
         })?;
 
-        response
-            .composing_text
-            .map(Candidates::from)
-            .ok_or_else(|| anyhow::anyhow!("composing_text is None"))
+        candidates_or_missing(response.composing_text)
     }
 
     pub fn set_context(&mut self, context: String) -> anyhow::Result<()> {
@@ -370,15 +387,11 @@ impl IPCService {
             return;
         }
 
-        let mut client = self.window_client.clone();
-        let result = self.exec(async move {
+        self.window_rpc("show_window", |mut client| async move {
             client
                 .show_window(tonic::Request::new(shared::proto::EmptyResponse {}))
                 .await
         });
-        if let Err(e) = result {
-            tracing::warn!("show_window failed: {e}");
-        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -391,15 +404,11 @@ impl IPCService {
             return;
         }
 
-        let mut client = self.window_client.clone();
-        let result = self.exec(async move {
+        self.window_rpc("hide_window", |mut client| async move {
             client
                 .hide_window(tonic::Request::new(shared::proto::EmptyResponse {}))
                 .await
         });
-        if let Err(e) = result {
-            tracing::warn!("hide_window failed: {e}");
-        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -412,8 +421,7 @@ impl IPCService {
             return;
         }
 
-        let mut client = self.window_client.clone();
-        let result = self.exec(async move {
+        self.window_rpc("set_window_position", |mut client| async move {
             client
                 .set_window_position(tonic::Request::new(shared::proto::SetPositionRequest {
                     position: Some(shared::proto::WindowPosition {
@@ -425,9 +433,6 @@ impl IPCService {
                 }))
                 .await
         });
-        if let Err(e) = result {
-            tracing::warn!("set_window_position failed: {e}");
-        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -440,17 +445,13 @@ impl IPCService {
             return;
         }
 
-        let mut client = self.window_client.clone();
-        let result = self.exec(async move {
+        self.window_rpc("set_candidates", |mut client| async move {
             client
                 .set_candidate(tonic::Request::new(shared::proto::SetCandidateRequest {
                     candidates,
                 }))
                 .await
         });
-        if let Err(e) = result {
-            tracing::warn!("set_candidates failed: {e}");
-        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -463,17 +464,13 @@ impl IPCService {
             return;
         }
 
-        let mut client = self.window_client.clone();
-        let result = self.exec(async move {
+        self.window_rpc("set_selection", |mut client| async move {
             client
                 .set_selection(tonic::Request::new(shared::proto::SetSelectionRequest {
                     index,
                 }))
                 .await
         });
-        if let Err(e) = result {
-            tracing::warn!("set_selection failed: {e}");
-        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -486,18 +483,14 @@ impl IPCService {
             return;
         }
 
-        let mut client = self.window_client.clone();
         let mode = mode.to_string();
-        let result = self.exec(async move {
+        self.window_rpc("set_input_mode", |mut client| async move {
             client
                 .set_input_mode(tonic::Request::new(shared::proto::SetInputModeRequest {
                     mode,
                 }))
                 .await
         });
-        if let Err(e) = result {
-            tracing::warn!("set_input_mode failed: {e}");
-        }
     }
 }
 
