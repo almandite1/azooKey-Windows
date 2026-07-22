@@ -299,7 +299,10 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let correspondingCount = candidate.correspondingCount
 
         var afterComposingText = target
-        afterComposingText.prefixComplete(correspondingCount: correspondingCount)
+        // same guard as ShrinkText below: prefixComplete clamps from above
+        // but a negative correspondingCount traps in removeFirst, and this
+        // one comes from the converter rather than from us
+        afterComposingText.prefixComplete(correspondingCount: max(0, correspondingCount))
         let subtext = _strdup(kanaReading(afterComposingText.convertTarget))
 
         result.append(FFICandidate(text: text, subtext: subtext, correspondingCount: Int32(correspondingCount)))
