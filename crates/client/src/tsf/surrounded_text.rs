@@ -96,7 +96,11 @@ impl TextServiceFactory {
         }
     }
 
-    pub fn update_context(&self, preview: &str) -> Result<()> {
+    /// Sends the engine the text that precedes the composition. `shown_text`
+    /// is everything the composition currently puts on screen (preview and
+    /// suffix): the window has to end before it, or the composition's own
+    /// text would come back as its context.
+    pub fn update_context(&self, shown_text: &str) -> Result<()> {
         let result: Result<()> = (|| unsafe {
             let text_service = self.borrow()?;
 
@@ -108,7 +112,7 @@ impl TextServiceFactory {
                 parent_context.clone(),
                 Rc::new({
                     // ShiftEnd counts UTF-16 code units, not chars
-                    let preview_count = preview.encode_utf16().count() as i32;
+                    let shown_count = shown_text.encode_utf16().count() as i32;
 
                     move |cookie| {
                         // 2. Get the selection from the parent context
@@ -127,16 +131,21 @@ impl TextServiceFactory {
 
                         let preceding_range = range.Clone()?;
                         preceding_range.Collapse(cookie, TF_ANCHOR_START)?;
+                        // both anchors clear the composed text: shifting
+                        // only the end by it left a window of
+                        // [sel - 30, sel - shown], which inverts (end before
+                        // start, so an empty or garbled context) as soon as
+                        // the composition passes 30 units
                         preceding_range.ShiftStart(
                             cookie,
-                            -30,
+                            -(30 + shown_count),
                             &mut preceding_range_shifted,
                             &halt_cond,
                         )?;
 
                         preceding_range.ShiftEnd(
                             cookie,
-                            -preview_count,
+                            -shown_count,
                             &mut preceding_range_shifted,
                             &halt_cond,
                         )?;
@@ -189,10 +198,10 @@ mod tests {
     };
 
     /// Drives update_context end to end against the fake host: the
-    /// preceding text is located by shifting the selection back — the fixed
-    /// 30-unit window, then forward past the preview — and the shift must be
-    /// in UTF-16 code units, not chars (B9's unit). Every range the host
-    /// handed out must be released (B10's leak).
+    /// preceding text is the 30-unit window that ends where the composition
+    /// begins, so both anchors retreat past the composed text, and the
+    /// shifts must be in UTF-16 code units, not chars (B9's unit). Every
+    /// range the host handed out must be released (B10's leak).
     #[test]
     fn update_context_shifts_by_utf16_units_and_releases_the_ranges() {
         let _guard = global_state_lock();
@@ -207,18 +216,45 @@ mod tests {
 
         assert_eq!(
             log.shift_start_reqs.borrow().last(),
-            Some(&-30),
-            "the fixed 30-unit context window must be requested"
+            Some(&-34),
+            "the start must clear the composed text (4 units) and then open the 30-unit window"
         );
         assert_eq!(
             log.shift_end_reqs.borrow().last(),
             Some(&-4),
-            "ShiftEnd must retreat by the preview's UTF-16 length (みず𠮷 = 4)"
+            "ShiftEnd must retreat by the composed text's UTF-16 length (みず𠮷 = 4)"
         );
         assert_eq!(
             log.live_ranges(),
             0,
             "every range the host handed out must be released"
+        );
+    }
+
+    /// The old window was [sel - 30, sel - shown], which inverted once the
+    /// composition grew past 30 units: the end landed before the start and
+    /// the engine got an empty or garbled context exactly when a long
+    /// reading needed it most.
+    #[test]
+    fn a_long_composition_must_not_invert_the_context_window() {
+        let _guard = global_state_lock();
+        let log = Rc::new(RangeLog::default());
+        *log.text.borrow_mut() = "こんにちは".encode_utf16().collect();
+        let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
+        let tip = factory_with_context(context.clone());
+        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+
+        let long = "あ".repeat(35);
+        factory.update_context(&long).unwrap();
+
+        let start = *log.shift_start_reqs.borrow().last().unwrap();
+        let end = *log.shift_end_reqs.borrow().last().unwrap();
+        assert_eq!(start, -65);
+        assert_eq!(end, -35);
+        assert_eq!(
+            end - start,
+            30,
+            "the window must stay 30 units wide however long the composition gets"
         );
     }
 }
