@@ -336,7 +336,10 @@ impl TextServiceFactory {
             .clone()
             .context("ipc_service is None")?;
 
-        self.update_context(&edit.preview)?;
+        // preview AND suffix: the caret sits after both, so a window that
+        // only steps back over the preview feeds the suffix to the engine as
+        // if it were text the user had already committed
+        self.update_context(&format!("{}{}", edit.preview, edit.suffix))?;
 
         // wrapped so the write-back below ALWAYS runs: an early return on a
         // failed action used to skip it, desyncing the client composition
@@ -704,8 +707,10 @@ mod tests {
     use crate::engine::client_action::SetTextType;
     use crate::engine::ipc_service::{FakeIpc, IPCService, IpcCall};
     use crate::tsf::test_support::{
-        factory_with_fake_context, global_state_lock, EditSessionBehavior, FakeComposition,
+        factory_with_context, factory_with_fake_context, global_state_lock, EditSessionBehavior,
+        FakeComposition, FakeContext, RangeLog,
     };
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use windows::core::AsImpl as _;
 
@@ -1148,6 +1153,43 @@ mod tests {
         assert!(
             recorded_calls(&fake).contains(&IpcCall::ClearText),
             "the server's reading must be dropped too, or it comes back on the next key"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// The context sent to the engine is the text before the composition,
+    /// and the caret sits after the preview AND the suffix. Passing only the
+    /// preview left the suffix inside the window, so the engine saw the
+    /// user's own half-typed reading as committed context.
+    #[test]
+    fn the_context_window_steps_back_over_the_suffix_too() {
+        let _guard = global_state_lock();
+        let _fake = install_fake_ipc(Candidates::default());
+
+        let log = Rc::new(RangeLog::default());
+        *log.text.borrow_mut() = "こんにちは".encode_utf16().collect();
+        let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
+        let tip = factory_with_context(context.clone());
+        let factory = unsafe { tip.as_impl() };
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Composing;
+            composition.preview = "水".to_string();
+            composition.suffix = "うみ".to_string();
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        // an empty batch still runs update_context, which is all this covers
+        factory
+            .handle_action(&[], CompositionState::Composing)
+            .unwrap();
+
+        assert_eq!(
+            log.shift_end_reqs.borrow().last(),
+            Some(&-3),
+            "preview + suffix is 3 UTF-16 units; the window must end before all of it"
         );
 
         IMEState::get().unwrap().ipc_service = None;
