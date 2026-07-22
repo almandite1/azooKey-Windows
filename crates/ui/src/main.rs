@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use uiaccess::prepare_uiaccess_token;
+use wry::WebContext;
 
 pub mod candidate;
 pub mod indicator;
@@ -32,6 +33,23 @@ pub enum UserEvent {
     WindowAction(WindowAction),
     /// liveness probe: proves the event loop is still processing events
     Heartbeat,
+}
+
+/// Where WebView2 keeps its profile. Left unset it defaults to
+/// `<exe dir>\ui.exe.WebView2`, and the exe dir is Program Files: a standard
+/// (non-elevated) user cannot create it there. That is not a soft failure —
+/// environment creation returns 0x80080005 and the webview never builds, so
+/// neither window ever appears. The logon task's `HighestAvailable` does not
+/// save us; it is a no-op for standard users (issue #54).
+///
+/// Falls back to the temp dir rather than to wry's default: with no
+/// `LOCALAPPDATA` we still need somewhere every user can write, and the
+/// profile is a cache we are free to lose.
+fn webview2_data_dir() -> std::path::PathBuf {
+    match shared::local_data_root() {
+        Some(root) => root.join("WebView2"),
+        None => std::env::temp_dir().join("Azookey").join("WebView2"),
+    }
 }
 
 /// how often the event loop's liveness is probed
@@ -86,9 +104,16 @@ async fn main() -> anyhow::Result<()> {
     let event_loop_proxy = event_loop.create_proxy();
     let task_guard: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
+    // One context for both webviews: they then share a single WebView2
+    // environment, which is also what keeps their environment options
+    // identical (WebView2 rejects two environments over one user data folder
+    // when the options differ). Declared before the windows so the builders
+    // can borrow it and the windows for the same region.
+    let mut web_context = WebContext::new(Some(webview2_data_dir()));
+
     let proxy_clone = event_loop_proxy.clone();
     let candidate_window = candidate::create_candidate_window(&event_loop)?;
-    let candidate_webview_builder = candidate::create_candidate_webview()?;
+    let candidate_webview_builder = candidate::create_candidate_webview(&mut web_context)?;
     let candidate_webview = candidate_webview_builder
         .with_devtools(true)
         .with_ipc_handler(move |message| {
@@ -106,7 +131,10 @@ async fn main() -> anyhow::Result<()> {
         .build(&candidate_window)?;
 
     let indicator_window = indicator::create_indicator_window(&event_loop)?;
-    let indicator_webview = indicator::create_indicator_webview(&indicator_window)?;
+    // the candidate builder's borrow of web_context ended when it was built
+    // above (the returned WebView holds no lifetime), so it can be lent again
+    let indicator_webview =
+        indicator::create_indicator_webview(&indicator_window, &mut web_context)?;
 
     // handle window actions
     let proxy_clone = event_loop_proxy.clone();

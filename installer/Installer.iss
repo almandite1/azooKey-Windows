@@ -70,8 +70,11 @@ Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey
 ; *.bak is the same story in a different shape: hand-made backups of a
 ; binary before swapping it (ui.exe.pre-aria.bak and the like) are working-
 ; tree leftovers, never runtime assets.
-; ui.exe.WebView2 is runtime state (the WebView2 profile ui.exe creates
-; next to itself when the stack is run from build/) — never ship it
+; ui.exe.WebView2 is runtime state: the WebView2 profile ui.exe used to
+; create next to itself when the stack was run from build/. Since issue #54
+; the profile lives under %LOCALAPPDATA% and is no longer created here, but
+; a working tree that predates that still has one — same leftover class as
+; the entries above, so the exclusion stays.
 Source: "../build/*"; Excludes: "azookey-setup.exe,azookey_windows*.dll,*.bak,\ui.exe.WebView2\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "../target/release/bundle/nsis/{#TauriSetupExe}"; Flags: dontcopy noencryption
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
@@ -102,6 +105,10 @@ Filename: "icacls"; \
 ; launch.vbs is created at post-install by [Code], so Setup does not track
 ; it; delete it explicitly, otherwise it keeps {app} from being removed
 Type: files; Name: "{app}\launch.vbs"
+; ui.exe.WebView2 is the same story: builds before the %LOCALAPPDATA% move
+; (issue #54) let WebView2 create its profile next to the exe, and a folder
+; Setup never installed is a folder Setup never removes.
+Type: filesandordirs; Name: "{app}\ui.exe.WebView2"
 
 [UninstallRun]
 ; stop the running IME processes first, or their exe/dll files stay locked

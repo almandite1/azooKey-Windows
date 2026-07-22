@@ -1,6 +1,6 @@
 use anyhow::Result;
 use tao::{event_loop::EventLoop, window::Window};
-use wry::WebViewBuilder;
+use wry::{WebContext, WebViewBuilder};
 
 use crate::window::create_overlay_window;
 use crate::UserEvent;
@@ -9,7 +9,9 @@ pub fn create_candidate_window(event_loop: &EventLoop<UserEvent>) -> Result<Wind
     create_overlay_window(event_loop, "CandidateList", false)
 }
 
-pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
+/// Takes the shared `WebContext` so this webview's profile lands where
+/// `webview2_data_dir` decided, not next to the exe (issue #54).
+pub fn create_candidate_webview(context: &mut WebContext) -> Result<WebViewBuilder<'_>> {
     // Markup, styles, and script live in assets/ (editable as real HTML/CSS/
     // JS); theme.css carries the design tokens shared with the indicator.
     let html = format!(
@@ -19,7 +21,9 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
         candidate_js = include_str!("../assets/candidate.js"),
     );
 
-    let webview_builder = WebViewBuilder::new().with_transparent(true).with_html(html);
+    let webview_builder = WebViewBuilder::new_with_web_context(context)
+        .with_transparent(true)
+        .with_html(html);
 
     Ok(webview_builder)
 }
