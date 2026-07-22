@@ -42,6 +42,16 @@ jobs:
     # 6 h default would sit on the runner until someone noticed
     timeout-minutes: 60
 
+    # the pins for the prebuilt downloads live here rather than inline,
+    # because the cache key is built from them: a cache hit skips the
+    # download step entirely, so a key that did not carry the checksums
+    # served the old bytes forever and the verification below never ran
+    env:
+      LLAMA_CPU_SHA256: AF34E4DFC7154DF650ED705421F26B3A56C685F2E35ABFDD6DF0CC0CB5C4B259
+      LLAMA_CUDA_SHA256: 5307B89AAE1F076E031D6AAB95E63DF5CB96B8D3B1FA7828F412E283A0663019
+      LLAMA_VULKAN_SHA256: ED1B7E6AA70CDB2A93EAAAD8586539DCE83F4FA8A44F4DDEE5A1AB09FFB1189B
+      ZENZ_SHA256: 501F605D088F5B988791A00AE19ED46985ED7C48144F364B2F3F1F951C9B2083
+
     # every `uses:` below is pinned to a full commit SHA rather than a tag,
     # because tags can be moved after the fact. The downloads further down are
     # SHA256-verified for the same reason; floating tags here would have been
@@ -93,9 +103,11 @@ jobs:
       with:
         tool: cargo-make
 
-    # ~600 MB of pinned artifacts (three llama zips + the zenz model);
-    # the key embeds the llama release tag and the zenz SHA256 prefix, so
-    # bumping either in the download step below invalidates the cache
+    # ~600 MB of pinned artifacts (three llama zips + the zenz model). The
+    # key carries every checksum the job verifies, so changing a pin — or
+    # re-pinning after an upstream tag is moved — misses the cache and the
+    # download step re-verifies. Keying on the release tag alone was not
+    # enough: a hit skips the verification with it.
     - name: Cache prebuilt llama and zenz model
       id: cache-prebuilt
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -106,7 +118,7 @@ jobs:
           llama_vulkan
           server-swift/llama.lib
           zenz.gguf
-        key: prebuilt-llama-b4846-zenz-501F605D
+        key: prebuilt-llama-b4846-${{ env.LLAMA_CPU_SHA256 }}-${{ env.LLAMA_CUDA_SHA256 }}-${{ env.LLAMA_VULKAN_SHA256 }}-${{ env.ZENZ_SHA256 }}
 
     - name: Download prebuilt llama
       if: steps.cache-prebuilt.outputs.cache-hit != 'true'
@@ -137,9 +149,9 @@ jobs:
         New-Item -Path $llamaCpuDir, $llamaCudaDir, $llamaVulkanDir -ItemType Directory -Force
 
         # Download, verify, and extract files
-        Download-Verify-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip" -destFolder $llamaCpuDir -sha256 "AF34E4DFC7154DF650ED705421F26B3A56C685F2E35ABFDD6DF0CC0CB5C4B259"
-        Download-Verify-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-cuda-cu12.4-x64.zip" -destFolder $llamaCudaDir -sha256 "5307B89AAE1F076E031D6AAB95E63DF5CB96B8D3B1FA7828F412E283A0663019"
-        Download-Verify-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-vulkan-x64.zip" -destFolder $llamaVulkanDir -sha256 "ED1B7E6AA70CDB2A93EAAAD8586539DCE83F4FA8A44F4DDEE5A1AB09FFB1189B"
+        Download-Verify-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip" -destFolder $llamaCpuDir -sha256 $env:LLAMA_CPU_SHA256
+        Download-Verify-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-cuda-cu12.4-x64.zip" -destFolder $llamaCudaDir -sha256 $env:LLAMA_CUDA_SHA256
+        Download-Verify-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-vulkan-x64.zip" -destFolder $llamaVulkanDir -sha256 $env:LLAMA_VULKAN_SHA256
 
         # Copy llama.lib to server-swift
         Copy-Item "$llamaCpuDir\llama.lib" -Destination "server-swift\" -Force
@@ -149,7 +161,7 @@ jobs:
         $zenzDest = "zenz.gguf"
         Invoke-WebRequest -Uri $zenzUrl -OutFile $zenzDest
         $zenzActual = (Get-FileHash $zenzDest -Algorithm SHA256).Hash
-        $zenzExpected = "501F605D088F5B988791A00AE19ED46985ED7C48144F364B2F3F1F951C9B2083"
+        $zenzExpected = $env:ZENZ_SHA256
         if ($zenzActual -ne $zenzExpected) {
           throw "checksum mismatch for ${zenzUrl}: expected $zenzExpected, got $zenzActual"
         }
