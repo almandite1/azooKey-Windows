@@ -60,27 +60,60 @@ pub fn encode(mode: &InputMode) -> (i32, i32) {
     }
 }
 
-/// `(open/close, conversion)` -> `InputMode`.
+/// `(open/close, conversion)` -> `InputMode`. `conversion` is `None` when
+/// nobody has written that compartment yet.
+///
+/// Open/close is the authority; conversion only refines an OPEN IME. That
+/// asymmetry matters because `TF_CONVERSIONMODE_ALPHANUMERIC` is *zero*: an
+/// unwritten conversion compartment is indistinguishable from an explicit
+/// "alphanumeric" if the two are collapsed. Requiring the `NATIVE` bit
+/// unconditionally therefore read every host that toggles only OPENCLOSE —
+/// the standard IME on/off path, and what another TIP sharing the thread
+/// leaves behind — as Latin no matter how often the user turned the IME on
+/// (issue #58).
 ///
 /// Deliberately lossy: `InputMode` has only `Latin` and `Kana`, so an
 /// external `TF_CONVERSIONMODE_KATAKANA` decodes to `Kana` and our write-back
 /// clears the katakana bit. Full katakana / half-width round-tripping needs a
 /// wider `InputMode` and is tracked separately.
-pub fn decode(open_close: i32, conversion: i32) -> InputMode {
-    if open_close != 0 && (conversion as u32 & TF_CONVERSIONMODE_NATIVE) != 0 {
-        InputMode::Kana
-    } else {
-        InputMode::Latin
+pub fn decode(open_close: i32, conversion: Option<i32>) -> InputMode {
+    // A closed IME is direct input whatever the conversion mode says.
+    if open_close == 0 {
+        return InputMode::Latin;
+    }
+
+    match conversion {
+        // Someone chose a conversion mode: NATIVE is what separates kana
+        // input from an IME that is open in alphanumeric ("A") mode.
+        Some(conversion) => {
+            if (conversion as u32 & TF_CONVERSIONMODE_NATIVE) != 0 {
+                InputMode::Kana
+            } else {
+                InputMode::Latin
+            }
+        }
+        // Open, and nobody has said anything about conversion. Take open at
+        // its word rather than inventing an alphanumeric preference.
+        None => InputMode::Kana,
     }
 }
 
-/// Reads a compartment as an i32. An unset compartment is `VT_EMPTY`, which
-/// is not an error — it means "nobody has decided yet", i.e. zero.
+/// Reads a compartment that may never have been written. `VT_EMPTY` means
+/// "nobody has decided yet" and is returned as `None`, which for the
+/// conversion compartment is a genuinely different answer from an explicit
+/// zero — `TF_CONVERSIONMODE_ALPHANUMERIC` *is* zero (issue #58).
+fn read_optional_i32(compartment: &ITfCompartment) -> Option<i32> {
+    let variant = unsafe { compartment.GetValue() }.ok()?;
+    if variant.is_empty() {
+        return None;
+    }
+    i32::try_from(&variant).ok()
+}
+
+/// Reads a compartment as an i32, where "unset" and zero mean the same thing
+/// (open/close and the boolean flags, unlike the conversion mode).
 fn read_i32(compartment: &ITfCompartment) -> i32 {
-    let Ok(variant) = (unsafe { compartment.GetValue() }) else {
-        return 0;
-    };
-    i32::try_from(&variant).unwrap_or(0)
+    read_optional_i32(compartment).unwrap_or(0)
 }
 
 /// Whether a compartment holds a non-zero (i.e. "set") value.
@@ -117,13 +150,11 @@ impl TextServiceFactory {
         // VT_EMPTY on open/close means no IME has claimed this thread yet, so
         // there is nothing to adopt and we publish our own default instead.
         // Note `i32::try_from` succeeds on an empty VARIANT (yielding 0), so
-        // the variant type is what has to be inspected here.
-        let has_state = unsafe { open_close.GetValue() }
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
+        // emptiness is what has to be inspected here, not the value.
+        let open_close_state = read_optional_i32(&open_close);
 
-        let adopted = if has_state {
-            let mode = decode(read_i32(&open_close), read_i32(&conversion));
+        let adopted = if let Some(open) = open_close_state {
+            let mode = decode(open, read_optional_i32(&conversion));
             let changed = mode != text_service.input_mode;
             text_service.input_mode = mode.clone();
             changed.then_some(mode)
@@ -220,7 +251,7 @@ impl TextServiceFactory {
             let mgr = Self::thread_compartments(&text_service)?;
             let mode = decode(
                 read_i32(&compartment_of(&mgr, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE)?),
-                read_i32(&compartment_of(
+                read_optional_i32(&compartment_of(
                     &mgr,
                     &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
                 )?),
@@ -340,7 +371,7 @@ mod tests {
     fn kana_and_latin_survive_a_compartment_round_trip() {
         for mode in [InputMode::Kana, InputMode::Latin] {
             let (open, conversion) = encode(&mode);
-            assert_eq!(decode(open, conversion), mode);
+            assert_eq!(decode(open, Some(conversion)), mode);
         }
     }
 
@@ -348,7 +379,29 @@ mod tests {
     /// crucially is NOT the same as "input disabled".
     #[test]
     fn a_closed_ime_decodes_to_latin() {
-        assert_eq!(decode(0, CONVERSION_KANA as i32), InputMode::Latin);
+        assert_eq!(decode(0, Some(CONVERSION_KANA as i32)), InputMode::Latin);
+        assert_eq!(decode(0, None), InputMode::Latin);
+    }
+
+    /// Issue #58: a host that turns the IME on by writing OPENCLOSE alone —
+    /// the standard on/off path — leaves the conversion compartment
+    /// untouched. Requiring the NATIVE bit read that as Latin, so the IME
+    /// looked stuck in alphanumeric no matter how often it was switched on.
+    #[test]
+    fn an_open_ime_with_no_conversion_mode_decodes_to_kana() {
+        assert_eq!(decode(1, None), InputMode::Kana);
+    }
+
+    /// The other half of that asymmetry: an EXPLICIT alphanumeric conversion
+    /// mode is a real state (an IME that is open in "A" mode), and must not
+    /// be overridden by open/close. This is why `None` and `Some(0)` cannot
+    /// be collapsed — `TF_CONVERSIONMODE_ALPHANUMERIC` is zero.
+    #[test]
+    fn an_explicit_alphanumeric_mode_beats_an_open_ime() {
+        assert_eq!(
+            decode(1, Some(TF_CONVERSIONMODE_ALPHANUMERIC as i32)),
+            InputMode::Latin
+        );
     }
 
     /// Documented lossiness: `InputMode` has no katakana variant, so an
@@ -357,7 +410,7 @@ mod tests {
     #[test]
     fn an_external_katakana_mode_degrades_to_kana() {
         let katakana = (TF_CONVERSIONMODE_NATIVE | TF_CONVERSIONMODE_KATAKANA) as i32;
-        assert_eq!(decode(1, katakana), InputMode::Kana);
+        assert_eq!(decode(1, Some(katakana)), InputMode::Kana);
     }
 
     /// The whole point of the feature: when the host disables input for a
@@ -426,6 +479,29 @@ mod tests {
             factory.borrow().unwrap().input_mode,
             InputMode::Kana,
             "Activate must adopt the mode the OS already held"
+        );
+        let _ = unsafe { tip.Deactivate() };
+    }
+
+    /// Issue #58, end to end: a host (or another TIP) that opened the IME by
+    /// writing OPENCLOSE alone leaves the conversion compartment empty.
+    /// Activate must still adopt "open" as Kana instead of reading the empty
+    /// compartment as an alphanumeric preference.
+    #[test]
+    fn activate_adopts_an_open_ime_with_no_conversion_mode() {
+        let _guard = global_state_lock();
+        let compartments = Rc::new(CompartmentLog::default());
+        compartments.preset(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, 1);
+        // deliberately no CONVERSION preset: it stays VT_EMPTY
+
+        let tip = activate_with(compartments);
+        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+
+        assert_eq!(
+            factory.borrow().unwrap().input_mode,
+            InputMode::Kana,
+            "an open IME must not be read as Latin just because nobody \
+             wrote a conversion mode"
         );
         let _ = unsafe { tip.Deactivate() };
     }
