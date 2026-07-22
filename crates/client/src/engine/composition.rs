@@ -83,6 +83,23 @@ fn apply_selected_candidate(
     *raw_hiragana = candidates.hiragana.clone();
 }
 
+/// Backspace shortened the reading: keep only the leading keystrokes the new
+/// top candidate covers. `count` is `corresponding_count`, already clamped to
+/// the list by the engine — the `as usize` cast is the original inline
+/// arithmetic, kept exact so the golden tests stay unchanged.
+fn raw_input_kept_for_count(raw_input: &str, count: i32) -> String {
+    raw_input.chars().take(count as usize).collect()
+}
+
+/// A candidate was committed (shrink): append the freshly typed keystrokes,
+/// then drop from the front the keystrokes that candidate consumed. The same
+/// two steps the inline code took (`push_str` then `skip`), as one value.
+fn raw_input_after_commit(raw_input: &str, appended: &str, count: i32) -> String {
+    let mut combined = raw_input.to_string();
+    combined.push_str(appended);
+    combined.chars().skip(count as usize).collect()
+}
+
 /// The mutable working copy `handle_action` edits while dispatching a batch
 /// of actions, then writes back to the live `Composition` in one shot.
 ///
@@ -134,6 +151,33 @@ impl CompositionEdit {
             &mut self.corresponding_count,
             &mut self.surface_count,
         );
+    }
+
+    /// Adopts the top of a freshly returned candidate list: resets the
+    /// selection to index 0, mirrors that candidate into the preview, and
+    /// stores the list. The shared head of append/remove/shrink — each gets a
+    /// new, differently sized list from the engine, so a selection index left
+    /// over from the previous list would adopt the wrong candidate or blank
+    /// the preview via the `entry()` fallback.
+    fn adopt_fresh(&mut self, candidates: Candidates) {
+        self.selection_index = 0;
+        self.adopt_candidate(&candidates, self.selection_index);
+        self.candidates = candidates;
+    }
+
+    /// Blanks the composing fields the terminating actions
+    /// (end/cancel/mode-switch/server-loss) all reset: the selection, both
+    /// spent counts, and the preview/suffix/reading strings. Leaves `state`
+    /// and `candidates` to the caller — server-loss also drops the list and
+    /// forces `None`, while end/mode-switch take the state from the write-back.
+    fn clear(&mut self) {
+        self.selection_index = 0;
+        self.corresponding_count = 0;
+        self.surface_count = 0;
+        self.preview.clear();
+        self.suffix.clear();
+        self.raw_input.clear();
+        self.raw_hiragana.clear();
     }
 
     /// Writes the working copy back onto the live composition. Leaves
@@ -206,6 +250,23 @@ impl TextServiceFactory {
         }
 
         Ok(())
+    }
+
+    /// Renders the adopted preview into the document and republishes the whole
+    /// candidate list. The tail shared by append and remove; shrink commits
+    /// with `shift_start` instead of `set_text`, so it publishes on its own.
+    fn render_and_publish_full(
+        &self,
+        edit: &CompositionEdit,
+        ipc_service: &mut crate::engine::ipc_service::IPCService,
+    ) -> Result<()> {
+        self.set_text(&edit.preview, &edit.suffix)?;
+        self.publish_candidates(
+            ipc_service,
+            &edit.candidates,
+            edit.selection_index,
+            CANDIDATES_CHANGED,
+        )
     }
 
     /// Opens the candidate UI for a new composition: asks the host first
@@ -441,14 +502,8 @@ impl TextServiceFactory {
         }
         self.close_candidate_ui(ipc_service);
 
+        edit.clear();
         edit.state = CompositionState::None;
-        edit.selection_index = 0;
-        edit.corresponding_count = 0;
-        edit.surface_count = 0;
-        edit.preview.clear();
-        edit.suffix.clear();
-        edit.raw_input.clear();
-        edit.raw_hiragana.clear();
         edit.candidates = Candidates::default();
     }
 
@@ -486,13 +541,7 @@ impl TextServiceFactory {
         // end_composition releases the client-side handle
         edit_result = edit_result.and(self.end_composition());
 
-        edit.selection_index = 0;
-        edit.corresponding_count = 0;
-        edit.surface_count = 0;
-        edit.preview.clear();
-        edit.suffix.clear();
-        edit.raw_input.clear();
-        edit.raw_hiragana.clear();
+        edit.clear();
         self.close_candidate_ui(ipc_service);
         let clear_result = ipc_service.clear_text();
 
@@ -523,17 +572,9 @@ impl TextServiceFactory {
         // Previewing (the arrow keys transition to Composing but map to the
         // MoveCursor no-op, which keeps the index) would adopt the wrong
         // candidate or blank the preview via the entry() fallback.
-        edit.selection_index = 0;
-        edit.adopt_candidate(&candidates, edit.selection_index);
-        edit.candidates = candidates;
+        edit.adopt_fresh(candidates);
 
-        self.set_text(&edit.preview, &edit.suffix)?;
-        self.publish_candidates(
-            ipc_service,
-            &edit.candidates,
-            edit.selection_index,
-            CANDIDATES_CHANGED,
-        )
+        self.render_and_publish_full(edit, ipc_service)
     }
 
     /// Backspace: the engine returns a fresh, shorter list. A selection index
@@ -546,23 +587,11 @@ impl TextServiceFactory {
         ipc_service: &mut IPCService,
     ) -> Result<()> {
         let candidates = ipc_service.remove_text()?;
-        edit.selection_index = 0;
-        edit.adopt_candidate(&candidates, edit.selection_index);
-        edit.candidates = candidates;
+        edit.adopt_fresh(candidates);
 
-        edit.raw_input = edit
-            .raw_input
-            .chars()
-            .take(edit.corresponding_count as usize)
-            .collect();
+        edit.raw_input = raw_input_kept_for_count(&edit.raw_input, edit.corresponding_count);
 
-        self.set_text(&edit.preview, &edit.suffix)?;
-        self.publish_candidates(
-            ipc_service,
-            &edit.candidates,
-            edit.selection_index,
-            CANDIDATES_CHANGED,
-        )
+        self.render_and_publish_full(edit, ipc_service)
     }
 
     /// Switches the IME mode. Clears the composition and hides the candidate
@@ -589,13 +618,7 @@ impl TextServiceFactory {
         // (same pattern as act_end_composition).
         let apply_result = self.apply_input_mode(mode.clone(), true);
 
-        edit.selection_index = 0;
-        edit.corresponding_count = 0;
-        edit.surface_count = 0;
-        edit.preview.clear();
-        edit.suffix.clear();
-        edit.raw_input.clear();
-        edit.raw_hiragana.clear();
+        edit.clear();
         let clear_result = ipc_service.clear_text();
 
         // surface the first failure only after both the client state and the
@@ -649,12 +672,7 @@ impl TextServiceFactory {
         mode: &InputMode,
         text: &str,
     ) -> Result<()> {
-        edit.raw_input.push_str(text);
-        edit.raw_input = edit
-            .raw_input
-            .chars()
-            .skip(edit.corresponding_count as usize)
-            .collect();
+        edit.raw_input = raw_input_after_commit(&edit.raw_input, text, edit.corresponding_count);
 
         // kana, not keystrokes: only the reading can express a candidate
         // that ends inside a romaji cluster
@@ -664,13 +682,13 @@ impl TextServiceFactory {
             InputMode::Latin => text.to_string(),
         };
         let candidates = ipc_service.append_text(text)?;
-        edit.selection_index = 0;
 
-        // shift_start needs the preview being replaced
+        // shift_start needs the preview being replaced, captured before
+        // adopt_fresh overwrites it (it does not read edit.candidates, so
+        // storing the new list first is harmless)
         let previous_preview = edit.preview.clone();
-        edit.adopt_candidate(&candidates, edit.selection_index);
+        edit.adopt_fresh(candidates);
         self.shift_start(&previous_preview, &edit.preview)?;
-        edit.candidates = candidates;
 
         self.publish_candidates(
             ipc_service,
@@ -728,6 +746,31 @@ mod tests {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use windows::core::AsImpl as _;
+
+    #[test]
+    fn raw_input_kept_for_count_keeps_the_leading_keystrokes() {
+        // backspace left a top candidate covering 3 keystrokes of "kyou"
+        assert_eq!(raw_input_kept_for_count("kyou", 3), "kyo");
+        // covers everything: unchanged
+        assert_eq!(raw_input_kept_for_count("kyou", 4), "kyou");
+        // covers nothing: emptied
+        assert_eq!(raw_input_kept_for_count("kyou", 0), "");
+        // a count past the end keeps all of it (take saturates), matching the
+        // original `as usize` arithmetic
+        assert_eq!(raw_input_kept_for_count("kyou", 9), "kyou");
+    }
+
+    #[test]
+    fn raw_input_after_commit_appends_then_drops_the_committed_keystrokes() {
+        // committed 2 keystrokes, then typed "u": "ki" + "u" -> drop 2 -> "u"
+        assert_eq!(raw_input_after_commit("ki", "u", 2), "u");
+        // nothing appended, drop the first 3 of "kyou"
+        assert_eq!(raw_input_after_commit("kyou", "", 3), "u");
+        // committed count covers the whole combined input
+        assert_eq!(raw_input_after_commit("ki", "u", 3), "");
+        // count of zero drops nothing
+        assert_eq!(raw_input_after_commit("ki", "u", 0), "kiu");
+    }
 
     /// Installs a recording IPC service into the global state and scripts
     /// the candidates the engine RPCs answer with. Callers must hold
