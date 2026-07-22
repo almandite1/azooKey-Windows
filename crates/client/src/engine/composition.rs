@@ -505,6 +505,11 @@ impl TextServiceFactory {
         };
 
         let candidates = ipc_service.append_text(text)?;
+        // The engine returned a fresh list; an index carried over from
+        // Previewing (the arrow keys transition to Composing but map to the
+        // MoveCursor no-op, which keeps the index) would adopt the wrong
+        // candidate or blank the preview via the entry() fallback.
+        edit.selection_index = 0;
         edit.adopt_candidate(&candidates, edit.selection_index);
         edit.candidates = candidates;
 
@@ -547,9 +552,9 @@ impl TextServiceFactory {
     }
 
     /// Switches the IME mode. Clears the composition and hides the candidate
-    /// window with it (issue #21). `apply_input_mode` is advisory on purpose:
-    /// propagating a teardown failure aborted the arm before it, silently
-    /// cancelling the mode switch itself.
+    /// window with it (issue #21). The clearing is unconditional: a failure
+    /// publishing the mode used to abort the arm before it, leaving the
+    /// reading alive on both sides.
     fn act_set_ime_mode(
         &self,
         edit: &mut CompositionEdit,
@@ -564,8 +569,11 @@ impl TextServiceFactory {
 
         // publishes the mode to the langbar, the indicator, and the OS
         // compartments (so the touch keyboard, IMM32 apps and the shell see
-        // it too)
-        self.apply_input_mode(mode.clone(), true)?;
+        // it too). Captured rather than `?`: a langbar or compartment failure
+        // must not skip the teardown below, or the write-back keeps the stale
+        // preview/reading and the next keystroke resurrects the old reading
+        // (same pattern as act_end_composition).
+        let apply_result = self.apply_input_mode(mode.clone(), true);
 
         edit.selection_index = 0;
         edit.corresponding_count = 0;
@@ -573,7 +581,12 @@ impl TextServiceFactory {
         edit.suffix.clear();
         edit.raw_input.clear();
         edit.raw_hiragana.clear();
-        ipc_service.clear_text()?;
+        let clear_result = ipc_service.clear_text();
+
+        // surface the first failure only after both the client state and the
+        // server reading were cleared
+        apply_result?;
+        clear_result?;
         Ok(())
     }
 
@@ -763,6 +776,69 @@ mod tests {
             "a CANDIDATES_CHANGED update must push the new list to the window: {calls:?}"
         );
         assert!(calls.contains(&IpcCall::SetSelection(0)));
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// The arrow keys leave Previewing for Composing but map to the
+    /// MoveCursor no-op, so a non-zero selection index survives into the
+    /// next keystroke. AppendText must not apply it to the fresh list: it
+    /// would adopt the wrong candidate, or blank the preview when the index
+    /// points past the shorter list.
+    #[test]
+    fn append_text_resets_a_selection_carried_over_from_previewing() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(scripted(&["水", "未"], "みず", &[4, 4]));
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = unsafe { tip.as_impl() };
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Previewing;
+            composition.selection_index = 3;
+            composition.preview = "水".to_string();
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        // the left arrow: Previewing + MoveCursor transitions to Composing,
+        // and the no-op arm leaves the selection index behind
+        factory
+            .handle_action(&[ClientAction::MoveCursor(-1)], CompositionState::Composing)
+            .unwrap();
+        {
+            let text_service = factory.borrow().unwrap();
+            let composition = text_service.borrow_composition().unwrap();
+            assert_eq!(
+                composition.selection_index, 3,
+                "precondition: the no-op arm must leave the stale index in Composing"
+            );
+        }
+
+        factory
+            .handle_action(
+                &[ClientAction::AppendText("mi".to_string())],
+                CompositionState::Composing,
+            )
+            .unwrap();
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(
+            composition.selection_index, 0,
+            "a stale Previewing selection must not survive the next keystroke"
+        );
+        assert_eq!(
+            composition.preview, "水",
+            "the top of the fresh list must be adopted, not the stale index"
+        );
+        drop(composition);
+        drop(text_service);
+
+        assert!(
+            recorded_calls(&fake).contains(&IpcCall::SetSelection(0)),
+            "the window must be told the selection went back to the top"
+        );
 
         IMEState::get().unwrap().ipc_service = None;
     }
@@ -1016,6 +1092,62 @@ mod tests {
         assert!(
             calls.contains(&IpcCall::SetCandidates(vec![])),
             "the stale list must be blanked on a mode switch: {calls:?}"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// A mode switch can arrive mid-composition straight from the language
+    /// bar, which never sends EndComposition first. Publishing the mode is
+    /// fallible (langbar item swap, compartments, indicator placement), and
+    /// bailing there used to skip the clearing below: the write-back then
+    /// restored the old preview and reading, and the next keystroke appended
+    /// to a reading the user thought was gone.
+    #[test]
+    fn set_ime_mode_clears_the_reading_even_when_apply_input_mode_fails() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(Candidates::default());
+
+        // the fake host has no thread manager, so apply_input_mode fails
+        // on its own — no extra hook needed
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = unsafe { tip.as_impl() };
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Composing;
+            composition.selection_index = 2;
+            composition.corresponding_count = 7;
+            composition.preview = "わたし".to_string();
+            composition.suffix = "は".to_string();
+            composition.raw_input = "watashiha".to_string();
+            composition.raw_hiragana = "わたしは".to_string();
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        let result = factory.handle_action(
+            &[ClientAction::SetIMEMode(InputMode::Kana)],
+            CompositionState::None,
+        );
+        assert!(
+            result.is_err(),
+            "the failure must still be surfaced, just not before the teardown"
+        );
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(composition.preview, "");
+        assert_eq!(composition.suffix, "");
+        assert_eq!(composition.raw_input, "");
+        assert_eq!(composition.raw_hiragana, "");
+        assert_eq!(composition.selection_index, 0);
+        assert_eq!(composition.corresponding_count, 0);
+        drop(composition);
+        drop(text_service);
+
+        assert!(
+            recorded_calls(&fake).contains(&IpcCall::ClearText),
+            "the server's reading must be dropped too, or it comes back on the next key"
         );
 
         IMEState::get().unwrap().ipc_service = None;
