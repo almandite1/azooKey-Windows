@@ -24,9 +24,9 @@ struct SessionState {
     var context = ""
 }
 
-@MainActor var sessions: [Int32: SessionState] = [:]
+@MainActor var sessions: [Int64: SessionState] = [:]
 
-@MainActor func withSession<T>(_ id: Int32, _ body: (inout SessionState) -> T) -> T {
+@MainActor func withSession<T>(_ id: Int64, _ body: (inout SessionState) -> T) -> T {
     var state = sessions[id] ?? SessionState()
     let result = body(&state)
     sessions[id] = state
@@ -216,7 +216,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
 @_cdecl("AppendText")
 @MainActor public func append_text(
-    session: Int32,
+    session: Int64,
     input: UnsafePointer<CChar>,
     cursorPtr: UnsafeMutablePointer<Int32>
 ) -> UnsafeMutablePointer<CChar>? {
@@ -231,7 +231,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
 @_cdecl("RemoveText")
 @MainActor public func remove_text(
-    session: Int32,
+    session: Int64,
     cursorPtr: UnsafeMutablePointer<Int32>
 ) -> UnsafeMutablePointer<CChar>? {
     withSession(session) { state in
@@ -244,7 +244,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
 @_cdecl("MoveCursor")
 @MainActor public func move_cursor(
-    session: Int32,
+    session: Int64,
     offset: Int32,
     cursorPtr: UnsafeMutablePointer<Int32>
 ) -> UnsafeMutablePointer<CChar>? {
@@ -257,14 +257,14 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 }
 
 @_cdecl("ClearText")
-@MainActor public func clear_text(session: Int32) {
+@MainActor public func clear_text(session: Int64) {
     withSession(session) { state in
         state.composingText = ComposingText()
     }
 }
 
 @_cdecl("RemoveSession")
-@MainActor public func remove_session(session: Int32) {
+@MainActor public func remove_session(session: Int64) {
     sessions.removeValue(forKey: session)
 }
 
@@ -280,7 +280,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
 @_cdecl("GetComposedText")
 @MainActor public func get_composed_text(
-    session: Int32,
+    session: Int64,
     lengthPtr: UnsafeMutablePointer<Int32>
 ) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let (composingText, contextString) = withSession(session) { state in
@@ -312,7 +312,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
 @_cdecl("ShrinkText")
 @MainActor public func shrink_text(
-    session: Int32,
+    session: Int64,
     offset: Int32
 ) -> UnsafeMutablePointer<CChar>? {
     withSession(session) { state in
@@ -329,7 +329,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
 @_cdecl("SetContext")
 @MainActor public func set_context(
-    session: Int32,
+    session: Int64,
     context: UnsafePointer<CChar>
 ) {
     let contextString = String(cString: context)

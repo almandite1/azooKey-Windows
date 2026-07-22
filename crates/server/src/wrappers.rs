@@ -63,20 +63,20 @@ pub(crate) fn initialize(path: &str) {
     unsafe { Initialize(path.as_ptr()) };
 }
 
-pub(crate) fn add_text(session: i32, input: &str) -> RawComposingText {
+pub(crate) fn add_text(session: i64, input: &str) -> RawComposingText {
     let input = to_cstring(input);
     composing_call(|cursor| unsafe { AppendText(session, input.as_ptr(), cursor) })
 }
 
-pub(crate) fn move_cursor(session: i32, offset: i32) -> RawComposingText {
+pub(crate) fn move_cursor(session: i64, offset: i32) -> RawComposingText {
     composing_call(|cursor| unsafe { MoveCursor(session, offset, cursor) })
 }
 
-pub(crate) fn remove_text(session: i32) -> RawComposingText {
+pub(crate) fn remove_text(session: i64) -> RawComposingText {
     composing_call(|cursor| unsafe { RemoveText(session, cursor) })
 }
 
-pub(crate) fn clear_text(session: i32) {
+pub(crate) fn clear_text(session: i64) {
     unsafe { ClearText(session) };
 }
 
@@ -85,11 +85,11 @@ pub(crate) fn clear_text(session: i32) {
 // it (a former `as i8`) wrapped it negative, and a negative count makes
 // the Swift engine's Array.removeFirst trap, killing the whole server.
 // ShrinkText has no cursor out-parameter, so the cursor stays 0.
-pub(crate) fn shrink_text(session: i32, offset: i32) -> RawComposingText {
+pub(crate) fn shrink_text(session: i64, offset: i32) -> RawComposingText {
     composing_call(|_cursor| unsafe { ShrinkText(session, offset) })
 }
 
-pub(crate) fn set_context(session: i32, context: &str) {
+pub(crate) fn set_context(session: i64, context: &str) {
     let context = to_cstring(context);
     unsafe { SetContext(session, context.as_ptr()) };
 }
@@ -107,7 +107,7 @@ struct ComposedTextList {
 }
 
 impl ComposedTextList {
-    fn fetch(session: i32) -> Self {
+    fn fetch(session: i64) -> Self {
         let mut length: c_int = 0;
         let ptr = unsafe { GetComposedText(session, &mut length) };
         ComposedTextList {
@@ -135,7 +135,7 @@ impl Drop for ComposedTextList {
     }
 }
 
-pub(crate) fn get_composed_text(session: i32) -> Vec<Suggestion> {
+pub(crate) fn get_composed_text(session: i64) -> Vec<Suggestion> {
     let list = ComposedTextList::fetch(session);
 
     let mut suggestions: Vec<Suggestion> = Vec::with_capacity(list.length as usize);

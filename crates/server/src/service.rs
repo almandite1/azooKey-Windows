@@ -21,7 +21,7 @@ pub struct MyAzookeyService;
 
 /// Builds the ComposingText payload every composing-text RPC returns: the
 /// current hiragana plus a fresh candidate fetch for the session.
-fn composed(session: i32, composing_text: RawComposingText) -> ComposingText {
+fn composed(session: i64, composing_text: RawComposingText) -> ComposingText {
     ComposingText {
         hiragana: composing_text.text,
         suggestions: get_composed_text(session),

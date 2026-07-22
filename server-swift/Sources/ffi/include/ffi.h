@@ -18,9 +18,11 @@
  * - all exported engine functions must be called from a single thread,
  *   serially; the Swift side keeps unsynchronized global state
  * - all out-parameters (cursor, length) are 32-bit ints
- * - the leading `session` (int32) parameter selects the per-client
+ * - the leading `session` (int64) parameter selects the per-client
  *   composing state; sessions are created on first use and discarded
- *   via RemoveSession
+ *   via RemoveSession. It is 64-bit so the monotonic per-connection
+ *   counter that produces it cannot realistically wrap onto a live
+ *   session and cross-wire two applications' composing state
  * - the char* members below and every returned string/list are owned by
  *   the Swift side; the caller copies them and hands them back to
  *   FreeString / FreeComposedText
@@ -36,14 +38,14 @@ void Initialize(const char *path);
 void LoadConfig(void);
 
 /* per-session composing text */
-void SetContext(int32_t session, const char *context);
-char *AppendText(int32_t session, const char *input, int32_t *cursorPtr);
-char *RemoveText(int32_t session, int32_t *cursorPtr);
-char *MoveCursor(int32_t session, int32_t offset, int32_t *cursorPtr);
-char *ShrinkText(int32_t session, int32_t offset);
-void ClearText(int32_t session);
-struct FFICandidate **GetComposedText(int32_t session, int32_t *lengthPtr);
-void RemoveSession(int32_t session);
+void SetContext(int64_t session, const char *context);
+char *AppendText(int64_t session, const char *input, int32_t *cursorPtr);
+char *RemoveText(int64_t session, int32_t *cursorPtr);
+char *MoveCursor(int64_t session, int32_t offset, int32_t *cursorPtr);
+char *ShrinkText(int64_t session, int32_t offset);
+void ClearText(int64_t session);
+struct FFICandidate **GetComposedText(int64_t session, int32_t *lengthPtr);
+void RemoveSession(int64_t session);
 
 /* ownership hand-back */
 void FreeString(char *ptr);

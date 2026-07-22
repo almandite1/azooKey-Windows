@@ -15,11 +15,11 @@ use crate::ffi::RemoveSession;
 /// been idle for a while so exited applications don't accumulate sessions.
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-static SESSION_LAST_USED: LazyLock<Mutex<HashMap<i32, Instant>>> =
+static SESSION_LAST_USED: LazyLock<Mutex<HashMap<i64, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Extracts the pipe-connection session id tonic stored in the request.
-pub(crate) fn session_of<T>(request: &Request<T>) -> i32 {
+pub(crate) fn session_of<T>(request: &Request<T>) -> i64 {
     let id = request
         .extensions()
         .get::<PipeConnectInfo>()
@@ -29,18 +29,18 @@ pub(crate) fn session_of<T>(request: &Request<T>) -> i32 {
     id
 }
 
-fn touch_session(id: i32) {
+fn touch_session(id: i64) {
     // Collect and drop the expired ids from the map, then release the lock
     // BEFORE calling into Swift. RemoveSession is an FFI call; running it
     // while holding SESSION_LAST_USED would, if it ever hung or panicked,
     // stall or poison the lock for every other request that needs it.
-    let expired: Vec<i32> = {
+    let expired: Vec<i64> = {
         let mut map = SESSION_LAST_USED
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         map.insert(id, Instant::now());
 
-        let expired: Vec<i32> = map
+        let expired: Vec<i64> = map
             .iter()
             .filter(|(sid, last)| **sid != id && last.elapsed() > SESSION_IDLE_TIMEOUT)
             .map(|(sid, _)| *sid)

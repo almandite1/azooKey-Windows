@@ -13,7 +13,9 @@
 //!   in main())
 //! - out-parameters are 32-bit (c_int on both sides)
 //! - `session` selects the per-client composing state; it is the pipe
-//!   connection id assigned in lib.rs (see PipeConnectInfo)
+//!   connection id assigned in lib.rs (see PipeConnectInfo). 64-bit, so the
+//!   monotonic counter behind it cannot realistically wrap onto a live
+//!   session
 //! - every returned string/list is owned by the callee and must be handed
 //!   back to FreeString / FreeComposedText after copying
 
@@ -29,18 +31,18 @@ pub(crate) struct FFICandidate {
 
 unsafe extern "C" {
     pub(crate) fn Initialize(path: *const c_char);
-    pub(crate) fn SetContext(session: c_int, context: *const c_char);
+    pub(crate) fn SetContext(session: i64, context: *const c_char);
     pub(crate) fn AppendText(
-        session: c_int,
+        session: i64,
         input: *const c_char,
         cursorPtr: *mut c_int,
     ) -> *mut c_char;
-    pub(crate) fn RemoveText(session: c_int, cursorPtr: *mut c_int) -> *mut c_char;
-    pub(crate) fn MoveCursor(session: c_int, offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
-    pub(crate) fn ShrinkText(session: c_int, offset: c_int) -> *mut c_char;
-    pub(crate) fn ClearText(session: c_int);
-    pub(crate) fn GetComposedText(session: c_int, lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
-    pub(crate) fn RemoveSession(session: c_int);
+    pub(crate) fn RemoveText(session: i64, cursorPtr: *mut c_int) -> *mut c_char;
+    pub(crate) fn MoveCursor(session: i64, offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
+    pub(crate) fn ShrinkText(session: i64, offset: c_int) -> *mut c_char;
+    pub(crate) fn ClearText(session: i64);
+    pub(crate) fn GetComposedText(session: i64, lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
+    pub(crate) fn RemoveSession(session: i64);
     pub(crate) fn LoadConfig();
     pub(crate) fn FreeString(ptr: *mut c_char);
     pub(crate) fn FreeComposedText(listPtr: *mut *mut FFICandidate, length: c_int);
