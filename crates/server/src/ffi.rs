@@ -2,10 +2,11 @@
 //!
 //! The canonical declaration of this interface is
 //! `server-swift/Sources/ffi/include/ffi.h`; the extern block below and the
-//! Swift `@_cdecl` exports in `azookey_server.swift` must both match it.
-//! Keep the three in sync — nothing checks them mechanically, but the
-//! `--ignored` smoke tests (crates/server/tests/ipc_smoke.rs) exercise every
-//! function against the live engine.
+//! Swift `@_cdecl` exports in `FFIExports.swift` must both match it.
+//! Keep the three in sync — `tests/ffi_surface.rs` checks that the three
+//! sets of function names agree (add/rename/typo in one place fails it),
+//! and the `--ignored` smoke tests (crates/server/tests/ipc_smoke.rs)
+//! exercise every function against the live engine.
 //!
 //! Contract (same as ffi.h):
 //! - all functions must be called from a single thread, serially — the Swift
