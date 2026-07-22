@@ -158,8 +158,18 @@ impl AppConfig {
         };
         let config_str = serde_json::to_string_pretty(&stamped)
             .map_err(|e| format!("failed to serialize settings: {e}"))?;
-        std::fs::write(&config_path, config_str)
-            .map_err(|e| format!("failed to write {}: {e}", config_path.display()))
+        // write-then-rename rather than a plain write: fs::write truncates
+        // first, so a crash or power loss mid-write leaves a half-file that
+        // the next start reads as Malformed and replaces with the defaults,
+        // taking the .bak with it. Rename on Windows replaces the existing
+        // file, and both paths are in the same directory so it stays atomic.
+        let tmp_path = config_root.join(format!("{SETTINGS_FILENAME}.tmp"));
+        std::fs::write(&tmp_path, config_str)
+            .map_err(|e| format!("failed to write {}: {e}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, &config_path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("failed to replace {}: {e}", config_path.display())
+        })
     }
 
     /// Read the stored settings, falling back to defaults for anything that
@@ -374,6 +384,32 @@ mod tests {
             root.read_settings(),
             original,
             "a newer file must never be rewritten"
+        );
+    }
+
+    /// The write goes through a temp file so a crash cannot leave a
+    /// truncated settings.json behind. The temp must not survive the write —
+    /// a leftover would be mistaken for a stale profile by anyone inspecting
+    /// the config directory.
+    #[test]
+    fn write_leaves_no_temp_file_and_replaces_the_old_content() {
+        let root = TempConfigRoot::new();
+        root.write_settings(r#"{"version":"0.0.1","zenzai":{"enable":false,"profile":"old"}}"#);
+
+        let mut config = AppConfig::default();
+        config.zenzai.profile = "new".to_string();
+        config.write_to(root.path()).expect("write");
+
+        let stored = root.read_settings();
+        let parsed: AppConfig = serde_json::from_str(&stored).expect("the final file must parse");
+        assert_eq!(parsed.zenzai.profile, "new");
+        assert_eq!(parsed.version, CONFIG_VERSION);
+        assert!(
+            !root
+                .path()
+                .join(format!("{SETTINGS_FILENAME}.tmp"))
+                .exists(),
+            "the temp file must be renamed away, not left behind"
         );
     }
 
