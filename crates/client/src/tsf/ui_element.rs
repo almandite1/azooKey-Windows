@@ -71,6 +71,18 @@ fn force_candidate_window() -> bool {
 }
 
 impl TextServiceFactory {
+    /// The host's UILess element manager, or `None` when the host has no
+    /// `ITfUIElementMgr` — such a host wants our own window, so every caller
+    /// treats `None` as "fall back, advisory". A borrow conflict still
+    /// propagates as an error, matching the `self.borrow()?` these call sites
+    /// used before this was folded out of them.
+    fn ui_element_mgr(&self) -> Result<Option<ITfUIElementMgr>> {
+        let Ok(thread_mgr) = self.borrow()?.thread_mgr() else {
+            return Ok(None);
+        };
+        Ok(thread_mgr.cast::<ITfUIElementMgr>().ok())
+    }
+
     /// Announces the candidate list to the host and asks whether we may draw
     /// it ourselves. Idempotent: a second call returns the stored answer.
     pub fn ui_begin(&self) -> Result<bool> {
@@ -81,11 +93,7 @@ impl TextServiceFactory {
             }
         }
 
-        let Ok(thread_mgr) = self.borrow()?.thread_mgr() else {
-            return Ok(true);
-        };
-        // a host without ITfUIElementMgr is a host that wants our window
-        let Ok(mgr) = thread_mgr.cast::<ITfUIElementMgr>() else {
+        let Some(mgr) = self.ui_element_mgr()? else {
             return Ok(true);
         };
 
@@ -140,10 +148,7 @@ impl TextServiceFactory {
             return Ok(());
         };
 
-        let Ok(thread_mgr) = self.borrow()?.thread_mgr() else {
-            return Ok(());
-        };
-        let Ok(mgr) = thread_mgr.cast::<ITfUIElementMgr>() else {
+        let Some(mgr) = self.ui_element_mgr()? else {
             return Ok(());
         };
 
@@ -172,10 +177,7 @@ impl TextServiceFactory {
             return Ok(());
         };
 
-        let Ok(thread_mgr) = self.borrow()?.thread_mgr() else {
-            return Ok(());
-        };
-        let Ok(mgr) = thread_mgr.cast::<ITfUIElementMgr>() else {
+        let Some(mgr) = self.ui_element_mgr()? else {
             return Ok(());
         };
 
