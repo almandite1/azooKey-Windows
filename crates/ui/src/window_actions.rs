@@ -104,8 +104,7 @@ pub fn handle_window_action(
             // off-screen near screen edges (B20)
             let indicator_size = indicator_window.inner_size();
             let (ix, iy) = utils::get_indicator_position(
-                left,
-                bottom,
+                &caret,
                 indicator_size.width as i32,
                 indicator_size.height as i32,
             );

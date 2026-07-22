@@ -16,6 +16,21 @@ pub struct CaretRect {
     pub right: i32,
 }
 
+impl CaretRect {
+    /// The caret as a Win32 `RECT`, for the monitor lookup. Both the
+    /// candidate window and the indicator resolve their monitor through
+    /// this, so the two cannot pick different monitors for the same caret
+    /// (issue #29: the indicator used to build a zero-area rect of its own).
+    pub fn as_rect(&self) -> RECT {
+        RECT {
+            left: self.left,
+            top: self.top,
+            right: self.right,
+            bottom: self.bottom,
+        }
+    }
+}
+
 /// Logical (CSS px) width of the candidate window for the longest candidate,
 /// in characters. The webview lays out in CSS px, so this must be applied as
 /// a `LogicalSize` — applying it as physical px left the window too small on
@@ -117,12 +132,7 @@ pub fn get_candidate_window_position(
     let x = caret.left - 15;
     let y = caret.bottom;
 
-    let Some(work) = work_area_near(RECT {
-        left: caret.left,
-        top: caret.top,
-        right: caret.right,
-        bottom: caret.bottom,
-    }) else {
+    let Some(work) = work_area_near(caret.as_rect()) else {
         return (x as f64, y as f64);
     };
 
@@ -131,21 +141,16 @@ pub fn get_candidate_window_position(
     (x as f64, y as f64)
 }
 
-pub fn get_indicator_position(
-    left: i32,
-    bottom: i32,
-    win_width: i32,
-    win_height: i32,
-) -> (f64, f64) {
-    let x = left - 45;
-    let y = bottom;
+/// Same contract as `get_candidate_window_position`: the caret rect the TIP
+/// reported, and the window size from the caller. It takes the whole rect
+/// rather than a corner so its monitor lookup is the candidate window's
+/// lookup — a caret straddling a monitor boundary used to be able to put the
+/// two on different monitors (issue #29).
+pub fn get_indicator_position(caret: &CaretRect, win_width: i32, win_height: i32) -> (f64, f64) {
+    let x = caret.left - 45;
+    let y = caret.bottom;
 
-    let Some(work) = work_area_near(RECT {
-        left,
-        top: bottom,
-        right: left,
-        bottom,
-    }) else {
+    let Some(work) = work_area_near(caret.as_rect()) else {
         return (x as f64, y as f64);
     };
 
@@ -233,6 +238,35 @@ mod tests {
         assert_eq!(
             clamp_indicator_position(100, 500, 90, 90, &WORK),
             (100, 500)
+        );
+    }
+
+    /// Issue #29: the indicator built its own lookup rect as
+    /// `{left, top: bottom, right: left, bottom}` — zero area, and with
+    /// left/bottom reused in the wrong fields. MONITOR_DEFAULTTONEAREST
+    /// treats that like a point, so it mostly behaved, but a caret spanning
+    /// a monitor boundary could resolve to a different monitor than the
+    /// candidate window's. Both now ask about the same rectangle.
+    #[test]
+    fn the_monitor_lookup_rect_is_the_whole_caret() {
+        let caret = CaretRect {
+            top: 100,
+            left: 200,
+            bottom: 140,
+            right: 260,
+        };
+
+        let rect = caret.as_rect();
+
+        assert_eq!(
+            (rect.left, rect.top, rect.right, rect.bottom),
+            (200, 100, 260, 140),
+            "the caret's own edges, each in its own field"
+        );
+        assert!(
+            rect.right > rect.left && rect.bottom > rect.top,
+            "a degenerate rect leaves the monitor choice to how \
+             MonitorFromRect happens to treat empty input"
         );
     }
 
