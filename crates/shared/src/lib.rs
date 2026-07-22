@@ -17,6 +17,28 @@ fn get_config_root() -> PathBuf {
     appdata.join("Azookey")
 }
 
+/// `%LOCALAPPDATA%\Azookey` — where per-user RUNTIME state belongs: logs,
+/// crash dumps, the WebView2 profile. Deliberately not `get_config_root`:
+/// that one is `%APPDATA%` (roaming), which is for settings a user would
+/// want to follow them between machines, not for a browser profile.
+///
+/// `None` when `LOCALAPPDATA` is unset or empty, so the caller picks its own
+/// fallback instead of silently getting a root-relative `Azookey` folder.
+pub fn local_data_root() -> Option<PathBuf> {
+    local_data_root_in(std::env::var_os("LOCALAPPDATA"))
+}
+
+/// Takes the environment value explicitly so tests never read or race on a
+/// real environment variable (same reason as the `*_in`/`*_to` config
+/// helpers below).
+fn local_data_root_in(base: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let base = base?;
+    if base.is_empty() {
+        return None;
+    }
+    Some(Path::new(&base).join("Azookey"))
+}
+
 const SETTINGS_FILENAME: &str = "settings.json";
 const SETTINGS_BACKUP_FILENAME: &str = "settings.json.bak";
 
@@ -427,5 +449,21 @@ mod tests {
             .expect("backup must exist");
         assert_eq!(backup, original, "the user's file is the only copy");
         assert!(root.read_settings().contains(CONFIG_VERSION));
+    }
+
+    #[test]
+    fn local_data_root_is_the_azookey_folder_under_the_given_base() {
+        let root = local_data_root_in(Some(r"C:\Users\someone\AppData\Local".into()))
+            .expect("a set base yields a root");
+        assert_eq!(root, Path::new(r"C:\Users\someone\AppData\Local\Azookey"));
+    }
+
+    /// Issue #54: the caller must be able to tell "no usable base" apart from
+    /// a path, so it can choose a fallback it knows is writable — an empty
+    /// base would otherwise yield a root-relative `Azookey` folder.
+    #[test]
+    fn local_data_root_is_none_without_a_usable_base() {
+        assert_eq!(local_data_root_in(None), None);
+        assert_eq!(local_data_root_in(Some("".into())), None);
     }
 }

@@ -143,6 +143,41 @@ fn uninstall_stops_the_running_processes() {
     }
 }
 
+/// Issue #54: before the WebView2 profile moved under %LOCALAPPDATA%,
+/// ui.exe created it inside {app}. Setup never installed that folder, so
+/// Setup never removes it — {app} survives an uninstall with a browser
+/// profile in it. Same reasoning as launch.vbs above.
+#[test]
+fn uninstall_removes_the_legacy_webview2_profile() {
+    let iss = read("Installer.iss");
+
+    // a section ends at the next header, which is a '[' at the START of a
+    // line — splitting on a bare '[' would stop at the "[Code]" inside the
+    // very first comment
+    let section: String = iss
+        .split_once("[UninstallDelete]")
+        .expect("Installer.iss should have an [UninstallDelete] section")
+        .1
+        .lines()
+        .take_while(|l| !l.starts_with('['))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // an entry line, not the comment above it that names the same folder
+    let entry = section
+        .lines()
+        .find(|l| l.starts_with("Type:") && l.contains("ui.exe.WebView2"))
+        .unwrap_or_else(|| {
+            panic!("[UninstallDelete] must remove the legacy profile: got {section}")
+        });
+
+    assert!(
+        entry.contains("filesandordirs"),
+        "the profile is a directory tree, so Type: files would leave it \
+         behind: got {entry}"
+    );
+}
+
 /// Returns the body of a `[Code]` procedure/function, from its header to
 /// the next top-level declaration.
 fn code_block(iss: &str, header: &str) -> String {

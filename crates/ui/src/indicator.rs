@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use tao::{dpi::LogicalSize, event_loop::EventLoop, window::Window};
-use wry::{WebView, WebViewBuilder};
+use wry::{WebContext, WebView, WebViewBuilder};
 
 use crate::window::create_overlay_window;
 use crate::UserEvent;
@@ -15,7 +15,14 @@ pub fn create_indicator_window(event_loop: &EventLoop<UserEvent>) -> Result<Wind
     Ok(window)
 }
 
-pub fn create_indicator_webview(window: &Window) -> Result<WebView> {
+/// Shares the candidate window's `WebContext`, so both webviews live in the
+/// one profile under `%LOCALAPPDATA%` (issue #54). Sharing it is also what
+/// keeps their `CoreWebView2EnvironmentOptions` identical, which WebView2
+/// requires of two environments over the same user data folder.
+pub fn create_indicator_webview<'a>(
+    window: &'a Window,
+    context: &'a mut WebContext,
+) -> Result<WebView> {
     // Shares theme.css (the design tokens) with the candidate window; the
     // accent border is the indicator's own look (assets/indicator.css).
     let html = format!(
@@ -25,7 +32,7 @@ pub fn create_indicator_webview(window: &Window) -> Result<WebView> {
         indicator_js = include_str!("../assets/indicator.js"),
     );
 
-    let webview = WebViewBuilder::new()
+    let webview = WebViewBuilder::new_with_web_context(context)
         .with_transparent(true)
         .with_html(html)
         .build(window)
