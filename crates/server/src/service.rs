@@ -90,10 +90,10 @@ impl AzookeyService for MyAzookeyService {
         request: Request<ShrinkTextRequest>,
     ) -> Result<Response<ShrinkTextResponse>, Status> {
         let session = session_of(&request);
-        let offset = request.into_inner().offset;
+        let surface_offset = request.into_inner().surface_offset;
 
         Ok(Response::new(ShrinkTextResponse {
-            composing_text: Some(composed(session, shrink_text(session, offset))),
+            composing_text: Some(composed(session, shrink_text(session, surface_offset))),
         }))
     }
 

@@ -5,7 +5,12 @@ package azookey;
 message Suggestion {
   string text = 1;    // The main suggestion text.
   string subtext = 2; // Additional information or subtext for the suggestion.
+  // Romaji keystrokes this candidate covers, for the client's own raw input.
   int32 corresponding_count = 3;
+  // Kana of the reading this candidate covers. This is the count ShrinkText
+  // takes; the two differ when a clause boundary falls inside a romaji
+  // cluster (kanshi|ya), which no keystroke count can express.
+  int32 surface_count = 4;
 }
 
 // ComposingText represents the text and its associated suggestions.
@@ -39,7 +44,13 @@ message MoveCursorRequest {
 
 // Request message for ShrinkText.
 message ShrinkTextRequest {
-  int32 offset = 1;
+  // 1 was `offset`, a keystroke count. The engine now shrinks by kana, so
+  // the field was renumbered rather than redefined: a client from before
+  // the change sends 1, the server reads 0 and shrinks nothing, instead of
+  // silently cutting the reading at the wrong place.
+  reserved 1;
+  reserved "offset";
+  int32 surface_offset = 2;
 }
 
 message ShrinkTextResponse {

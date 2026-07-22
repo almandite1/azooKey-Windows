@@ -27,6 +27,7 @@ pub(crate) struct FFICandidate {
     pub(crate) text: *mut c_char,
     pub(crate) subtext: *mut c_char,
     pub(crate) corresponding_count: c_int,
+    pub(crate) surface_count: c_int,
 }
 
 unsafe extern "C" {
@@ -39,7 +40,7 @@ unsafe extern "C" {
     ) -> *mut c_char;
     pub(crate) fn RemoveText(session: i64, cursorPtr: *mut c_int) -> *mut c_char;
     pub(crate) fn MoveCursor(session: i64, offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
-    pub(crate) fn ShrinkText(session: i64, offset: c_int) -> *mut c_char;
+    pub(crate) fn ShrinkText(session: i64, surfaceOffset: c_int) -> *mut c_char;
     pub(crate) fn ClearText(session: i64);
     pub(crate) fn GetComposedText(session: i64, lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     pub(crate) fn RemoveSession(session: i64);

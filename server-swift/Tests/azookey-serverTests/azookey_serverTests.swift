@@ -59,11 +59,12 @@ struct ConversionTargetTests {
 }
 
 /// The engine reports how much of the reading a candidate covers as a
-/// `ComposingCount`, which is a *surface* (kana) count for nearly every real
-/// candidate, while the number crossing the FFI has to stay an input
-/// (keystroke) count — the client spends it on its own raw_input and hands it
-/// back to ShrinkText. Reinterpreting the enum's payload as an input count
-/// would cut `にゅうりょく` (6 kana, 9 keystrokes) three keystrokes short.
+/// `ComposingCount`, which can be a surface (kana) count, an input
+/// (keystroke) count, or a composite of several. Both units have to come out
+/// of it: ShrinkText spends the kana on the session's reading, and the client
+/// spends the keystrokes on its own raw_input. Reinterpreting the enum's
+/// payload as an input count would cut `にゅうりょく` (6 kana, 9 keystrokes)
+/// three keystrokes short.
 @Suite("remainder")
 struct RemainderTests {
     private func romaji(_ input: String) -> ComposingText {
@@ -78,6 +79,7 @@ struct RemainderTests {
         let result = remainder(of: romaji("nyuuryoku"), after: .surfaceCount(6))
 
         #expect(result.text.convertTarget == "")
+        #expect(result.surfaceCount == 6)
         #expect(result.inputCount == 9)
     }
 
@@ -87,6 +89,7 @@ struct RemainderTests {
         let result = remainder(of: romaji("nyuuryoku"), after: .surfaceCount(3))
 
         #expect(result.text.convertTarget == "りょく")
+        #expect(result.surfaceCount == 3)
         #expect(result.inputCount == 4)
     }
 
@@ -100,22 +103,107 @@ struct RemainderTests {
         #expect(result.inputCount == 9)
     }
 
-    /// ShrinkText spends the number this returns as `.inputCount`, so the two
-    /// have to agree on what it means.
-    @Test("the count is what ShrinkText would spend")
+    /// ShrinkText spends the surface count on the session's own text, so
+    /// that is the number that has to reproduce the reading we advertise.
+    @Test("the surface count is what ShrinkText would spend")
     func agreesWithShrink() {
         let target = romaji("nyuuryoku")
-        let count = remainder(of: target, after: .surfaceCount(3)).inputCount
+        let result = remainder(of: target, after: .surfaceCount(3))
 
         var shrunk = target
-        shrunk.prefixComplete(composingCount: .inputCount(count))
+        shrunk.prefixComplete(composingCount: .surfaceCount(result.surfaceCount))
 
+        #expect(shrunk.convertTarget == result.text.convertTarget)
         #expect(shrunk.convertTarget == "りょく")
     }
 
     @Test("an input count passes through unchanged")
     func inputCountIsIdentity() {
         #expect(remainder(of: romaji("nihon"), after: .inputCount(4)).inputCount == 4)
+    }
+
+    /// The engine looks candidates up by surface index too, so a clause
+    /// boundary can fall inside a romaji cluster: へんかん|する splits
+    /// `{nsuru}` — the ん belongs to the same independent segment as する.
+    /// Measuring what `prefixComplete` took overcounts there, because
+    /// spending a surface count re-encodes that segment into kana and the
+    /// input array shrinks for a reason unrelated to the candidate.
+    @Test("a clause boundary inside a cluster still yields spendable keystrokes")
+    func boundaryInsideCluster() {
+        // へんかんする: {he}{nka}{nsuru}; 「変換」covers the first 4 kana,
+        // which is inside the last segment
+        let target = romaji("henkansuru")
+        let result = remainder(of: target, after: .surfaceCount(4))
+
+        #expect(result.text.convertTarget == "する")
+        #expect(result.surfaceCount == 4)
+        // h,e,n,k,a,n — not 7, which is what the re-encoded input measures
+        #expect(result.inputCount == 6)
+
+        // both units have to land on the same reading here
+        var shrunk = target
+        shrunk.prefixComplete(composingCount: .inputCount(result.inputCount))
+        #expect(shrunk.convertTarget == "する")
+    }
+
+    /// Some boundaries cannot be expressed as a number of keystrokes at all:
+    /// かんしゃ is `{ka}{nsha}`, so no prefix of the input leaves ゃ behind —
+    /// 「監視」on that reading is exactly the case the keystroke count could
+    /// not carry, and the reason the surface count exists.
+    @Test("an inexpressible boundary survives as kana")
+    func inexpressibleBoundary() {
+        let target = romaji("kansha")
+        let result = remainder(of: target, after: .surfaceCount(3))
+
+        #expect(result.text.convertTarget == "ゃ")
+        #expect(result.surfaceCount == 3)
+
+        var shrunk = target
+        shrunk.prefixComplete(composingCount: .surfaceCount(result.surfaceCount))
+        #expect(shrunk.convertTarget == "ゃ")
+    }
+
+    /// The counts come from the converter, not from us. `removeFirst` and
+    /// `dropFirst` both trap on a negative one, and this process is the whole
+    /// engine — every application's composition dies with it.
+    @Test("a negative count from the converter does not trap")
+    func negativeCountsAreClamped() {
+        #expect(remainder(of: romaji("nihon"), after: .inputCount(-1)).inputCount == 0)
+        #expect(remainder(of: romaji("nihon"), after: .surfaceCount(-3)).surfaceCount == 0)
+        #expect(
+            remainder(
+                of: romaji("nihon"),
+                after: .composite(lhs: .surfaceCount(-1), rhs: .inputCount(-1))
+            ).surfaceCount == 0
+        )
+    }
+
+    /// A surface count past the end of the reading is the dangerous one: it
+    /// is accepted quietly and leaves `convertTargetCursorPosition` negative,
+    /// so the trap comes later, on the next keystroke, in an unrelated call.
+    /// This is what took the live server down (exit code 0xc000001d) when a
+    /// shrink offset outran the composition.
+    @Test("an overlong surface count leaves a usable composition")
+    func overlongSurfaceCountKeepsTheCursorValid() {
+        var text = romaji("kakikukeko")
+
+        spend(.surfaceCount(999), from: &text)
+        #expect(text.convertTarget == "")
+
+        // the delayed trap: prefix(negative cursor)
+        text.insertAtCursorPosition("a", inputStyle: .roman2kana)
+        #expect(text.convertTarget == "あ")
+    }
+
+    /// An overlong count is the converter's business too; prefixComplete
+    /// clamps it, and the measured keystroke count must not exceed the input.
+    @Test("an overlong count consumes everything and no more")
+    func overlongCountsAreClamped() {
+        let result = remainder(of: romaji("nihon"), after: .surfaceCount(99))
+
+        #expect(result.text.convertTarget == "")
+        #expect(result.surfaceCount == 3) // にほn — the whole reading, no more
+        #expect(result.inputCount == 5)
     }
 }
 

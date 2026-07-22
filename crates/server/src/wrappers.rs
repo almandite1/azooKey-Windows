@@ -80,13 +80,13 @@ pub(crate) fn clear_text(session: i64) {
     unsafe { ClearText(session) };
 }
 
-// offset is the full int32 from the wire: it is a count of roman-input
-// keystrokes and routinely exceeds 127 in long compositions. Truncating
-// it (a former `as i8`) wrapped it negative, and a negative count makes
-// the Swift engine's Array.removeFirst trap, killing the whole server.
+// The offset is the full int32 from the wire: it is a count of kana in the
+// reading and can exceed 127 in a long composition. Truncating it (a former
+// `as i8`) wrapped it negative, and a negative count makes the Swift engine
+// trap in dropFirst, killing the whole server.
 // ShrinkText has no cursor out-parameter, so the cursor stays 0.
-pub(crate) fn shrink_text(session: i64, offset: i32) -> RawComposingText {
-    composing_call(|_cursor| unsafe { ShrinkText(session, offset) })
+pub(crate) fn shrink_text(session: i64, surface_offset: i32) -> RawComposingText {
+    composing_call(|_cursor| unsafe { ShrinkText(session, surface_offset) })
 }
 
 pub(crate) fn set_context(session: i64, context: &str) {
@@ -144,6 +144,7 @@ pub(crate) fn get_composed_text(session: i64) -> Vec<Suggestion> {
             text: unsafe { cstr_or_empty(candidate.text) },
             subtext: unsafe { cstr_or_empty(candidate.subtext) },
             corresponding_count: candidate.corresponding_count,
+            surface_count: candidate.surface_count,
         };
 
         // the engine can propose the same surface text more than once;
