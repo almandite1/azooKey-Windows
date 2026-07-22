@@ -1,4 +1,7 @@
-name: Rust
+# Named for what it covers, not for one of the languages in it: this builds
+# and tests Swift, Rust (x64 and x86), the Tauri app and the installer. The
+# name is also the left-hand label of the README's status badge.
+name: CI
 
 on:
   # a docs-only change cannot break a 25 min Windows build
