@@ -227,6 +227,55 @@ fn install_stops_the_running_stack_before_copying() {
     );
 }
 
+/// Issue #57: taskkill can only match an image NAME, and `ui.exe` and
+/// `launcher.exe` are generic enough to belong to something else entirely,
+/// so `/IM` reached every one of them on the machine. Ownership is decided
+/// by the executable's PATH instead.
+#[test]
+fn install_kills_only_processes_from_the_install_directory() {
+    let iss = read("Installer.iss");
+
+    let body = code_block(&iss, "function StackProcesses");
+
+    assert!(
+        body.contains("ExecutablePath"),
+        "ownership must be decided by the executable path, which only WMI \
+         exposes: got {body}"
+    );
+    assert!(
+        body.contains("Pos(Prefix, Path) = 1"),
+        "the path must be matched against the install directory as a \
+         prefix: got {body}"
+    );
+    // the two unambiguous names stay name-matched on purpose — the settings
+    // app does not even live under {app}
+    for name in ["azookey-server.exe", "azookey.exe"] {
+        assert!(
+            body.contains(name),
+            "{name} is unambiguous and must still be matched by name: got {body}"
+        );
+    }
+}
+
+/// Issue #57: terminating a process only REQUESTS it; the handles close a
+/// moment later. A fixed sleep proved nothing on a slow machine and wasted
+/// the wait on a fast one, so the exit has to be observed.
+#[test]
+fn install_waits_for_the_stack_to_actually_exit() {
+    let iss = read("Installer.iss");
+
+    let body = code_block(&iss, "procedure StopRunningStack");
+
+    assert!(
+        body.contains("repeat") && body.contains("until"),
+        "the teardown must poll for the processes to be gone: got {body}"
+    );
+    assert!(
+        body.contains("Alive = 0"),
+        "the poll must exit on the process count reaching zero: got {body}"
+    );
+}
+
 /// launcher.exe runs as administrator, and the startup task is
 /// machine-scope. `runascurrentuser` de-elevates the spawned process, so a
 /// taskkill carrying it silently fails to kill the launcher and the task
