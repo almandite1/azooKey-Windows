@@ -242,19 +242,105 @@ end;
 //
 // Line comments, not brace comments: a { } comment mentioning an Inno
 // constant would be closed early by the constant's own closing brace.
+// Counts our runtime processes, optionally terminating each, and reports
+// whether WMI itself could be reached (Failed) — "could not look" is not the
+// same answer as "none running".
+//
+// Why WMI rather than taskkill: taskkill can only match an image NAME, and
+// ui.exe and launcher.exe are generic enough to belong to something else
+// entirely, so /IM reached every one of them on the machine. A process is
+// ours when it runs from the install directory; azookey-server.exe and
+// Azookey.exe are matched by name alone because those names are already
+// unambiguous, and the settings app in particular lives wherever the chained
+// Tauri NSIS put it rather than under {app}.
+// WMI hands back NULL for fields we may not read (ExecutablePath on a
+// process we cannot open), and Pascal Script has no VarToStr to absorb that.
+function VariantText(const Value: Variant): String;
+begin
+  if VarIsNull(Value) or VarIsEmpty(Value) then
+    Result := ''
+  else
+    Result := Value;
+end;
+
+function StackProcesses(const Dir: String; Kill: Boolean; var Failed: Boolean): Integer;
+var
+  Locator, Service, Items, Item: Variant;
+  i: Integer;
+  Prefix, Path, Name: String;
+begin
+  Result := 0;
+  Failed := False;
+  Prefix := Lowercase(AddBackslash(Dir));
+  try
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Service := Locator.ConnectServer('', 'root\CIMV2');
+    Items := Service.ExecQuery('SELECT Name, ExecutablePath FROM Win32_Process' +
+      ' WHERE Name = "launcher.exe" OR Name = "ui.exe"' +
+      ' OR Name = "azookey-server.exe" OR Name = "Azookey.exe"');
+    for i := 0 to Items.Count - 1 do
+    begin
+      Item := Items.ItemIndex(i);
+      Name := Lowercase(VariantText(Item.Name));
+      // ExecutablePath is NULL for processes we may not open; those are not
+      // ours to kill anyway
+      Path := Lowercase(VariantText(Item.ExecutablePath));
+      if (Name = 'azookey-server.exe') or (Name = 'azookey.exe') or
+         ((Path <> '') and (Pos(Prefix, Path) = 1)) then
+      begin
+        Result := Result + 1;
+        if Kill then
+        begin
+          try
+            Item.Terminate();
+          except
+            // already gone, or refused: the poll decides, not this call
+          end;
+        end;
+      end;
+    end;
+  except
+    Failed := True;
+    Result := 0;
+  end;
+end;
+
 procedure StopRunningStack();
 var
-  Dummy: Integer;
+  Dummy, Waited, Alive: Integer;
+  Failed: Boolean;
 begin
   // End the startup task first: it is what would put a fresh launcher back
   // between the kill and the copies.
   ShellExec('', 'schtasks', '/End /TN "Azookey Startup"', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
-  // Azookey.exe is the settings app, installed by the chained Tauri NSIS,
-  // which cannot replace its own running exe either.
-  ShellExec('', 'taskkill', '/F /IM launcher.exe /IM ui.exe /IM azookey-server.exe /IM Azookey.exe', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
-  // taskkill returns once termination has been requested; the file handles
-  // close a moment later. Nothing to wait on, so give the OS that moment.
-  Sleep(1500);
+
+  StackProcesses(ExpandConstant('{app}'), True, Failed);
+  if Failed then
+  begin
+    // No WMI: fall back to the name-only kill. It is over-broad, but an
+    // upgrade that cannot replace its locked files is the worse outcome.
+    // Azookey.exe is the settings app, installed by the chained Tauri NSIS,
+    // which cannot replace its own running exe either.
+    Log('WMI unavailable; falling back to a name-only taskkill');
+    ShellExec('', 'taskkill', '/F /IM launcher.exe /IM ui.exe /IM azookey-server.exe /IM Azookey.exe', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
+    Sleep(1500);
+    exit;
+  end;
+
+  // Termination is only REQUESTED above; the file handles close a moment
+  // later. Poll for it instead of sleeping a fixed 1.5s, which proved
+  // nothing on a slow machine and wasted the wait on a fast one.
+  Waited := 0;
+  repeat
+    Alive := StackProcesses(ExpandConstant('{app}'), False, Failed);
+    if (Alive = 0) or Failed then
+      break;
+    Sleep(250);
+    Waited := Waited + 250;
+  until Waited >= 15000;
+
+  if Alive > 0 then
+    Log('Timed out waiting for the running stack to exit; the file copies may hit locked files');
 end;
 
 // Runs just before the file copies, and unlike a wizard-page hook it also
