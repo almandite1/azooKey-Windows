@@ -9,6 +9,10 @@ on:
     branches:
       - dev
       - master
+    # a release is cut by pushing a version tag; the release job below turns
+    # that build's installer into a GitHub Release
+    tags:
+      - 'v*'
     paths-ignore:
       - '**.md'
       - 'LICENSE'
@@ -23,7 +27,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# nothing here writes back to the repository
+# the build writes nothing back; only the release job below does, and it
+# raises this for itself rather than granting write to every job
 permissions:
   contents: read
 
@@ -184,3 +189,33 @@ jobs:
         # the installer bundles the models and is large; nobody reaches for a
         # build older than a couple of weeks, so do not keep it the full 90 days
         retention-days: 14
+
+  # A tag build additionally publishes what it just produced. It takes the
+  # artifact from the build job rather than rebuilding: a second build could
+  # differ from the one that passed the gates above, and the whole point of a
+  # release is that it is the build that was tested.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download the setup artifact
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+      with:
+        name: azookey-setup
+
+    - name: Publish the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.ref_name }}
+      # pre-release while the project is pre-1.0: the README says stability is
+      # not guaranteed, and the release should say the same thing
+      run: |
+        gh release create "$TAG" azookey-setup.exe \
+          --repo "$GITHUB_REPOSITORY" \
+          --title "$TAG" \
+          --generate-notes \
+          --prerelease
