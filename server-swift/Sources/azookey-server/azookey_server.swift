@@ -395,6 +395,13 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 /// behind by one app is what the next lookup is incrementally built on.
 /// Upstream resets it when a composition ends; ours end at ClearText and at
 /// RemoveSession, so those are the two places to say so.
+///
+/// This is process-wide, not per-session: `stopComposition` clears the one
+/// shared converter's caches, so ending a composition in one app also drops
+/// the incremental state of any other app mid-composition. Scoping the reset
+/// to a session needs a per-session cache handle the converter does not yet
+/// expose; it is coming upstream (feat/session_api) and is the right fix — do
+/// not try to fake it from here.
 @MainActor func endComposition() {
     converter?.stopComposition()
 }
