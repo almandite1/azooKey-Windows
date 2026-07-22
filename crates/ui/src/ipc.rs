@@ -1,3 +1,6 @@
+use std::sync::{Arc, Mutex, PoisonError};
+
+use azookey_server::PipeConnectInfo;
 use shared::proto::{
     window_service_server::WindowService as WindowServiceProto, EmptyResponse, SetCandidateRequest,
     SetInputModeRequest, SetPositionRequest, SetSelectionRequest,
@@ -17,7 +20,11 @@ impl WindowController {
 
     /// Forwards an action to the window event loop. Returns a gRPC error
     /// instead of panicking when the event loop side has shut down.
-    async fn dispatch(&self, action: WindowAction) -> Result<(), Status> {
+    ///
+    /// `pub(crate)` so a dropped connection can hide the window down exactly
+    /// this path (see main.rs): the placement bookkeeping behind `Hide`
+    /// (issue #59) only holds if every hide is the same hide.
+    pub(crate) async fn dispatch(&self, action: WindowAction) -> Result<(), Status> {
         self.sender
             .send(action)
             .await
@@ -48,14 +55,29 @@ pub enum WindowAction {
 #[derive(Debug)]
 pub struct WindowService {
     pub controller: WindowController,
+    /// Which connection the visible window belongs to, so its death can take
+    /// the window with it (issue #67). Shared with the task that watches for
+    /// disconnects; a std Mutex because nothing awaits while it is held.
+    pub show_owner: Arc<Mutex<crate::utils::ShowOwner>>,
 }
 
 #[tonic::async_trait]
 impl WindowServiceProto for WindowService {
     async fn show_window(
         &self,
-        _request: Request<EmptyResponse>,
+        request: Request<EmptyResponse>,
     ) -> Result<Response<EmptyResponse>, Status> {
+        // tonic put the accepted connection's id in the extensions; remember
+        // whose window this is before it goes up
+        let session = request
+            .extensions()
+            .get::<PipeConnectInfo>()
+            .map(|info| info.session_id);
+        self.show_owner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .on_show(session);
+
         self.controller.dispatch(WindowAction::Show).await?;
         Ok(Response::new(EmptyResponse {}))
     }
@@ -64,6 +86,11 @@ impl WindowServiceProto for WindowService {
         &self,
         _request: Request<EmptyResponse>,
     ) -> Result<Response<EmptyResponse>, Status> {
+        self.show_owner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .on_hide();
+
         self.controller.dispatch(WindowAction::Hide).await?;
         Ok(Response::new(EmptyResponse {}))
     }

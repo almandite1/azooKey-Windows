@@ -97,6 +97,45 @@ impl CandidatePlacement {
     }
 }
 
+/// Which pipe connection the visible candidate window belongs to.
+///
+/// `Hide` only ever arrives as an RPC, so a host application killed while
+/// converting leaves its candidate window on screen — topmost, over
+/// everything, with nobody left to take it down. The connection dying is the
+/// signal, but connections also die late: an application closed a moment ago
+/// can be reported after the next one has already shown its candidates.
+///
+/// So the disconnect only hides when it names the connection that put the
+/// window up. Anything else is a straggler and must be ignored.
+#[derive(Default, Debug)]
+pub struct ShowOwner {
+    last: Option<i64>,
+}
+
+impl ShowOwner {
+    /// A `Show` from `session` (`None` when the connection could not be
+    /// identified, which then matches no disconnect).
+    pub fn on_show(&mut self, session: Option<i64>) {
+        self.last = session;
+    }
+
+    /// A normal `Hide`. The window is down; no disconnect should take it
+    /// down again.
+    pub fn on_hide(&mut self) {
+        self.last = None;
+    }
+
+    /// A connection ended. Returns whether the window must be hidden.
+    pub fn on_disconnect(&mut self, session: i64) -> bool {
+        if self.last == Some(session) {
+            self.last = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Logical (CSS px) width of the candidate window for the longest candidate,
 /// in characters. The webview lays out in CSS px, so this must be applied as
 /// a `LogicalSize` — applying it as physical px left the window too small on
@@ -425,5 +464,53 @@ mod tests {
         // みずうみ = 4 chars (12 UTF-8 bytes) — bytes would return 12
         assert_eq!(max_candidate_chars(&candidates), 4);
         assert_eq!(max_candidate_chars(&[]), 0);
+    }
+
+    #[test]
+    fn a_disconnect_of_the_showing_connection_hides() {
+        let mut owner = ShowOwner::default();
+        owner.on_show(Some(7));
+
+        assert!(
+            owner.on_disconnect(7),
+            "the app that put the window up died"
+        );
+        assert!(
+            !owner.on_disconnect(7),
+            "hiding twice for one death would fight the next composition"
+        );
+    }
+
+    /// A connection can be reported dead after the next application has
+    /// already shown its own candidates. Hiding then would blank a live
+    /// composition in an unrelated app.
+    #[test]
+    fn a_stale_connections_disconnect_must_not_hide_the_new_composition() {
+        let mut owner = ShowOwner::default();
+        owner.on_show(Some(1));
+        owner.on_show(Some(2));
+
+        assert!(!owner.on_disconnect(1));
+        assert!(owner.on_disconnect(2));
+    }
+
+    #[test]
+    fn a_disconnect_after_a_normal_hide_is_a_noop() {
+        let mut owner = ShowOwner::default();
+        owner.on_show(Some(3));
+        owner.on_hide();
+
+        assert!(!owner.on_disconnect(3));
+    }
+
+    /// Without connect info there is nothing to match a disconnect against;
+    /// the window then behaves exactly as it did before this existed.
+    #[test]
+    fn a_show_without_connect_info_never_matches() {
+        let mut owner = ShowOwner::default();
+        owner.on_show(None);
+
+        assert!(!owner.on_disconnect(0));
+        assert!(!owner.on_disconnect(1));
     }
 }

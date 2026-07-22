@@ -78,12 +78,20 @@ async fn main() -> anyhow::Result<()> {
     // initialize window controller
     let (tx, mut rx) = mpsc::channel(32);
     let window_controller = WindowController::new(tx.clone());
+    // who the visible window belongs to; shared with the disconnect watcher
+    let show_owner = Arc::new(std::sync::Mutex::new(utils::ShowOwner::default()));
     let grpc_service = WindowService {
         controller: window_controller.clone(),
+        show_owner: show_owner.clone(),
     };
 
-    // start grpc server
-    let incoming = TonicNamedPipeServer::new(&shared::pipe::ui_pipe_base())?;
+    // start grpc server. Hide only ever arrives as an RPC, so an application
+    // killed mid-composition would leave its candidate window on screen with
+    // nobody left to take it down; the connection ending is the only notice
+    // we get, and tonic gives it to us by dropping the pipe (issue #67).
+    let (disconnect_tx, mut disconnect_rx) = mpsc::unbounded_channel();
+    let incoming =
+        TonicNamedPipeServer::with_disconnect_notify(&shared::pipe::ui_pipe_base(), disconnect_tx)?;
     // health service for the launcher's watchdog. The reported status
     // follows the EVENT LOOP's liveness (via the heartbeat below), so a
     // stalled window loop turns the whole process NOT_SERVING even while
@@ -102,6 +110,30 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("gRPC server terminated: {:?}", result);
         std::process::exit(1);
     });
+
+    // a dropped connection hides the window, but only when it is the one
+    // that showed it: a connection can be reported dead after the next
+    // application has already put its own candidates up, and hiding then
+    // would blank a live composition somewhere else. Goes down the ordinary
+    // Hide path so the placement bookkeeping (issue #59) stays consistent.
+    {
+        let controller = window_controller.clone();
+        let show_owner = show_owner.clone();
+        tokio::spawn(async move {
+            while let Some(session) = disconnect_rx.recv().await {
+                let owns = show_owner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .on_disconnect(session);
+                if owns {
+                    eprintln!("client {session} disconnected while showing; hiding");
+                    if let Err(e) = controller.dispatch(WindowAction::Hide).await {
+                        eprintln!("hide after disconnect failed: {e}");
+                    }
+                }
+            }
+        });
+    }
 
     let event_loop_proxy = event_loop.create_proxy();
     let task_guard: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
