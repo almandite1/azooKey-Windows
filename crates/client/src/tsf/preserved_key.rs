@@ -24,19 +24,14 @@
 //!    the toggle on hosts where the reservation failed; not suppressing it
 //!    when the reservation took makes hosts that deliver *both* toggle twice.
 
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use windows::{
-    Win32::UI::{
-        Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_SHIFT},
-        TextServices::{
-            ITfKeystrokeMgr, ITfThreadMgr, TF_MOD_ALT, TF_MOD_CONTROL, TF_MOD_SHIFT,
-            TF_PRESERVEDKEY,
-        },
-    },
+    Win32::UI::TextServices::{ITfKeystrokeMgr, ITfThreadMgr, TF_MOD_ALT, TF_PRESERVEDKEY},
     core::{GUID, Interface},
 };
 
-use crate::extension::VKeyExt;
 use crate::globals::{
     GUID_PRESERVEDKEY_TOGGLE_ALT_GRAVE, GUID_PRESERVEDKEY_TOGGLE_KANJI,
     GUID_PRESERVEDKEY_TOGGLE_ZENHAN,
@@ -108,20 +103,6 @@ const TOGGLE_KEYS: [(GUID, TF_PRESERVEDKEY, &str); 5] = [
     ),
 ];
 
-/// Whether a `TF_PRESERVEDKEY`'s `uModifiers` is satisfied by the given
-/// modifier state. Pure so it can be tested without the keyboard: an
-/// unmodified reservation requires all three modifiers *up*, or Alt+`
-/// would fire on a plain `` ` `` and eat the character.
-///
-/// Only Alt/Ctrl/Shift are modelled because those are the only bits
-/// [`TOGGLE_KEYS`] uses; a side-specific reservation (`TF_MOD_LALT` and
-/// friends) would need this widened.
-fn modifiers_satisfied(modifiers: u32, alt: bool, control: bool, shift: bool) -> bool {
-    ((modifiers & TF_MOD_ALT) != 0) == alt
-        && ((modifiers & TF_MOD_CONTROL) != 0) == control
-        && ((modifiers & TF_MOD_SHIFT) != 0) == shift
-}
-
 impl TextServiceFactory_Impl {
     /// Reserves the IME on/off keys and reports the ones that took, for the
     /// caller to record. Never fails: an unreservable key is warned about and
@@ -161,6 +142,8 @@ impl TextServiceFactory_Impl {
             }
         }
 
+        self.log_reservation_state(&keystroke_mgr, &reserved);
+
         reserved
     }
 
@@ -198,22 +181,51 @@ impl TextServiceFactory_Impl {
         Ok(self.borrow()?.preserved_keys.iter().any(|(g, _)| g == guid))
     }
 
-    /// Whether a raw keystroke duplicates a reservation that took. Such a key
-    /// has already been handled through `OnPreservedKey`, so acting on it
-    /// again would toggle twice on hosts that deliver both.
-    pub fn is_reserved_keystroke(&self, key_code: usize) -> Result<bool> {
-        let Ok(key_code) = u32::try_from(key_code) else {
-            return Ok(false);
-        };
-        let alt = VK_MENU.is_pressed();
-        let control = VK_CONTROL.is_pressed();
-        let shift = VK_SHIFT.is_pressed();
+    /// Records that `OnPreservedKey` just toggled the mode, so a raw VK for
+    /// the same press can be recognised as a duplicate.
+    pub fn note_preserved_toggle(&self) -> Result<()> {
+        self.borrow_mut()?.last_preserved_toggle = Some(Instant::now());
+        Ok(())
+    }
 
-        Ok(self.borrow()?.preserved_keys.iter().any(|(_, key)| {
-            key.uVKey == key_code && modifiers_satisfied(key.uModifiers, alt, control, shift)
-        }))
+    /// Whether a raw on/off keystroke is the echo of a press `OnPreservedKey`
+    /// has already handled.
+    ///
+    /// A host that both dispatches the preserved key and delivers the raw VK
+    /// would toggle twice for one press. The window is deliberately tiny: the
+    /// two deliveries of one press are microseconds apart, while a human
+    /// double-tap is tens of milliseconds at best.
+    pub fn raw_toggle_is_duplicate(&self) -> Result<bool> {
+        Ok(self
+            .borrow()?
+            .last_preserved_toggle
+            .is_some_and(|at| at.elapsed() < DOUBLE_DELIVERY_WINDOW))
+    }
+
+    /// Asks TSF whether it actually holds the reservations we made. Purely
+    /// diagnostic: `PreserveKey` returning S_OK turned out NOT to mean the
+    /// chord will ever be dispatched (issue #19), so the log has to record
+    /// TSF's own view rather than our request.
+    fn log_reservation_state(
+        &self,
+        keystroke_mgr: &ITfKeystrokeMgr,
+        reserved: &[(GUID, TF_PRESERVEDKEY)],
+    ) {
+        for (guid, key) in reserved {
+            let held = unsafe { keystroke_mgr.IsPreservedKey(guid, key) };
+            tracing::debug!(
+                "IsPreservedKey(vk={:#04x}, modifiers={:#x}) = {:?}",
+                key.uVKey,
+                key.uModifiers,
+                held.map(|b| b.as_bool())
+            );
+        }
     }
 }
+
+/// How long after an `OnPreservedKey` toggle a raw on/off VK counts as the
+/// same press rather than a new one.
+const DOUBLE_DELIVERY_WINDOW: Duration = Duration::from_millis(50);
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -346,27 +358,80 @@ mod tests {
         teardown(&tip);
     }
 
-    /// Double-delivery guard: once the reservation took, the key arrives
-    /// through `OnPreservedKey`. A host that ALSO sends the raw VK would
-    /// otherwise toggle twice.
+    /// A raw on/off VK is handled even though the reservation was accepted.
+    ///
+    /// This asserts the opposite of what the first attempt did, on purpose.
+    /// Suppressing the raw VK whenever `PreserveKey` had returned S_OK is
+    /// unsound: TSF accepts reservations it then never dispatches (measured
+    /// with Alt+VK_KANJI on a 101-key layout), and the keystroke fell into
+    /// the gap — Alt+` did nothing at all. A raw VK arriving IS the evidence
+    /// that TSF did not route the key, because a key it dispatches through
+    /// `OnPreservedKey` is not also delivered raw.
     #[test]
-    fn a_reserved_zenkaku_key_no_longer_toggles_through_the_raw_vk() {
+    fn a_raw_toggle_vk_is_handled_even_when_the_reservation_was_accepted() {
+        let _guard = global_state_lock();
+        let log = Rc::new(ThreadMgrLog::default());
+        let thread_mgr = FakeThreadMgr::new(log.clone());
+        let tip = activate(&thread_mgr);
+        let context = FakeContext::new(EditSessionBehavior::RunSync);
+        let factory = factory_of(&tip);
+
+        assert!(
+            !log.preserved_keys.borrow().is_empty(),
+            "this host accepts the reservations"
+        );
+        assert!(
+            factory.test_key(Some(&context), WPARAM(0xF3)).unwrap(),
+            "the raw VK must still be handled — its arrival proves TSF did \
+             not route it as a preserved key"
+        );
+        teardown(&tip);
+    }
+
+    /// The double-delivery guard, in its evidence-based form: only a toggle
+    /// `OnPreservedKey` actually performed suppresses the raw VK, and only
+    /// for as long as one press could plausibly still be arriving.
+    #[test]
+    fn a_raw_toggle_right_after_a_preserved_one_is_ignored() {
         let _guard = global_state_lock();
         let thread_mgr = FakeThreadMgr::new(Rc::new(ThreadMgrLog::default()));
         let tip = activate(&thread_mgr);
         let context = FakeContext::new(EditSessionBehavior::RunSync);
         let factory = factory_of(&tip);
 
+        factory.note_preserved_toggle().unwrap();
+
+        assert!(
+            factory.raw_toggle_is_duplicate().unwrap(),
+            "the raw VK arriving with the preserved dispatch is one press"
+        );
         assert!(
             !factory.test_key(Some(&context), WPARAM(0xF3)).unwrap(),
-            "the raw VK must be ignored once TSF routes the key to us"
+            "so it must not toggle a second time"
         );
         teardown(&tip);
     }
 
-    /// …and the other half: on a host that refuses the reservation, the raw
-    /// VK stays the safety net. Dropping it unconditionally would lose the
-    /// toggle entirely there.
+    /// …but the suppression must expire, or the next deliberate press would
+    /// be swallowed too.
+    #[test]
+    fn the_double_delivery_window_expires() {
+        let _guard = global_state_lock();
+        let thread_mgr = FakeThreadMgr::new(Rc::new(ThreadMgrLog::default()));
+        let tip = activate(&thread_mgr);
+        let factory = factory_of(&tip);
+
+        factory.borrow_mut().unwrap().last_preserved_toggle =
+            Some(Instant::now() - DOUBLE_DELIVERY_WINDOW * 2);
+
+        assert!(
+            !factory.raw_toggle_is_duplicate().unwrap(),
+            "a press long after the last preserved toggle is a new press"
+        );
+        teardown(&tip);
+    }
+
+    /// On a host that refuses the reservation the raw VK is all there is.
     #[test]
     fn the_raw_vk_still_toggles_when_the_reservation_fails() {
         let _guard = global_state_lock();
@@ -390,27 +455,6 @@ mod tests {
             "without a reservation the raw Zenkaku/Hankaku VK must still toggle"
         );
         teardown(&tip);
-    }
-
-    /// An unmodified reservation must NOT match while a modifier is down —
-    /// otherwise reserving `` ` `` for Alt+` would swallow the plain
-    /// backtick, and Ctrl+Space would look like the Zenkaku/Hankaku key.
-    #[test]
-    fn an_unmodified_reservation_requires_every_modifier_up() {
-        assert!(modifiers_satisfied(0, false, false, false));
-        assert!(!modifiers_satisfied(0, true, false, false));
-        assert!(!modifiers_satisfied(0, false, true, false));
-        assert!(!modifiers_satisfied(0, false, false, true));
-    }
-
-    #[test]
-    fn an_alt_reservation_requires_alt_and_nothing_else() {
-        assert!(modifiers_satisfied(TF_MOD_ALT, true, false, false));
-        assert!(!modifiers_satisfied(TF_MOD_ALT, false, false, false));
-        assert!(
-            !modifiers_satisfied(TF_MOD_ALT, true, true, false),
-            "Ctrl+Alt+` is AltGr+` on many layouts and is not our chord"
-        );
     }
 
     /// The Alt+` reservation is the whole point of the issue-#19 scope
@@ -458,8 +502,8 @@ mod tests {
             .collect();
 
         assert_eq!(kanji.len(), 2, "plain 漢字 and Alt+`");
-        assert!(modifiers_satisfied(kanji[0], false, false, false));
-        assert!(modifiers_satisfied(kanji[1], true, false, false));
+        assert_eq!(kanji[0], 0, "the bare 漢字 key");
+        assert_eq!(kanji[1], TF_MOD_ALT, "Alt+` after Windows' translation");
     }
 
     /// Zenkaku/Hankaku's two virtual keys are the same physical key, so they

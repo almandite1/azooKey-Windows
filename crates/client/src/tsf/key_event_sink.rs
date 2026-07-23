@@ -91,6 +91,9 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         }
 
         self.toggle_input_mode(pic.as_ref())?;
+        // stamped after the toggle so a host that ALSO delivers the raw VK
+        // does not toggle a second time for the same press
+        self.note_preserved_toggle()?;
         Ok(true.into())
     }
 

@@ -333,19 +333,21 @@ impl TextServiceFactory_Impl {
         // registry rather than a fixed VK list, so a host where the
         // reservation FAILED keeps the raw-VK toggle as its safety net
         // (issue #19).
-        if self.is_reserved_keystroke(wparam.0)? {
-            return Ok(None);
-        }
-
         // The IME on/off keys outrank the chord branch below. Windows
         // translates Alt+` on a 101-key Japanese layout into VK_KANJI with
         // Alt STILL HELD (measured on hardware), so the chord branch would
         // throw the user's only on/off key away as a host shortcut.
         //
-        // Only reached when the TSF reservation did not take — the guard
-        // above returns first when it did — so this stays the safety net for
-        // hosts that refuse PreserveKey, not a second delivery path.
+        // Reaching this at all means TSF did NOT route the key through
+        // OnPreservedKey — a reserved key is not also delivered raw — so the
+        // press is ours to handle. The only thing that must not be handled
+        // twice is a host that delivers both, which the recency check
+        // catches (issue #19).
         if is_ime_toggle_key(wparam.0) {
+            if self.raw_toggle_is_duplicate()? {
+                tracing::debug!("ignoring the raw VK echo of a preserved-key toggle");
+                return Ok(None);
+            }
             let ctx = self.keystroke_context()?;
             return Ok(transition(&ctx, UserAction::ToggleInputMode)
                 .map(|(next_state, actions)| (actions, next_state)));
