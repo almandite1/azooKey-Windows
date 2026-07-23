@@ -106,6 +106,42 @@ pub fn lazy_pipe_channel(pipe_name: String) -> Result<Channel, tonic::transport:
     )
 }
 
+/// True when `status` says the peer process could not be reached, rather than
+/// carrying an answer the peer produced. Callers that keep state mirrored in
+/// the peer (the TIP's composition) use this to tell "the server lost my
+/// state, reset" from "the server rejected this request, surface it".
+///
+/// A dead engine surfaces in **two** different shapes, and both must count:
+///
+/// * the connect attempt fails (the pipe is gone) — tonic wraps every custom
+///   connector's error in `tonic::ConnectError` and its source-chain
+///   classifier maps that to `Unavailable`;
+/// * an already-established connection breaks mid-call — hyper reports a
+///   broken pipe, which tonic's classifier does *not* recognise, so the call
+///   comes back as **`Unknown`** with a `tonic::transport::Error` source.
+///
+/// The second shape is the common one in the field: the channel connected at
+/// the first keystroke and the engine died later, so the next RPC goes out on
+/// the stale connection. Matching on `Unavailable` alone therefore misses the
+/// most frequent server-loss case. A status the server itself produced (an
+/// `InvalidArgument` decoded from trailers) never carries a transport error in
+/// its source chain, so this stays precise.
+pub fn is_transport_failure(status: &tonic::Status) -> bool {
+    if status.code() == tonic::Code::Unavailable {
+        return true;
+    }
+
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(status);
+    while let Some(error) = source {
+        if error.is::<tonic::transport::Error>() {
+            return true;
+        }
+        source = error.source();
+    }
+
+    false
+}
+
 /// Opens the client end of `pipe_name` the way tokio's `ClientOptions::open`
 /// does — OPEN_EXISTING, overlapped, identification-level SQOS — but with
 /// [`PIPE_CLIENT_ACCESS`] instead of GENERIC_READ|GENERIC_WRITE, so the client
@@ -161,6 +197,30 @@ mod tests {
         assert!(ui_pipe().starts_with(r"\\.\pipe\azookey_ui_"));
         // base and full path must agree on the session id
         assert!(server_pipe().ends_with(&server_pipe_base()));
+    }
+
+    /// A status the server produced is an answer, not a transport failure:
+    /// classifying it as server loss would reset the composition on every
+    /// rejected request.
+    #[test]
+    fn a_server_side_status_is_not_a_transport_failure() {
+        assert!(!is_transport_failure(&tonic::Status::invalid_argument(
+            "bad request"
+        )));
+        assert!(!is_transport_failure(&tonic::Status::internal(
+            "engine blew up"
+        )));
+    }
+
+    /// The connect-failure shape: tonic maps a failing connector to
+    /// `Unavailable`. (The other shape — `Unknown` over a broken established
+    /// connection — needs a real connection to break, so it is covered by
+    /// `crates/server/tests/pipe_transport.rs`.)
+    #[test]
+    fn unavailable_is_a_transport_failure() {
+        assert!(is_transport_failure(&tonic::Status::unavailable(
+            "pipe is gone"
+        )));
     }
 
     /// The client access mask must let a byte-mode client read and write, but
