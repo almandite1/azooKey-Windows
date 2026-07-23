@@ -188,7 +188,6 @@ async fn main() -> anyhow::Result<()> {
     {
         let last_beat = last_beat.clone();
         let proxy = event_loop_proxy.clone();
-        let mut health_reporter = health_reporter;
         tokio::spawn(async move {
             health_reporter
                 .set_service_status("", tonic_health::ServingStatus::Serving)
