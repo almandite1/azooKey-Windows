@@ -63,14 +63,22 @@ impl TextServiceFactory_Impl {
     /// sink, langbar item) that need the thread manager. Best-effort — returns
     /// the first failure but attempts every step it can reach.
     fn teardown_thread_scoped(&self) -> Result<()> {
-        let text_service = self.borrow()?;
-        let thread_mgr = text_service.thread_mgr()?;
+        let (thread_mgr, tid) = {
+            let text_service = self.borrow()?;
+            (text_service.thread_mgr()?, text_service.tid)
+        };
+        // Drained only once the thread manager is in hand: with no way to
+        // reach ITfKeystrokeMgr there is nothing to unpreserve, and clearing
+        // the registry anyway would lose the record of what is still held.
+        let preserved = std::mem::take(&mut self.borrow_mut()?.preserved_keys);
 
         let mut first_error = Ok(());
         tracing::debug!("UnadviseKeyEventSink");
+        record(&mut first_error, self.unadvise_key_sink(&thread_mgr, tid));
+        tracing::debug!("UnpreserveKey");
         record(
             &mut first_error,
-            self.unadvise_key_sink(&thread_mgr, text_service.tid),
+            self.unpreserve_keys(&thread_mgr, &preserved),
         );
         tracing::debug!("Remove langbar");
         record(&mut first_error, self.remove_langbar_item(&thread_mgr));
@@ -228,7 +236,14 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             return Err(error);
         }
 
+        // Claim the IME on/off keys. Advisory, and deliberately still outside
+        // any borrow: without this the OS keeps Alt+` (the US-layout on/off
+        // chord) to itself and the key never reaches the TIP at all (#19).
+        tracing::debug!("PreserveKey (IME on/off)");
+        let preserved = self.preserve_toggle_keys(&thread_mgr, tid);
+
         let mut text_service = self.borrow_mut()?;
+        text_service.preserved_keys = preserved;
 
         // Everything below is ADVISORY. A failure here must NOT abort Activate:
         //   - returning Err leaves the previously active IME's icon up (the

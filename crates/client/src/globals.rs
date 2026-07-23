@@ -38,6 +38,21 @@ pub const GUID_DISPLAY_ATTRIBUTE: GUID = GUID::from_u128(0xffdefe7b_2fc2_11ef_b1
 pub const GUID_CANDIDATE_LIST_UI_ELEMENT: GUID =
     GUID::from_u128(0xffdefe7c_2fc2_11ef_b16b_94e70b2c378c);
 
+// Identify the keys reserved with `ITfKeystrokeMgr::PreserveKey`. One GUID
+// per *purpose* rather than per key: TSF hands the GUID back in
+// `OnPreservedKey`, and separating them is what lets a log say which key the
+// user actually pressed. Zenkaku/Hankaku shares one GUID across its two
+// virtual keys because they are the same physical key.
+// ffdefe7d-2fc2-11ef-b16b-94e70b2c378c
+pub const GUID_PRESERVEDKEY_TOGGLE_ZENHAN: GUID =
+    GUID::from_u128(0xffdefe7d_2fc2_11ef_b16b_94e70b2c378c);
+// ffdefe7e-2fc2-11ef-b16b-94e70b2c378c
+pub const GUID_PRESERVEDKEY_TOGGLE_KANJI: GUID =
+    GUID::from_u128(0xffdefe7e_2fc2_11ef_b16b_94e70b2c378c);
+// ffdefe7f-2fc2-11ef-b16b-94e70b2c378c
+pub const GUID_PRESERVEDKEY_TOGGLE_ALT_GRAVE: GUID =
+    GUID::from_u128(0xffdefe7f_2fc2_11ef_b16b_94e70b2c378c);
+
 pub const DISPLAY_ATTRIBUTE: TF_DISPLAYATTRIBUTE = TF_DISPLAYATTRIBUTE {
     crText: TF_DA_COLOR {
         r#type: TF_CT_NONE,

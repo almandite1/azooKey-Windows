@@ -73,12 +73,24 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     }
 
     #[macros::anyhow]
+    #[tracing::instrument(skip(self, pic))]
     fn OnPreservedKey(
         &self,
-        _pic: windows_core::Ref<'_, ITfContext>,
-        _rguid: *const GUID,
+        pic: windows_core::Ref<'_, ITfContext>,
+        rguid: *const GUID,
     ) -> Result<BOOL> {
-        // this function is actually not used
+        // Answering TRUE unconditionally — what the old stub did — claims
+        // every preserved key in the process, our own or not, and eats it.
+        // Only the keys this activation reserved are ours (issue #19).
+        let Some(guid) = (unsafe { rguid.as_ref() }) else {
+            return Ok(false.into());
+        };
+
+        if !self.is_preserved_toggle(guid)? {
+            return Ok(false.into());
+        }
+
+        self.toggle_input_mode(pic.as_ref())?;
         Ok(true.into())
     }
 
