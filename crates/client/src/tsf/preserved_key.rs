@@ -181,24 +181,24 @@ impl TextServiceFactory_Impl {
         Ok(self.borrow()?.preserved_keys.iter().any(|(g, _)| g == guid))
     }
 
-    /// Records that `OnPreservedKey` just toggled the mode, so a raw VK for
-    /// the same press can be recognised as a duplicate.
-    pub fn note_preserved_toggle(&self) -> Result<()> {
-        self.borrow_mut()?.last_preserved_toggle = Some(Instant::now());
+    /// Records that the input mode was just toggled, so the other
+    /// delivery of the same physical press can be recognised as a duplicate.
+    pub fn note_mode_toggle(&self) -> Result<()> {
+        self.borrow_mut()?.last_mode_toggle = Some(Instant::now());
         Ok(())
     }
 
-    /// Whether a raw on/off keystroke is the echo of a press `OnPreservedKey`
-    /// has already handled.
+    /// Whether an on/off keystroke is a second delivery of a press already
+    /// handled.
     ///
-    /// A host that both dispatches the preserved key and delivers the raw VK
-    /// would toggle twice for one press. The window is deliberately tiny: the
-    /// two deliveries of one press are microseconds apart, while a human
-    /// double-tap is tens of milliseconds at best.
-    pub fn raw_toggle_is_duplicate(&self) -> Result<bool> {
+    /// One press can reach the TIP twice — measured at 5-7ms apart on a
+    /// 101-key layout — and the second flip cancels the first, so the key
+    /// looks dead. The window is deliberately tiny: no human double-tap
+    /// fits inside it (that would be 20 presses a second).
+    pub fn toggle_is_duplicate(&self) -> Result<bool> {
         Ok(self
             .borrow()?
-            .last_preserved_toggle
+            .last_mode_toggle
             .is_some_and(|at| at.elapsed() < DOUBLE_DELIVERY_WINDOW))
     }
 
@@ -223,8 +223,8 @@ impl TextServiceFactory_Impl {
     }
 }
 
-/// How long after an `OnPreservedKey` toggle a raw on/off VK counts as the
-/// same press rather than a new one.
+/// How long after a mode toggle another on/off key counts as the same
+/// physical press rather than a new one.
 const DOUBLE_DELIVERY_WINDOW: Duration = Duration::from_millis(50);
 
 #[cfg(test)]
@@ -388,26 +388,61 @@ mod tests {
         teardown(&tip);
     }
 
-    /// The double-delivery guard, in its evidence-based form: only a toggle
-    /// `OnPreservedKey` actually performed suppresses the raw VK, and only
-    /// for as long as one press could plausibly still be arriving.
+    /// The double-delivery guard: one physical press delivered twice must
+    /// toggle once. Measured on a 101-key layout, Alt+` reaches OnKeyDown
+    /// twice 5-7ms apart, and the second flip cancelled the first — the key
+    /// simply looked dead.
     #[test]
-    fn a_raw_toggle_right_after_a_preserved_one_is_ignored() {
+    fn a_second_delivery_of_one_press_is_ignored() {
         let _guard = global_state_lock();
         let thread_mgr = FakeThreadMgr::new(Rc::new(ThreadMgrLog::default()));
         let tip = activate(&thread_mgr);
         let context = FakeContext::new(EditSessionBehavior::RunSync);
         let factory = factory_of(&tip);
 
-        factory.note_preserved_toggle().unwrap();
+        factory.note_mode_toggle().unwrap();
 
         assert!(
-            factory.raw_toggle_is_duplicate().unwrap(),
-            "the raw VK arriving with the preserved dispatch is one press"
+            factory.toggle_is_duplicate().unwrap(),
+            "a key arriving 5ms after the last toggle is the same press"
         );
         assert!(
             !factory.test_key(Some(&context), WPARAM(0xF3)).unwrap(),
             "so it must not toggle a second time"
+        );
+        teardown(&tip);
+    }
+
+    /// The guard is only armed if an actual toggle arms it. `act_set_ime_mode`
+    /// is the one place the mode changes, whichever path asked for it, so the
+    /// stamp lives there — putting it in `OnPreservedKey` alone left the
+    /// raw-VK-twice case (the one that actually happens) unguarded.
+    #[test]
+    fn performing_a_toggle_arms_the_guard() {
+        let _guard = global_state_lock();
+        let thread_mgr = FakeThreadMgr::new(Rc::new(ThreadMgrLog::default()));
+        let tip = activate(&thread_mgr);
+        let context = FakeContext::new(EditSessionBehavior::RunSync);
+        let factory = factory_of(&tip);
+
+        assert!(
+            !factory.toggle_is_duplicate().unwrap(),
+            "nothing has toggled yet"
+        );
+
+        assert!(
+            factory.test_key(Some(&context), WPARAM(0xF3)).unwrap(),
+            "the first delivery toggles"
+        );
+        factory.handle_key(Some(&context), WPARAM(0xF3)).unwrap();
+
+        assert!(
+            factory.toggle_is_duplicate().unwrap(),
+            "and arms the guard for the second delivery of the same press"
+        );
+        assert!(
+            !factory.test_key(Some(&context), WPARAM(0xF3)).unwrap(),
+            "which is then ignored instead of cancelling the first"
         );
         teardown(&tip);
     }
@@ -421,12 +456,12 @@ mod tests {
         let tip = activate(&thread_mgr);
         let factory = factory_of(&tip);
 
-        factory.borrow_mut().unwrap().last_preserved_toggle =
+        factory.borrow_mut().unwrap().last_mode_toggle =
             Some(Instant::now() - DOUBLE_DELIVERY_WINDOW * 2);
 
         assert!(
-            !factory.raw_toggle_is_duplicate().unwrap(),
-            "a press long after the last preserved toggle is a new press"
+            !factory.toggle_is_duplicate().unwrap(),
+            "a press long after the last toggle is a new press"
         );
         teardown(&tip);
     }
