@@ -10,7 +10,7 @@ use tao::{
     event::{Event, StartCause, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use uiaccess::prepare_uiaccess_token;
@@ -151,15 +151,13 @@ async fn main() -> anyhow::Result<()> {
     let candidate_webview = candidate_webview_builder
         .with_devtools(true)
         .with_ipc_handler(move |message| {
-            if let Ok(message) = serde_json::from_str::<serde_json::Value>(message.body()) {
-                if let Some(type_value) = message.get("type") {
-                    if type_value == "resize" {
-                        if let Some(height) = message.get("height") {
-                            let height = height.as_f64().unwrap_or(0.0);
-                            let _ = proxy_clone.send_event(UserEvent::UpdateHeight(height as i32));
-                        }
-                    }
-                }
+            if let Ok(message) = serde_json::from_str::<serde_json::Value>(message.body())
+                && let Some(type_value) = message.get("type")
+                && type_value == "resize"
+                && let Some(height) = message.get("height")
+            {
+                let height = height.as_f64().unwrap_or(0.0);
+                let _ = proxy_clone.send_event(UserEvent::UpdateHeight(height as i32));
             }
         })
         .build(&candidate_window)?;

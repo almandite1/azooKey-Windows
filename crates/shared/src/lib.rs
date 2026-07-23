@@ -137,16 +137,16 @@ impl AppConfig {
     fn write_to(&self, config_root: &Path) -> Result<(), String> {
         let config_path = config_root.join(SETTINGS_FILENAME);
 
-        if let LoadOutcome::Parsed(stored) = Self::load_from(config_root) {
-            if is_newer_than_current(&stored.version) {
-                return Err(format!(
-                    "{} was written by a newer version ({}) than this build supports ({}); \
-                     refusing to overwrite it",
-                    config_path.display(),
-                    stored.version,
-                    CONFIG_VERSION
-                ));
-            }
+        if let LoadOutcome::Parsed(stored) = Self::load_from(config_root)
+            && is_newer_than_current(&stored.version)
+        {
+            return Err(format!(
+                "{} was written by a newer version ({}) than this build supports ({}); \
+                 refusing to overwrite it",
+                config_path.display(),
+                stored.version,
+                CONFIG_VERSION
+            ));
         }
 
         // whatever version the caller happens to be holding, what lands on
@@ -217,11 +217,11 @@ impl AppConfig {
     }
 
     fn new_in(config_root: &Path) -> Self {
-        if !config_root.exists() {
-            if let Err(e) = std::fs::create_dir_all(config_root) {
-                eprintln!("failed to create {}: {e}", config_root.display());
-                return AppConfig::default();
-            }
+        if !config_root.exists()
+            && let Err(e) = std::fs::create_dir_all(config_root)
+        {
+            eprintln!("failed to create {}: {e}", config_root.display());
+            return AppConfig::default();
         }
 
         match Self::load_from(config_root) {

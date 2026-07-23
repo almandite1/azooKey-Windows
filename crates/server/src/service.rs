@@ -12,8 +12,8 @@ use shared::proto::{
 
 use crate::session::session_of;
 use crate::wrappers::{
-    add_text, clear_text, get_composed_text, load_config, move_cursor, remove_text, set_context,
-    shrink_text, RawComposingText,
+    RawComposingText, add_text, clear_text, get_composed_text, load_config, move_cursor,
+    remove_text, set_context, shrink_text,
 };
 
 #[derive(Debug, Default)]

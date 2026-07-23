@@ -2,8 +2,8 @@ use anyhow::{Context as _, Result};
 use tao::{dpi::LogicalSize, event_loop::EventLoop, window::Window};
 use wry::{WebContext, WebView, WebViewBuilder};
 
-use crate::window::create_overlay_window;
 use crate::UserEvent;
+use crate::window::create_overlay_window;
 
 pub fn create_indicator_window(event_loop: &EventLoop<UserEvent>) -> Result<Window> {
     let window = create_overlay_window(event_loop, "Indicator", true)?;

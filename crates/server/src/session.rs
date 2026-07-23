@@ -64,7 +64,7 @@ fn touch_session(id: i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{expired_sessions, SESSION_IDLE_TIMEOUT};
+    use super::{SESSION_IDLE_TIMEOUT, expired_sessions};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 

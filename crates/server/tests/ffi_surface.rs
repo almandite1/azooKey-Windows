@@ -123,14 +123,16 @@ fn ffi_function_names_agree_across_the_three_sources() {
     );
 
     assert_eq!(
-        header, rust,
+        header,
+        rust,
         "ffi.h and crates/server/src/ffi.rs disagree.\n  only in ffi.h: {:?}\n  only in ffi.rs: {:?}",
         header.difference(&rust).collect::<Vec<_>>(),
         rust.difference(&header).collect::<Vec<_>>(),
     );
 
     assert_eq!(
-        header, swift,
+        header,
+        swift,
         "ffi.h and FFIExports.swift disagree.\n  only in ffi.h: {:?}\n  only in @_cdecl: {:?}",
         header.difference(&swift).collect::<Vec<_>>(),
         swift.difference(&header).collect::<Vec<_>>(),

@@ -8,16 +8,16 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::HealthCheckRequest;
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use tonic_health::pb::health_client::HealthClient;
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
 };
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::core::{PCWSTR, w};
 
 /// give up when a child keeps crashing this many times within RESTART_WINDOW
 const MAX_RESTARTS_IN_WINDOW: usize = 5;
@@ -67,7 +67,9 @@ fn init_child_job() {
         match CreateJobObjectW(None, PCWSTR::null()) {
             Ok(job) => job,
             Err(e) => {
-                log_err(&format!("CreateJobObject failed ({e}); children won't be tied to the launcher's lifetime"));
+                log_err(&format!(
+                    "CreateJobObject failed ({e}); children won't be tied to the launcher's lifetime"
+                ));
                 return;
             }
         }
@@ -228,7 +230,14 @@ async fn main() -> anyhow::Result<()> {
 
     let mut new_path = env::var("PATH").unwrap_or_else(|_| String::new());
     new_path = format!("{};{}", backend_path_str, new_path);
-    env::set_var("PATH", &new_path);
+    // set_var is unsafe as of edition 2024: it is UB if another thread reads
+    // the environment concurrently. Sound here — this runs before either
+    // tokio::spawn below, so the only other threads in the process are the
+    // runtime's idle workers, which never touch the environment while parked.
+    // The later reads that matter (each child Command inheriting this PATH so
+    // it can find the llama backend DLLs) happen on tasks spawned after this
+    // point, and the spawn supplies the happens-before edge.
+    unsafe { env::set_var("PATH", &new_path) };
 
     // a crashed OR HUNG server would otherwise leave the IME dead in every
     // application until re-login, so both children are supervised: exits

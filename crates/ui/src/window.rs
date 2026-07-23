@@ -13,9 +13,9 @@ use windows::Win32::{
     UI::{
         Accessibility::NotifyWinEvent,
         WindowsAndMessaging::{
-            IsWindowVisible, SetWindowLongW, SetWindowPos, ShowWindow, CHILDID_SELF, GWL_EXSTYLE,
-            GWL_STYLE, HWND_TOPMOST, OBJID_CLIENT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
-            SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+            CHILDID_SELF, GWL_EXSTYLE, GWL_STYLE, HWND_TOPMOST, IsWindowVisible, OBJID_CLIENT,
+            SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowLongW,
+            SetWindowPos, ShowWindow, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
         },
     },
 };
