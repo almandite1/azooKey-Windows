@@ -305,6 +305,39 @@ pub fn get_indicator_position(caret: &CaretRect, win_width: i32, win_height: i32
     (x as f64, y as f64)
 }
 
+/// The script that pushes a new input mode into the indicator webview.
+///
+/// The mode string ("あ"/"A") arrives over the `SetInputMode` RPC, which any
+/// local process on the pipe can call with an arbitrary payload, so it is
+/// untrusted input: `serde_json` turns it into a properly quoted and escaped
+/// JS string literal. A raw `"{}"` interpolation let a `"` or `\` break out
+/// of the literal and inject script into the (UIAccess) webview.
+pub fn update_input_method_script(mode: &str) -> String {
+    // an un-serializable mode is not worth dropping the update over; an
+    // empty indicator is the safe answer
+    let arg = serde_json::to_string(mode).unwrap_or_else(|_| "\"\"".to_string());
+    format!("updateInputMethod({arg})")
+}
+
+/// Where WebView2 keeps its profile, given the resolved per-user data root.
+///
+/// Left unset it defaults to `<exe dir>\ui.exe.WebView2`, and the exe dir is
+/// Program Files: a standard (non-elevated) user cannot create it there. That
+/// is not a soft failure — environment creation returns 0x80080005 and the
+/// webview never builds, so neither window ever appears. The logon task's
+/// `HighestAvailable` does not save us; it is a no-op for standard users
+/// (issue #54).
+///
+/// Falls back to the temp dir rather than to wry's default: with no
+/// `LOCALAPPDATA` we still need somewhere every user can write, and the
+/// profile is a cache we are free to lose.
+pub fn webview2_data_dir_in(local_data_root: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    match local_data_root {
+        Some(root) => root.join("WebView2"),
+        None => std::env::temp_dir().join("Azookey").join("WebView2"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +654,65 @@ mod tests {
 
         assert!(!owner.on_disconnect(0));
         assert!(!owner.on_disconnect(1));
+    }
+
+    #[test]
+    fn the_mode_string_reaches_the_webview_quoted() {
+        assert_eq!(
+            update_input_method_script("あ"),
+            r#"updateInputMethod("あ")"#
+        );
+        assert_eq!(update_input_method_script("A"), r#"updateInputMethod("A")"#);
+    }
+
+    /// The injection this guards against: a mode string carrying a quote used
+    /// to close the JS literal and let everything after it run as script. The
+    /// payload must come out as data — one string argument, escaped.
+    #[test]
+    fn a_quote_in_the_mode_string_cannot_break_out_of_the_literal() {
+        let script = update_input_method_script(r#""); alert(1); //"#);
+
+        assert_eq!(
+            script, r#"updateInputMethod("\"); alert(1); //")"#,
+            "the quote must be escaped, not terminate the argument"
+        );
+    }
+
+    /// A trailing backslash is the other half of the same trick: unescaped it
+    /// would escape the closing quote instead.
+    #[test]
+    fn backslashes_and_newlines_are_escaped() {
+        assert_eq!(
+            update_input_method_script(r"back\slash"),
+            r#"updateInputMethod("back\\slash")"#
+        );
+        assert_eq!(
+            update_input_method_script("two\nlines"),
+            r#"updateInputMethod("two\nlines")"#,
+            "a raw newline inside a JS string literal is a syntax error"
+        );
+    }
+
+    /// A standard user cannot write next to ui.exe, so the profile goes under
+    /// the per-user data root when there is one (issue #54).
+    #[test]
+    fn the_webview_profile_lives_under_the_user_data_root() {
+        let root = std::path::PathBuf::from(r"C:\Users\someone\AppData\Local\Azookey");
+
+        assert_eq!(
+            webview2_data_dir_in(Some(root.clone())),
+            root.join("WebView2")
+        );
+    }
+
+    /// With no `LOCALAPPDATA` the profile is a cache we are free to lose, so
+    /// it goes somewhere every user can write rather than back to wry's
+    /// (unwritable) default.
+    #[test]
+    fn the_webview_profile_falls_back_to_the_temp_directory() {
+        assert_eq!(
+            webview2_data_dir_in(None),
+            std::env::temp_dir().join("Azookey").join("WebView2")
+        );
     }
 }

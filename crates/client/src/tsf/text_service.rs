@@ -173,3 +173,191 @@ impl TextService {
         Ok(self.composition.try_borrow_mut()?)
     }
 }
+
+/// The suppression window is what keeps `update_pos` and `OnLayoutChange`
+/// from feeding each other: moving the candidate window makes the host
+/// report a layout change, which would move the window again. The state
+/// machine is pure and takes its `Instant`, so every boundary below is
+/// exact rather than timing-dependent (issue #37 is about how often hosts
+/// fire `OnLayoutChange`, so the arithmetic that answers it must be pinned).
+#[cfg(test)]
+mod tests {
+    use super::UpdatePosState;
+    use std::time::{Duration, Instant};
+
+    const WINDOW: Duration = UpdatePosState::LAYOUT_CHANGE_SUPPRESSION;
+
+    #[test]
+    fn beginning_an_update_arms_the_suppression_window() {
+        let now = Instant::now();
+        let mut state = UpdatePosState::Idle;
+
+        assert!(state.try_begin_update(now));
+        assert_eq!(
+            state,
+            UpdatePosState::Updating {
+                suppress_layout_until: now + WINDOW
+            }
+        );
+    }
+
+    /// A second `update_pos` entered while the first is still running is
+    /// refused — and must not push the deadline out, or a busy host could
+    /// keep the window armed indefinitely.
+    #[test]
+    fn a_reentrant_begin_is_refused_and_keeps_the_deadline() {
+        let now = Instant::now();
+        let mut state = UpdatePosState::Idle;
+        assert!(state.try_begin_update(now));
+
+        assert!(!state.try_begin_update(now + Duration::from_millis(50)));
+        assert_eq!(
+            state,
+            UpdatePosState::Updating {
+                suppress_layout_until: now + WINDOW
+            }
+        );
+    }
+
+    #[test]
+    fn finishing_inside_the_window_keeps_suppressing_until_the_same_deadline() {
+        let now = Instant::now();
+        let mut state = UpdatePosState::Idle;
+        state.try_begin_update(now);
+
+        state.finish_update(now + Duration::from_millis(50));
+
+        assert_eq!(
+            state,
+            UpdatePosState::SuppressingLayoutChange {
+                until: now + WINDOW
+            },
+            "the deadline is the one armed at begin, not a fresh one"
+        );
+    }
+
+    /// `now <= suppress_layout_until`: an update that finishes exactly on the
+    /// deadline still suppresses.
+    #[test]
+    fn finishing_exactly_on_the_deadline_still_suppresses() {
+        let now = Instant::now();
+        let mut state = UpdatePosState::Idle;
+        state.try_begin_update(now);
+
+        state.finish_update(now + WINDOW);
+
+        assert_eq!(
+            state,
+            UpdatePosState::SuppressingLayoutChange {
+                until: now + WINDOW
+            }
+        );
+    }
+
+    /// An update slower than the window has already outlived any layout
+    /// change it could have caused, so there is nothing left to suppress.
+    #[test]
+    fn finishing_past_the_deadline_goes_straight_to_idle() {
+        let now = Instant::now();
+        let mut state = UpdatePosState::Idle;
+        state.try_begin_update(now);
+
+        state.finish_update(now + WINDOW + Duration::from_millis(1));
+
+        assert_eq!(state, UpdatePosState::Idle);
+    }
+
+    /// `finish_update` is called from the tail of `update_pos`, including the
+    /// paths that never began one (a refused re-entrant call). Those must
+    /// leave the state alone rather than clearing somebody else's window.
+    #[test]
+    fn finishing_without_an_update_in_flight_changes_nothing() {
+        let now = Instant::now();
+
+        let mut idle = UpdatePosState::Idle;
+        idle.finish_update(now);
+        assert_eq!(idle, UpdatePosState::Idle);
+
+        let mut suppressing = UpdatePosState::SuppressingLayoutChange {
+            until: now + WINDOW,
+        };
+        suppressing.finish_update(now);
+        assert_eq!(
+            suppressing,
+            UpdatePosState::SuppressingLayoutChange {
+                until: now + WINDOW
+            }
+        );
+    }
+
+    #[test]
+    fn layout_changes_are_not_skipped_when_idle() {
+        let mut state = UpdatePosState::Idle;
+
+        assert!(!state.should_skip_layout_change(Instant::now()));
+        assert_eq!(state, UpdatePosState::Idle);
+    }
+
+    /// The layout change a host fires from inside our own `SetWindowPos` —
+    /// arriving before `finish_update` — is the innermost turn of the loop.
+    #[test]
+    fn layout_changes_during_an_update_are_skipped() {
+        let now = Instant::now();
+        let mut state = UpdatePosState::Idle;
+        state.try_begin_update(now);
+
+        assert!(state.should_skip_layout_change(now + Duration::from_millis(1)));
+        assert_eq!(
+            state,
+            UpdatePosState::Updating {
+                suppress_layout_until: now + WINDOW
+            },
+            "an in-flight update is not cleared by a layout change"
+        );
+    }
+
+    #[test]
+    fn layout_changes_exactly_on_the_deadline_are_still_skipped() {
+        let now = Instant::now();
+        let mut state = UpdatePosState::SuppressingLayoutChange { until: now };
+
+        assert!(state.should_skip_layout_change(now));
+        assert_eq!(
+            state,
+            UpdatePosState::SuppressingLayoutChange { until: now },
+            "the window has not elapsed yet, so it stays armed"
+        );
+    }
+
+    /// Past the deadline the first layout change is honoured *and* disarms
+    /// the window, so a host that only ever reports position late (the
+    /// `TS_E_NOLAYOUT` then `OnLayoutChange` sequence) is not starved.
+    #[test]
+    fn the_first_layout_change_past_the_deadline_is_honoured_and_rearms_idle() {
+        let now = Instant::now();
+        let mut state = UpdatePosState::SuppressingLayoutChange { until: now };
+
+        assert!(!state.should_skip_layout_change(now + Duration::from_millis(1)));
+        assert_eq!(state, UpdatePosState::Idle);
+        assert!(
+            !state.should_skip_layout_change(now + Duration::from_millis(2)),
+            "and stays honoured afterwards"
+        );
+    }
+
+    /// One full keystroke's worth of traffic, in the order the TIP produces
+    /// it: begin → host fires a layout change → finish → the echo arrives
+    /// and is swallowed → a genuine scroll later gets through.
+    #[test]
+    fn a_full_update_cycle_swallows_only_the_echo() {
+        let now = Instant::now();
+        let mut state = UpdatePosState::default();
+
+        assert!(state.try_begin_update(now));
+        assert!(state.should_skip_layout_change(now + Duration::from_millis(1)));
+        state.finish_update(now + Duration::from_millis(2));
+        assert!(state.should_skip_layout_change(now + Duration::from_millis(3)));
+
+        assert!(!state.should_skip_layout_change(now + WINDOW + Duration::from_millis(1)));
+    }
+}
