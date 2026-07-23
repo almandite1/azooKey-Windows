@@ -92,6 +92,28 @@ impl AzookeyService for MyAzookeyService {
         let session = session_of(&request);
         let surface_offset = request.into_inner().surface_offset;
 
+        // Committing a candidate that spends no kana is something the client
+        // never has reason to ask for — the candidate it just confirmed always
+        // covers at least one kana of the reading. In practice a zero means a
+        // TIP older than the switch of this count from keystrokes to kana: it
+        // sends its number in proto field 1, retired when `surface_offset`
+        // was renumbered to 2, so nothing arrives here. The reading then
+        // survives the commit and the next preview re-converts the whole thing
+        // — on screen the confirmed clause looks duplicated (せいちょうせんりゃく
+        // committed as 政庁 came back as 政庁成長戦略). The skew is silent
+        // otherwise, because an application that was already running keeps the
+        // DLL it loaded even after the new one is registered. A warning, not an
+        // error: the old TIP is still usable, just wrong at this one boundary.
+        if surface_offset <= 0 {
+            tracing::warn!(
+                surface_offset,
+                "ShrinkText spends no kana, so the reading survives the commit. \
+                 This is what a TIP built before the kana-unit shrink looks \
+                 like: re-register the current DLL and restart the application \
+                 that is typing."
+            );
+        }
+
         Ok(Response::new(ShrinkTextResponse {
             composing_text: Some(composed(session, shrink_text(session, surface_offset))),
         }))
