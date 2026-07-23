@@ -22,6 +22,16 @@ fn decoded_text(count: i32, units: &[u16]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Whether a virtual key means "switch the IME on/off".
+///
+/// `VK_KANJI` (0x19) is one of them because Windows translates **Alt+`** on a
+/// 101-key Japanese layout into it, with Alt still held. `process_key` has to
+/// know that before it reaches its Ctrl/Alt chord branch, which would
+/// otherwise discard the chord as a host shortcut (issue #19).
+pub fn is_ime_toggle_key(key_code: usize) -> bool {
+    matches!(key_code, 0xF3 | 0xF4 | 0x19)
+}
+
 #[derive(Debug)]
 pub enum UserAction {
     /// The text this keystroke produced. A `String` rather than a `char`
@@ -102,7 +112,9 @@ impl TryFrom<usize> for UserAction {
             0x78 => UserAction::Function(Function::Nine), // VK_F9
             0x79 => UserAction::Function(Function::Ten), // VK_F10
 
-            0xF3 | 0xF4 => UserAction::ToggleInputMode, // Zenkaku/Hankaku
+            // Zenkaku/Hankaku, and VK_KANJI — which is what Windows
+            // translates Alt+` into on a 101-key Japanese layout
+            0xF3 | 0xF4 | 0x19 => UserAction::ToggleInputMode,
 
             _ => {
                 let key_state = {
@@ -219,6 +231,33 @@ mod tests {
     #[test]
     fn a_count_past_the_buffer_is_refused() {
         assert_eq!(decoded_text(9, &[0x0061; 4]), None);
+    }
+
+    /// VK_KANJI is an IME on/off key, not a character key: Windows
+    /// translates Alt+` on a 101-key Japanese layout into it. Decoding it
+    /// through the ToUnicode branch instead made it Unknown, and the chord
+    /// branch in process_key then discarded it (issue #19).
+    #[test]
+    fn the_ime_toggle_keys_include_vk_kanji() {
+        for vk in [0xF3usize, 0xF4, 0x19] {
+            assert!(is_ime_toggle_key(vk), "0x{vk:02X} switches the IME");
+            assert!(
+                matches!(
+                    UserAction::try_from(vk).unwrap(),
+                    UserAction::ToggleInputMode
+                ),
+                "0x{vk:02X} must decode to ToggleInputMode"
+            );
+        }
+    }
+
+    /// …and ordinary keys must not be mistaken for one, or the chord branch
+    /// would be bypassed for every host shortcut.
+    #[test]
+    fn ordinary_keys_are_not_ime_toggle_keys() {
+        for vk in [0x41usize, 0x20, 0x0D, 0xC0, 0x1B] {
+            assert!(!is_ime_toggle_key(vk), "0x{vk:02X} is not an on/off key");
+        }
     }
 
     /// The host editing keys must decode to EditingKey — falling through to
