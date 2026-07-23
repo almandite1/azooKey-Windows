@@ -16,17 +16,9 @@ import ffi
 
 @_cdecl("LoadConfig")
 @MainActor public func load_config() {
-    guard let settings = loadSettingsFile() else { return }
-    // only override keys that are present, matching the previous
-    // behavior: a partial file keeps the current values
-    if let zenzai = settings.zenzai {
-        if let enable = zenzai.enable {
-            config.zenzaiEnabled = enable
-        }
-        if let profile = zenzai.profile {
-            config.zenzaiProfile = profile
-        }
-    }
+    // only the keys that are present are overridden, so a partial file keeps
+    // the current values — see applySettings
+    applySettings(loadSettingsFile())
 }
 
 @_cdecl("Initialize")
