@@ -124,18 +124,17 @@ pub struct TextService {
     /// the sink cookies, B14). Also read on the key path — a reserved key
     /// arrives through `OnPreservedKey`, so the raw VK must not toggle again.
     pub preserved_keys: Vec<(GUID, TF_PRESERVEDKEY)>,
-    /// When `OnPreservedKey` last toggled the mode. The double-delivery guard
-    /// (issue #19): a host that sends the raw VK *as well as* dispatching the
-    /// preserved key would otherwise toggle twice for one press.
+    /// When the input mode was last toggled, by whichever path. The
+    /// double-delivery guard (issue #19): one physical press of the on/off
+    /// key can reach the TIP more than once, and each delivery would flip
+    /// the mode again — two flips cancel out and the key looks dead.
     ///
-    /// Deliberately NOT "was this key reserved?" — that was the first attempt
-    /// and it is unsound. TSF accepts a reservation it then never dispatches
-    /// (measured with Alt+VK_KANJI), and suppressing the raw VK on the
-    /// strength of the acceptance dropped the keystroke entirely. The arrival
-    /// of a raw VK is itself evidence that TSF did NOT route it as a
-    /// preserved key, so only a toggle we just performed can justify
-    /// ignoring one.
-    pub last_preserved_toggle: Option<Instant>,
+    /// Measured on a 101-key layout: Alt+` arrives at `OnKeyDown` **twice**,
+    /// 5-7ms apart, for a single press. (`OnPreservedKey` never fires there
+    /// at all, even though `IsPreservedKey` answers true for that very
+    /// chord — which is why this is keyed off the toggle itself rather than
+    /// off which path delivered the key.)
+    pub last_mode_toggle: Option<Instant>,
     /// Set while we are writing our own mode into the compartments, so the
     /// `OnChange` that TSF dispatches synchronously from inside `SetValue`
     /// does not bounce straight back into another write.

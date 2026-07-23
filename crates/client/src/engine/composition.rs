@@ -340,12 +340,12 @@ impl TextServiceFactory_Impl {
         //
         // Reaching this at all means TSF did NOT route the key through
         // OnPreservedKey — a reserved key is not also delivered raw — so the
-        // press is ours to handle. The only thing that must not be handled
-        // twice is a host that delivers both, which the recency check
-        // catches (issue #19).
+        // press is ours to handle. What must NOT happen is handling one
+        // press twice: this host delivers Alt+` to OnKeyDown twice, 5-7ms
+        // apart, and the second flip cancelled the first (issue #19).
         if is_ime_toggle_key(wparam.0) {
-            if self.raw_toggle_is_duplicate()? {
-                tracing::debug!("ignoring the raw VK echo of a preserved-key toggle");
+            if self.toggle_is_duplicate()? {
+                tracing::debug!("ignoring a second delivery of one on/off press");
                 return Ok(None);
             }
             let ctx = self.keystroke_context()?;
@@ -649,6 +649,13 @@ impl TextServiceFactory_Impl {
         ipc_service: &mut IPCService,
         mode: &InputMode,
     ) -> Result<()> {
+        // Stamped here, where the mode actually changes, so every path that
+        // toggles feeds the double-delivery guard — the raw VK, the
+        // preserved key, and the langbar alike (issue #19).
+        if let Err(error) = self.note_mode_toggle() {
+            tracing::warn!("could not record the mode toggle time: {error:?}");
+        }
+
         self.start_composition()?;
         self.update_pos()?;
         self.end_composition()?;
