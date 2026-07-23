@@ -90,3 +90,108 @@ impl TextServiceFactory_Impl {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use windows::Win32::UI::TextServices::ITfTextInputProcessor;
+
+    use crate::tsf::test_support::{
+        EditSessionBehavior, FakeContext, FakeDocumentMgr, factory_of, factory_with_context,
+        fake_context_of, global_state_lock,
+    };
+
+    /// Advises the layout sink on `context`, the way `OnSetFocus` and
+    /// `Activate` both do — through the document manager the host handed us.
+    fn advise_on(
+        tip: &ITfTextInputProcessor,
+        context: &windows::Win32::UI::TextServices::ITfContext,
+    ) {
+        let factory = factory_of(tip);
+        let mut text_service = factory.borrow_mut().unwrap();
+        factory
+            .advise_text_layout_sink(&mut text_service, FakeDocumentMgr::new(context.clone()))
+            .expect("advise must succeed against a cooperative host");
+    }
+
+    /// Focus can move to a document we are already advised on (B14): TSF
+    /// fires `OnSetFocus` for switches within an application too. Advising
+    /// again without unadvising first would leak the previous cookie — the
+    /// host keeps calling a sink nobody will ever take down, and our own
+    /// bookkeeping only remembers the newest one.
+    #[test]
+    fn advising_twice_unadvises_the_first_cookie_first() {
+        let _guard = global_state_lock();
+        let context = FakeContext::new(EditSessionBehavior::RunSync);
+        let tip = factory_with_context(context.clone());
+
+        advise_on(&tip, &context);
+        let first = unsafe { fake_context_of(&context) }.sink_advises();
+        assert_eq!(first.len(), 1);
+
+        advise_on(&tip, &context);
+
+        let fake = unsafe { fake_context_of(&context) };
+        assert_eq!(fake.sink_advises().len(), 2, "the new sink is advised");
+        assert_eq!(
+            fake.sink_unadvises(),
+            first,
+            "and the old cookie was handed back, exactly once"
+        );
+    }
+
+    /// The unadvise is driven by `layout_context`, so it must be cleared when
+    /// it is consumed: a second unadvise would otherwise hand the host a
+    /// cookie it has already released.
+    #[test]
+    fn unadvising_twice_only_talks_to_the_host_once() {
+        let _guard = global_state_lock();
+        let context = FakeContext::new(EditSessionBehavior::RunSync);
+        let tip = factory_with_context(context.clone());
+        advise_on(&tip, &context);
+
+        let factory = factory_of(&tip);
+        {
+            let mut text_service = factory.borrow_mut().unwrap();
+            factory
+                .unadvise_text_layout_sink(&mut text_service)
+                .expect("the first unadvise must succeed");
+            assert!(text_service.layout_context.is_none());
+            factory
+                .unadvise_text_layout_sink(&mut text_service)
+                .expect("a second unadvise is a no-op, not an error");
+        }
+
+        assert_eq!(
+            unsafe { fake_context_of(&context) }.sink_unadvises().len(),
+            1
+        );
+    }
+
+    /// After a clean unadvise the next advise starts over — no stale context
+    /// to release, and the host sees one advise with nothing before it.
+    #[test]
+    fn readvising_after_an_unadvise_does_not_release_anything() {
+        let _guard = global_state_lock();
+        let context = FakeContext::new(EditSessionBehavior::RunSync);
+        let tip = factory_with_context(context.clone());
+        advise_on(&tip, &context);
+        {
+            let factory = factory_of(&tip);
+            let mut text_service = factory.borrow_mut().unwrap();
+            factory
+                .unadvise_text_layout_sink(&mut text_service)
+                .unwrap();
+        }
+
+        advise_on(&tip, &context);
+
+        let fake = unsafe { fake_context_of(&context) };
+        assert_eq!(fake.sink_advises().len(), 2);
+        assert_eq!(
+            fake.sink_unadvises().len(),
+            1,
+            "only the explicit unadvise, not one from the re-advise"
+        );
+    }
+}

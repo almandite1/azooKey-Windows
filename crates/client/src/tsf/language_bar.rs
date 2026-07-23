@@ -53,6 +53,22 @@ impl TextServiceFactory_Impl {
     }
 }
 
+/// The icon resource id for a mode under the current theme. `light_theme` is
+/// what `get_theme` reports, and it picks the icon that CONTRASTS with the
+/// task bar: the black glyphs (`res/res.h`: `IDI_MODE_*_BLACK`, 102/103) are
+/// for a light theme, the white ones (104/105) for a dark one. Split out of
+/// `GetIcon` so the table can be tested without a module handle and a live
+/// `LoadImageW`; getting it wrong shows an invisible or simply wrong mode
+/// indicator.
+fn langbar_icon_id(input_mode: &InputMode, light_theme: bool) -> u32 {
+    match (input_mode, light_theme) {
+        (InputMode::Kana, true) => 102,
+        (InputMode::Latin, true) => 103,
+        (InputMode::Kana, false) => 104,
+        (InputMode::Latin, false) => 105,
+    }
+}
+
 const INFO: TF_LANGBARITEMINFO = TF_LANGBARITEMINFO {
     clsidService: GUID_TEXT_SERVICE,
     guidItem: GUID_LBI_INPUTMODE,
@@ -129,22 +145,7 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
         let input_mode = self.borrow()?.input_mode.clone();
         let theme = get_theme()?;
 
-        let icon_id = match input_mode {
-            InputMode::Kana => {
-                if theme {
-                    102
-                } else {
-                    104
-                }
-            }
-            InputMode::Latin => {
-                if theme {
-                    103
-                } else {
-                    105
-                }
-            }
-        };
+        let icon_id = langbar_icon_id(&input_mode, theme);
 
         unsafe {
             let handle = LoadImageW(
@@ -204,5 +205,146 @@ impl ITfSource_Impl for TextServiceFactory_Impl {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use windows::Win32::Foundation::E_INVALIDARG;
+    use windows::Win32::System::Ole::CONNECT_E_CANNOTCONNECT;
+    use windows::Win32::UI::TextServices::{
+        ITfLangBarItem, ITfLangBarItemSink, ITfSource, ITfTextInputProcessor, TF_LANGBARITEMINFO,
+    };
+    use windows::core::{IUnknown, Interface as _};
+
+    use super::{INFO, langbar_icon_id};
+    use crate::engine::input_mode::InputMode;
+    use crate::globals::TEXTSERVICE_LANGBARITEMSINK_COOKIE;
+    use crate::tsf::test_support::{EditSessionBehavior, factory_with_fake_context};
+
+    fn langbar_source() -> (ITfTextInputProcessor, ITfSource) {
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let source = tip.cast::<ITfSource>().unwrap();
+        (tip, source)
+    }
+
+    /// The host connects its language-bar sink through the generic
+    /// `ITfSource`, so the IID is the only thing telling us what it wants.
+    #[test]
+    fn the_langbar_sink_iid_is_accepted() {
+        let (tip, source) = langbar_source();
+        let punk: IUnknown = tip.cast().unwrap();
+
+        let cookie = unsafe { source.AdviseSink(&ITfLangBarItemSink::IID, &punk) }.unwrap();
+
+        assert_eq!(cookie, TEXTSERVICE_LANGBARITEMSINK_COOKIE);
+    }
+
+    /// Anything else must be refused rather than silently handed the langbar
+    /// cookie — a host that advised, say, a text-edit sink would then be told
+    /// it had one and never hear from us.
+    #[test]
+    fn another_sinks_iid_is_refused() {
+        let (tip, source) = langbar_source();
+        let punk: IUnknown = tip.cast().unwrap();
+
+        let result = unsafe { source.AdviseSink(&ITfLangBarItem::IID, &punk) };
+
+        assert_eq!(result.unwrap_err().code(), E_INVALIDARG);
+    }
+
+    /// A raw deref in a COM callback is a segfault, and `catch_unwind` cannot
+    /// turn that into an HRESULT — so the null check has to be in front of it.
+    #[test]
+    fn a_null_iid_is_refused_instead_of_dereferenced() {
+        let (tip, source) = langbar_source();
+        let punk: IUnknown = tip.cast().unwrap();
+
+        let result = unsafe { source.AdviseSink(std::ptr::null(), &punk) };
+
+        assert_eq!(result.unwrap_err().code(), E_INVALIDARG);
+    }
+
+    #[test]
+    fn a_missing_sink_object_is_refused() {
+        let (_tip, source) = langbar_source();
+
+        let result = unsafe { source.AdviseSink(&ITfLangBarItemSink::IID, None) };
+
+        assert_eq!(result.unwrap_err().code(), E_INVALIDARG);
+    }
+
+    #[test]
+    fn the_cookie_we_handed_out_can_be_unadvised() {
+        let (_tip, source) = langbar_source();
+
+        unsafe { source.UnadviseSink(TEXTSERVICE_LANGBARITEMSINK_COOKIE) }.unwrap();
+    }
+
+    /// The one cookie we ever hand out is the only one we accept back;
+    /// anything else is the host confusing us with another sink.
+    #[test]
+    fn an_unknown_cookie_cannot_be_unadvised() {
+        let (_tip, source) = langbar_source();
+
+        let result = unsafe { source.UnadviseSink(TEXTSERVICE_LANGBARITEMSINK_COOKIE + 1) };
+
+        assert_eq!(result.unwrap_err().code(), CONNECT_E_CANNOTCONNECT);
+    }
+
+    /// The whole theme × mode table, which is otherwise four magic numbers
+    /// three call-levels deep. Black glyphs (102/103) go on the light theme.
+    #[test]
+    fn the_icon_matches_the_mode_and_contrasts_with_the_theme() {
+        assert_eq!(langbar_icon_id(&InputMode::Kana, true), 102);
+        assert_eq!(langbar_icon_id(&InputMode::Latin, true), 103);
+        assert_eq!(langbar_icon_id(&InputMode::Kana, false), 104);
+        assert_eq!(langbar_icon_id(&InputMode::Latin, false), 105);
+    }
+
+    /// Every combination gets its own icon: a duplicated id is the mistake
+    /// this table invites, and it would make the two modes indistinguishable.
+    #[test]
+    fn every_mode_and_theme_pair_has_its_own_icon() {
+        let ids = [
+            langbar_icon_id(&InputMode::Kana, true),
+            langbar_icon_id(&InputMode::Latin, true),
+            langbar_icon_id(&InputMode::Kana, false),
+            langbar_icon_id(&InputMode::Latin, false),
+        ];
+
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "duplicate icon id in {ids:?}");
+        // 101 is the application icon, not a mode icon
+        assert!(ids.iter().all(|id| *id > 101));
+    }
+
+    /// `GetInfo` writes through a raw pointer the host owns; a null one is a
+    /// hostile (or merely broken) host, not a crash.
+    #[test]
+    fn get_info_fills_the_hosts_struct_and_rejects_a_null_one() {
+        let (tip, _source) = langbar_source();
+        let item = tip.cast::<ITfLangBarItem>().unwrap();
+
+        let mut info = TF_LANGBARITEMINFO::default();
+        unsafe { item.GetInfo(&mut info) }.unwrap();
+        assert_eq!(info.guidItem, INFO.guidItem);
+        assert_eq!(info.clsidService, INFO.clsidService);
+
+        let result = unsafe { item.GetInfo(std::ptr::null_mut()) };
+        assert_eq!(result.unwrap_err().code(), E_INVALIDARG);
+    }
+
+    /// Unused, but part of the interface the host may call at any time.
+    #[test]
+    fn the_item_reports_no_status_and_no_tooltip() {
+        let (tip, _source) = langbar_source();
+        let item = tip.cast::<ITfLangBarItem>().unwrap();
+
+        assert_eq!(unsafe { item.GetStatus() }.unwrap(), 0);
+        assert!(unsafe { item.GetTooltipString() }.unwrap().is_empty());
     }
 }
