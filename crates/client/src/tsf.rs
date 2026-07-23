@@ -4,6 +4,7 @@ pub(super) mod edit_session;
 pub(super) mod factory;
 pub(super) mod key_event_sink;
 pub(super) mod language_bar;
+pub(super) mod preserved_key;
 pub(super) mod surrounded_text;
 #[cfg(test)]
 pub(super) mod test_support;

@@ -325,6 +325,16 @@ impl TextServiceFactory_Impl {
             return Ok(None);
         }
 
+        // A key TSF reserved for us has already arrived through
+        // OnPreservedKey. Some hosts deliver the raw VK as well, and acting
+        // on both toggles the mode twice. Keyed off the per-activation
+        // registry rather than a fixed VK list, so a host where the
+        // reservation FAILED keeps the raw-VK toggle as its safety net
+        // (issue #19).
+        if self.is_reserved_keystroke(wparam.0)? {
+            return Ok(None);
+        }
+
         // A Ctrl or Alt chord is the host's shortcut. During a composition
         // the TIP owns the keyboard (MS-IME convention): the chord is eaten
         // and cancels the composition, and the next press — or the chord's
@@ -343,20 +353,44 @@ impl TextServiceFactory_Impl {
                 .map(|(next_state, actions)| (actions, next_state)));
         }
 
-        let ctx = {
-            let text_service = self.borrow()?;
-            let composition = text_service.borrow_composition()?;
-            KeystrokeContext {
-                state: composition.state.clone(),
-                mode: text_service.input_mode.clone(),
-                reading_chars: composition.raw_hiragana.chars().count(),
-                suffix_is_empty: composition.suffix.is_empty(),
-            }
-        };
-
+        let ctx = self.keystroke_context()?;
         let action = UserAction::try_from(wparam.0)?;
 
         Ok(transition(&ctx, action).map(|(next_state, actions)| (actions, next_state)))
+    }
+
+    /// The state the pure transition table decides against.
+    fn keystroke_context(&self) -> Result<KeystrokeContext> {
+        let text_service = self.borrow()?;
+        let composition = text_service.borrow_composition()?;
+        Ok(KeystrokeContext {
+            state: composition.state.clone(),
+            mode: text_service.input_mode.clone(),
+            reading_chars: composition.raw_hiragana.chars().count(),
+            suffix_is_empty: composition.suffix.is_empty(),
+        })
+    }
+
+    /// Flips あ/A from somewhere other than a raw key event — today that is
+    /// `OnPreservedKey`, where TSF delivers the reserved on/off keys.
+    ///
+    /// Runs the *same* transition the raw VK would, so a composition in
+    /// flight is ended exactly the way Zenkaku/Hankaku has always ended it
+    /// rather than being abandoned open.
+    #[tracing::instrument(skip(self, context))]
+    pub fn toggle_input_mode(&self, context: Option<&ITfContext>) -> Result<()> {
+        // The preserved-key callback carries the context, and the edit
+        // sessions below need it; without one there is nothing to compose in.
+        if let Some(context) = context {
+            self.borrow_mut()?.context = Some(context.clone());
+        }
+
+        let ctx = self.keystroke_context()?;
+        let Some((next_state, actions)) = transition(&ctx, UserAction::ToggleInputMode) else {
+            return Ok(());
+        };
+
+        self.handle_action(&actions, next_state)
     }
 
     /// Answers OnTestKeyDown. A pure query, as the ITfKeyEventSink contract

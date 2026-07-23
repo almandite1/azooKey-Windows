@@ -1075,6 +1075,10 @@ pub struct ThreadMgrLog {
     pub unadvise_cookies: RefCell<Vec<u32>>,
     pub langbar_adds: Cell<u32>,
     pub langbar_removes: Cell<u32>,
+    /// `PreserveKey`/`UnpreserveKey` traffic, in call order — the balance a
+    /// test asserts on (issue #19).
+    pub preserved_keys: RefCell<Vec<(GUID, TF_PRESERVEDKEY)>>,
+    pub unpreserved_keys: RefCell<Vec<(GUID, TF_PRESERVEDKEY)>>,
     /// Whether the TIP could take a borrow of its own `TextService` during
     /// the synchronous `OnSetFocus` that `AdviseKeyEventSink` dispatched.
     /// `None` when the fake never dispatched one (the default host).
@@ -1114,39 +1118,44 @@ impl ThreadMgrLog {
 )]
 pub struct FakeThreadMgr {
     log: Rc<ThreadMgrLog>,
+    config: FakeThreadMgrConfig,
+}
+
+/// How a [`FakeThreadMgr`] misbehaves. A struct rather than a growing list of
+/// `build` parameters: every constructor below overrides one or two fields and
+/// takes the defaults (a cooperative host) for the rest.
+#[derive(Default)]
+pub struct FakeThreadMgrConfig {
+    /// When set, `GetFocus` serves a [`FakeDocumentMgr`] over this context so
+    /// the text-layout-sink path runs; otherwise it reports no focus.
     focus_context: Option<ITfContext>,
     /// When true, `AddItem` fails — models a host where the last Activate
     /// step (adding the language-bar item) fails, so a test can prove the
-    /// TIP unwinds the sinks it already advised (Activate rollback).
+    /// TIP keeps the key sink it advised earlier.
     fail_add_item: bool,
-    compartments: Rc<CompartmentLog>,
-    ui_elements: Rc<UiElementLog>,
+    /// When true, `PreserveKey` fails — a host that will not hand over the
+    /// IME on/off keys, where the raw-VK path must still work (issue #19).
+    fail_preserve_key: bool,
     /// When true, `AdviseKeyEventSink` calls the sink's `OnSetFocus(TRUE)`
     /// back synchronously, before returning — which is what TSF does when the
     /// thread already owns the focus at Activate time (issue #62).
     focus_on_advise: bool,
+    compartments: Rc<CompartmentLog>,
+    ui_elements: Rc<UiElementLog>,
 }
 
 impl FakeThreadMgr {
     pub fn new(log: Rc<ThreadMgrLog>) -> ITfThreadMgr {
-        Self::build(
-            log,
-            None,
-            false,
-            Default::default(),
-            Default::default(),
-            false,
-        )
+        Self::build(log, Default::default())
     }
 
     pub fn with_focus(log: Rc<ThreadMgrLog>, focus_context: ITfContext) -> ITfThreadMgr {
         Self::build(
             log,
-            Some(focus_context),
-            false,
-            Default::default(),
-            Default::default(),
-            false,
+            FakeThreadMgrConfig {
+                focus_context: Some(focus_context),
+                ..Default::default()
+            },
         )
     }
 
@@ -1158,7 +1167,14 @@ impl FakeThreadMgr {
         log: Rc<ThreadMgrLog>,
         compartments: Rc<CompartmentLog>,
     ) -> ITfThreadMgr {
-        Self::build(log, None, false, compartments, Default::default(), true)
+        Self::build(
+            log,
+            FakeThreadMgrConfig {
+                focus_on_advise: true,
+                compartments,
+                ..Default::default()
+            },
+        )
     }
 
     /// A thread manager whose `AddItem` (the final Activate step) fails, so
@@ -1167,11 +1183,22 @@ impl FakeThreadMgr {
     pub fn with_failing_langbar(log: Rc<ThreadMgrLog>) -> ITfThreadMgr {
         Self::build(
             log,
-            None,
-            true,
-            Default::default(),
-            Default::default(),
-            false,
+            FakeThreadMgrConfig {
+                fail_add_item: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A thread manager that refuses every `PreserveKey`, so a test can prove
+    /// the raw-VK toggle survives as the fallback (issue #19).
+    pub fn with_failing_preserve_key(log: Rc<ThreadMgrLog>) -> ITfThreadMgr {
+        Self::build(
+            log,
+            FakeThreadMgrConfig {
+                fail_preserve_key: true,
+                ..Default::default()
+            },
         )
     }
 
@@ -1181,33 +1208,30 @@ impl FakeThreadMgr {
         log: Rc<ThreadMgrLog>,
         compartments: Rc<CompartmentLog>,
     ) -> ITfThreadMgr {
-        Self::build(log, None, false, compartments, Default::default(), false)
+        Self::build(
+            log,
+            FakeThreadMgrConfig {
+                compartments,
+                ..Default::default()
+            },
+        )
     }
 
     /// A thread manager whose `ITfUIElementMgr` the test controls — set
     /// `show` on `ui_elements` to model a UILess host that draws the
     /// candidates itself.
     pub fn with_ui_elements(log: Rc<ThreadMgrLog>, ui_elements: Rc<UiElementLog>) -> ITfThreadMgr {
-        Self::build(log, None, false, Default::default(), ui_elements, false)
+        Self::build(
+            log,
+            FakeThreadMgrConfig {
+                ui_elements,
+                ..Default::default()
+            },
+        )
     }
 
-    fn build(
-        log: Rc<ThreadMgrLog>,
-        focus_context: Option<ITfContext>,
-        fail_add_item: bool,
-        compartments: Rc<CompartmentLog>,
-        ui_elements: Rc<UiElementLog>,
-        focus_on_advise: bool,
-    ) -> ITfThreadMgr {
-        FakeThreadMgr {
-            log,
-            focus_context,
-            fail_add_item,
-            compartments,
-            ui_elements,
-            focus_on_advise,
-        }
-        .into()
+    fn build(log: Rc<ThreadMgrLog>, config: FakeThreadMgrConfig) -> ITfThreadMgr {
+        FakeThreadMgr { log, config }.into()
     }
 }
 
@@ -1219,7 +1243,7 @@ impl ITfCompartmentMgr_Impl for FakeThreadMgr_Impl {
 
         Ok(FakeCompartment {
             guid: *guid,
-            log: self.compartments.clone(),
+            log: self.config.compartments.clone(),
         }
         .into())
     }
@@ -1240,7 +1264,7 @@ impl ITfUIElementMgr_Impl for FakeThreadMgr_Impl {
         pbshow: *mut BOOL,
         pdwuielementid: *mut u32,
     ) -> WinResult<()> {
-        let log = &self.ui_elements;
+        let log = &self.config.ui_elements;
         log.begin_calls.set(log.begin_calls.get() + 1);
 
         let id = log.next_id.get() + 1;
@@ -1259,13 +1283,13 @@ impl ITfUIElementMgr_Impl for FakeThreadMgr_Impl {
     }
 
     fn UpdateUIElement(&self, _dwuielementid: u32) -> WinResult<()> {
-        let log = &self.ui_elements;
+        let log = &self.config.ui_elements;
         log.update_calls.set(log.update_calls.get() + 1);
         Ok(())
     }
 
     fn EndUIElement(&self, dwuielementid: u32) -> WinResult<()> {
-        let log = &self.ui_elements;
+        let log = &self.config.ui_elements;
         log.end_calls.set(log.end_calls.get() + 1);
         log.ended_ids.borrow_mut().push(dwuielementid);
         Ok(())
@@ -1294,7 +1318,7 @@ impl ITfThreadMgr_Impl for FakeThreadMgr_Impl {
         Err(E_NOTIMPL.into())
     }
     fn GetFocus(&self) -> WinResult<ITfDocumentMgr> {
-        match &self.focus_context {
+        match &self.config.focus_context {
             Some(context) => Ok(FakeDocumentMgr::new(context.clone())),
             // No focus: the TIP's `if let Ok(doc_mgr)` skips advising the
             // text layout sink, exactly like a host with no focused document.
@@ -1334,7 +1358,7 @@ impl ITfKeystrokeMgr_Impl for FakeThreadMgr_Impl {
     ) -> WinResult<()> {
         self.log.key_sink_advises.borrow_mut().push(psink.is_some());
 
-        if let (true, Some(sink)) = (self.focus_on_advise, psink.as_ref()) {
+        if let (true, Some(sink)) = (self.config.focus_on_advise, psink.as_ref()) {
             // TSF hands the focus to a freshly advised sink from *inside*
             // AdviseKeyEventSink. Record whether the TIP's own RefCell is
             // free at that instant before letting the callback run: that is
@@ -1391,19 +1415,28 @@ impl ITfKeystrokeMgr_Impl for FakeThreadMgr_Impl {
     fn PreserveKey(
         &self,
         _tid: u32,
-        _rguid: *const GUID,
-        _prekey: *const TF_PRESERVEDKEY,
+        rguid: *const GUID,
+        prekey: *const TF_PRESERVEDKEY,
         _pchdesc: &PCWSTR,
         _cchdesc: u32,
     ) -> WinResult<()> {
-        Err(E_NOTIMPL.into())
+        if self.config.fail_preserve_key {
+            return Err(E_FAIL.into());
+        }
+        let (Some(guid), Some(key)) = (unsafe { rguid.as_ref() }, unsafe { prekey.as_ref() })
+        else {
+            return Err(windows::Win32::Foundation::E_INVALIDARG.into());
+        };
+        self.log.preserved_keys.borrow_mut().push((*guid, *key));
+        Ok(())
     }
-    fn UnpreserveKey(
-        &self,
-        _rguid: *const GUID,
-        _pprekey: *const TF_PRESERVEDKEY,
-    ) -> WinResult<()> {
-        Err(E_NOTIMPL.into())
+    fn UnpreserveKey(&self, rguid: *const GUID, pprekey: *const TF_PRESERVEDKEY) -> WinResult<()> {
+        let (Some(guid), Some(key)) = (unsafe { rguid.as_ref() }, unsafe { pprekey.as_ref() })
+        else {
+            return Err(windows::Win32::Foundation::E_INVALIDARG.into());
+        };
+        self.log.unpreserved_keys.borrow_mut().push((*guid, *key));
+        Ok(())
     }
     fn SetPreservedKeyDescription(
         &self,
@@ -1454,7 +1487,7 @@ impl ITfLangBarItemMgr_Impl for FakeThreadMgr_Impl {
     }
     fn AddItem(&self, _punk: windows_core::Ref<'_, ITfLangBarItem>) -> WinResult<()> {
         self.log.langbar_adds.set(self.log.langbar_adds.get() + 1);
-        if self.fail_add_item {
+        if self.config.fail_add_item {
             return Err(E_FAIL.into());
         }
         Ok(())

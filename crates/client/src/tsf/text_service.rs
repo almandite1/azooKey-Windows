@@ -5,7 +5,7 @@ use std::{
 };
 
 use windows::{
-    Win32::UI::TextServices::{ITfCompartment, ITfContext, ITfThreadMgr},
+    Win32::UI::TextServices::{ITfCompartment, ITfContext, ITfThreadMgr, TF_PRESERVEDKEY},
     core::{GUID, Interface},
 };
 
@@ -118,6 +118,12 @@ pub struct TextService {
     /// several compartments — and `UnadviseSink` must be called on the very
     /// object that `AdviseSink` was called on.
     pub compartment_sinks: Vec<(ITfCompartment, u32)>,
+    /// The keys this activation reserved with `ITfKeystrokeMgr::PreserveKey`,
+    /// and only those: Deactivate must unpreserve exactly what Activate got,
+    /// and a host that refused one leaves it out (same per-instance rule as
+    /// the sink cookies, B14). Also read on the key path — a reserved key
+    /// arrives through `OnPreservedKey`, so the raw VK must not toggle again.
+    pub preserved_keys: Vec<(GUID, TF_PRESERVEDKEY)>,
     /// Set while we are writing our own mode into the compartments, so the
     /// `OnChange` that TSF dispatches synchronously from inside `SetValue`
     /// does not bounce straight back into another write.
