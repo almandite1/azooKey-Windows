@@ -1075,6 +1075,14 @@ pub struct ThreadMgrLog {
     pub unadvise_cookies: RefCell<Vec<u32>>,
     pub langbar_adds: Cell<u32>,
     pub langbar_removes: Cell<u32>,
+    /// Whether the TIP could take a borrow of its own `TextService` during
+    /// the synchronous `OnSetFocus` that `AdviseKeyEventSink` dispatched.
+    /// `None` when the fake never dispatched one (the default host).
+    ///
+    /// This is the invariant issue #62 is about: real TSF calls back into the
+    /// sink from *inside* `AdviseKeyEventSink`, so Activate must hold no
+    /// borrow at that point.
+    pub borrow_ok_in_sync_focus: Cell<Option<bool>>,
     next_cookie: Cell<u32>,
 }
 
@@ -1113,11 +1121,22 @@ pub struct FakeThreadMgr {
     fail_add_item: bool,
     compartments: Rc<CompartmentLog>,
     ui_elements: Rc<UiElementLog>,
+    /// When true, `AdviseKeyEventSink` calls the sink's `OnSetFocus(TRUE)`
+    /// back synchronously, before returning — which is what TSF does when the
+    /// thread already owns the focus at Activate time (issue #62).
+    focus_on_advise: bool,
 }
 
 impl FakeThreadMgr {
     pub fn new(log: Rc<ThreadMgrLog>) -> ITfThreadMgr {
-        Self::build(log, None, false, Default::default(), Default::default())
+        Self::build(
+            log,
+            None,
+            false,
+            Default::default(),
+            Default::default(),
+            false,
+        )
     }
 
     pub fn with_focus(log: Rc<ThreadMgrLog>, focus_context: ITfContext) -> ITfThreadMgr {
@@ -1127,14 +1146,33 @@ impl FakeThreadMgr {
             false,
             Default::default(),
             Default::default(),
+            false,
         )
+    }
+
+    /// A thread manager that re-enters the TIP the way TSF does: the sink's
+    /// `OnSetFocus(TRUE)` fires synchronously from inside
+    /// `AdviseKeyEventSink`. Shares `compartments` so the callback has a mode
+    /// to read.
+    pub fn with_sync_focus_on_advise(
+        log: Rc<ThreadMgrLog>,
+        compartments: Rc<CompartmentLog>,
+    ) -> ITfThreadMgr {
+        Self::build(log, None, false, compartments, Default::default(), true)
     }
 
     /// A thread manager whose `AddItem` (the final Activate step) fails, so
     /// the TIP's Activate must roll back the key-event and thread-manager
     /// sinks it advised earlier.
     pub fn with_failing_langbar(log: Rc<ThreadMgrLog>) -> ITfThreadMgr {
-        Self::build(log, None, true, Default::default(), Default::default())
+        Self::build(
+            log,
+            None,
+            true,
+            Default::default(),
+            Default::default(),
+            false,
+        )
     }
 
     /// A thread manager sharing `compartments`, so a test can seed the
@@ -1143,14 +1181,14 @@ impl FakeThreadMgr {
         log: Rc<ThreadMgrLog>,
         compartments: Rc<CompartmentLog>,
     ) -> ITfThreadMgr {
-        Self::build(log, None, false, compartments, Default::default())
+        Self::build(log, None, false, compartments, Default::default(), false)
     }
 
     /// A thread manager whose `ITfUIElementMgr` the test controls — set
     /// `show` on `ui_elements` to model a UILess host that draws the
     /// candidates itself.
     pub fn with_ui_elements(log: Rc<ThreadMgrLog>, ui_elements: Rc<UiElementLog>) -> ITfThreadMgr {
-        Self::build(log, None, false, Default::default(), ui_elements)
+        Self::build(log, None, false, Default::default(), ui_elements, false)
     }
 
     fn build(
@@ -1159,6 +1197,7 @@ impl FakeThreadMgr {
         fail_add_item: bool,
         compartments: Rc<CompartmentLog>,
         ui_elements: Rc<UiElementLog>,
+        focus_on_advise: bool,
     ) -> ITfThreadMgr {
         FakeThreadMgr {
             log,
@@ -1166,6 +1205,7 @@ impl FakeThreadMgr {
             fail_add_item,
             compartments,
             ui_elements,
+            focus_on_advise,
         }
         .into()
     }
@@ -1293,6 +1333,24 @@ impl ITfKeystrokeMgr_Impl for FakeThreadMgr_Impl {
         _fforeground: BOOL,
     ) -> WinResult<()> {
         self.log.key_sink_advises.borrow_mut().push(psink.is_some());
+
+        if let (true, Some(sink)) = (self.focus_on_advise, psink.as_ref()) {
+            // TSF hands the focus to a freshly advised sink from *inside*
+            // AdviseKeyEventSink. Record whether the TIP's own RefCell is
+            // free at that instant before letting the callback run: that is
+            // the invariant, and OnSetFocus itself swallows the failure into
+            // a tracing::warn! (advisory path), so nothing else would show it
+            // (issue #62).
+            if let Ok(factory) =
+                windows::core::ComObject::<super::factory::TextServiceFactory>::cast_from(sink)
+            {
+                self.log
+                    .borrow_ok_in_sync_focus
+                    .set(Some(factory.borrow().is_ok()));
+            }
+            unsafe { sink.OnSetFocus(true)? };
+        }
+
         Ok(())
     }
     fn UnadviseKeyEventSink(&self, _tid: u32) -> WinResult<()> {
