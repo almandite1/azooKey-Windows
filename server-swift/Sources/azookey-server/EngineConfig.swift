@@ -26,8 +26,10 @@ struct EngineConfig {
 /// not stop the engine, so both degrade to nil and the caller keeps the
 /// current config. Only the file I/O and parsing live here; applying the
 /// result to `config` stays with the LoadConfig export.
-func loadSettingsFile() -> SettingsFile? {
-    guard let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] else {
+/// - Parameter appDataPath: overrides `%APPDATA%`. Only the tests pass it;
+///   the engine always reads the environment.
+func loadSettingsFile(appDataPath: String? = nil) -> SettingsFile? {
+    guard let appDataPath = appDataPath ?? ProcessInfo.processInfo.environment["APPDATA"] else {
         return nil
     }
     let settingsPath = URL(filePath: appDataPath).appendingPathComponent("Azookey/settings.json")
@@ -37,6 +39,20 @@ func loadSettingsFile() -> SettingsFile? {
     } catch {
         print("Failed to read settings: \(error)")
         return nil
+    }
+}
+
+/// Applies a decoded settings file to the engine's `config`, overriding only
+/// the keys that are present — a partial file keeps the current values, which
+/// is what the settings app relies on when it writes one key at a time.
+/// Split out of the `LoadConfig` export so it can be tested without a file.
+@MainActor func applySettings(_ settings: SettingsFile?) {
+    guard let zenzai = settings?.zenzai else { return }
+    if let enable = zenzai.enable {
+        config.zenzaiEnabled = enable
+    }
+    if let profile = zenzai.profile {
+        config.zenzaiProfile = profile
     }
 }
 
