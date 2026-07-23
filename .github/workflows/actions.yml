@@ -202,6 +202,12 @@ jobs:
     - name: Test (x86)
       run: cargo test -p azookey-windows --target i686-pc-windows-msvc --release
 
+    # upload v7 and download v8 (in the release job) look mismatched but are
+    # the matching pair: the two actions live in separate repositories whose
+    # major numbers are offset by one, and they are bumped together on the same
+    # day (upload v5/v6/v7 shipped alongside download v6/v7/v8). download v8's
+    # release notes name upload v7's direct-upload feature as the reason for
+    # its own major. Do not "align" them — upload v8 does not exist.
     - name: Upload Setup Artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
@@ -224,6 +230,9 @@ jobs:
       contents: write
 
     steps:
+    # v8 is the counterpart of the build job's upload-artifact v7; see the note
+    # there. This step only ever runs on a tag push, so a break here would first
+    # be seen during an actual release — treat it with the same care.
     - name: Download the setup artifact
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
