@@ -16,7 +16,7 @@ use tokio::{net::windows::named_pipe::NamedPipeClient, time};
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 use windows::Win32::{
-    Foundation::{ERROR_PIPE_BUSY, HANDLE},
+    Foundation::ERROR_PIPE_BUSY,
     Storage::FileSystem::{
         CreateFileW, FILE_APPEND_DATA, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         FILE_SHARE_NONE, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
@@ -129,7 +129,9 @@ unsafe fn open_pipe_client(pipe_name: &str) -> std::io::Result<NamedPipeClient> 
             None,
             OPEN_EXISTING,
             FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-            HANDLE::default(),
+            // no template file; windows 0.62 models this parameter as an
+            // Option rather than the null handle it used to take
+            None,
         )
         // windows returns HRESULT_FROM_WIN32; recover the Win32 code so the
         // caller's ERROR_PIPE_BUSY retry (raw_os_error) keeps working

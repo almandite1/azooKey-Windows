@@ -8,7 +8,7 @@ use windows::{
 
 use anyhow::Result;
 
-use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
+use super::factory::TextServiceFactory_Impl;
 use super::text_service::TextService;
 
 impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
@@ -17,9 +17,9 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnLayoutChange(
         &self,
-        _pic: Option<&ITfContext>,
+        _pic: windows_core::Ref<'_, ITfContext>,
         _lcode: TfLayoutCode,
-        _pview: Option<&ITfContextView>,
+        _pview: windows_core::Ref<'_, ITfContextView>,
     ) -> Result<()> {
         let should_skip = match self.borrow_mut() {
             Ok(mut text_service) => text_service
@@ -49,7 +49,7 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
 // holds the RefMut, so borrowing again here would double-borrow. The cookie
 // and context now live in the per-instance TextService (B14) — one TIP per
 // UI thread, no cross-thread sharing.
-impl TextServiceFactory {
+impl TextServiceFactory_Impl {
     pub fn advise_text_layout_sink(
         &self,
         text_service: &mut TextService,

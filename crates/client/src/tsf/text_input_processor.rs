@@ -5,10 +5,9 @@ use crate::{
     globals::{DllModule, GUID_DISPLAY_ATTRIBUTE},
 };
 
-use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
+use super::factory::TextServiceFactory_Impl;
 use windows::{
     Win32::{
-        Foundation::BOOL,
         System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
         UI::TextServices::{
             CLSID_TF_CategoryMgr, ITfCategoryMgr, ITfKeyEventSink, ITfKeystrokeMgr, ITfSource,
@@ -34,7 +33,7 @@ fn record(slot: &mut Result<()>, result: Result<()>) {
     }
 }
 
-impl TextServiceFactory {
+impl TextServiceFactory_Impl {
     /// Advises the key-event sink — the lifeline every keystroke arrives
     /// through. Paired with `unadvise_key_sink`; extracted from the inline
     /// closures Activate and Deactivate each open-coded.
@@ -43,7 +42,8 @@ impl TextServiceFactory {
             thread_mgr.cast::<ITfKeystrokeMgr>()?.AdviseKeyEventSink(
                 tid,
                 &self.this::<ITfKeyEventSink>()?,
-                BOOL::from(true),
+                // takes a plain bool since 0.62
+                true,
             )?;
         }
         Ok(())
@@ -155,7 +155,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
     // Debug, and the factory's Debug output is a whole composition dump in
     // any case — the tid is what identifies the activation
     #[tracing::instrument(skip(self, ptim))]
-    fn Activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
+    fn Activate(&self, ptim: windows_core::Ref<'_, ITfThreadMgr>, tid: u32) -> Result<()> {
         tracing::debug!("Activated with tid: {tid}");
 
         // add reference to the dll instance to prevent it from being unloaded
@@ -183,7 +183,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
 
         // resolve the thread manager up front; on null, release the dll ref
         // taken above before bailing (the old code leaked it here)
-        let thread_mgr = match ptim {
+        let thread_mgr = match ptim.as_ref() {
             Some(thread_mgr) => thread_mgr.clone(),
             None => {
                 dll_instance.release();
@@ -324,7 +324,12 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
 
 impl ITfTextInputProcessorEx_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
-    fn ActivateEx(&self, ptim: Option<&ITfThreadMgr>, tid: u32, dwflags: u32) -> Result<()> {
+    fn ActivateEx(
+        &self,
+        ptim: windows_core::Ref<'_, ITfThreadMgr>,
+        tid: u32,
+        dwflags: u32,
+    ) -> Result<()> {
         // called when the text service is activated
         // if this function is implemented, the Activate() function won't be called
         // so we need to call the Activate function manually
@@ -358,9 +363,8 @@ mod tests {
     use crate::globals::{DLL_INSTANCE, DllModule};
     use crate::tsf::factory::TextServiceFactory;
     use crate::tsf::test_support::{
-        EditSessionBehavior, FakeContext, FakeThreadMgr, ThreadMgrLog, fake_context_of,
+        EditSessionBehavior, FakeContext, FakeThreadMgr, ThreadMgrLog, factory_of, fake_context_of,
     };
-    use windows::core::AsImpl as _;
 
     // Activate/Deactivate mutate the process-global IMEState and DllModule,
     // so every test here holds the crate-wide global_state_lock (shared with
@@ -577,7 +581,7 @@ mod tests {
         );
 
         // the TIP is genuinely active: tid is set, so keystrokes are handled
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         assert_eq!(
             factory.borrow().unwrap().tid,
             1,
@@ -597,7 +601,7 @@ mod tests {
     fn deactivate_resets_the_engine_composition() {
         let _guard = crate::tsf::test_support::global_state_lock();
         let (tip, _tm, _log) = activate_fresh_tip();
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();

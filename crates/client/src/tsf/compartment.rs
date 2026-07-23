@@ -28,6 +28,7 @@
 
 use anyhow::Result;
 use windows::{
+    Win32::System::Variant::VARIANT,
     Win32::UI::TextServices::{
         GUID_COMPARTMENT_EMPTYCONTEXT, GUID_COMPARTMENT_KEYBOARD_DISABLED,
         GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
@@ -35,15 +36,12 @@ use windows::{
         ITfContext, ITfSource, TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_FULLSHAPE,
         TF_CONVERSIONMODE_NATIVE, TF_CONVERSIONMODE_ROMAN,
     },
-    core::{GUID, Interface, VARIANT},
+    core::{GUID, Interface},
 };
 
 use crate::engine::input_mode::InputMode;
 
-use super::{
-    factory::{TextServiceFactory, TextServiceFactory_Impl},
-    text_service::TextService,
-};
+use super::{factory::TextServiceFactory_Impl, text_service::TextService};
 
 /// Japanese kana input: native conversion, full-width, roman entry.
 const CONVERSION_KANA: u32 =
@@ -125,7 +123,7 @@ fn compartment_of(mgr: &ITfCompartmentMgr, guid: &GUID) -> Result<ITfCompartment
     Ok(unsafe { mgr.GetCompartment(guid)? })
 }
 
-impl TextServiceFactory {
+impl TextServiceFactory_Impl {
     /// The thread-scoped compartment manager. Open/close and conversion mode
     /// both live on the thread manager, not on a context.
     fn thread_compartments(text_service: &TextService) -> Result<ITfCompartmentMgr> {
@@ -342,15 +340,17 @@ impl ITfCompartmentEventSink_Impl for TextServiceFactory_Impl {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    // the tests build a bare factory; the module itself only needs the
+    // generated outer type now
     use crate::globals::{DLL_INSTANCE, DllModule};
+    use crate::tsf::factory::TextServiceFactory;
     use crate::tsf::test_support::{
-        CompartmentLog, EditSessionBehavior, FakeContext, FakeThreadMgr, ThreadMgrLog,
+        CompartmentLog, EditSessionBehavior, FakeContext, FakeThreadMgr, ThreadMgrLog, factory_of,
         global_state_lock,
     };
     use std::rc::Rc;
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
     use windows::Win32::UI::TextServices::{ITfTextInputProcessor, TF_CONVERSIONMODE_KATAKANA};
-    use windows::core::AsImpl as _;
 
     fn ensure_dll_module() {
         let _ = DLL_INSTANCE.set(std::sync::Mutex::new(DllModule::new()));
@@ -423,7 +423,7 @@ mod tests {
         let context = FakeContext::with_compartments(EditSessionBehavior::RunSync, compartments);
 
         let tip = TextServiceFactory::create::<ITfTextInputProcessor>().unwrap();
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         assert!(
             factory.is_input_disabled(Some(&context)),
@@ -439,7 +439,7 @@ mod tests {
         let context = FakeContext::with_compartments(EditSessionBehavior::RunSync, compartments);
 
         let tip = TextServiceFactory::create::<ITfTextInputProcessor>().unwrap();
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         assert!(factory.is_input_disabled(Some(&context)));
     }
@@ -451,7 +451,7 @@ mod tests {
         let _guard = global_state_lock();
         let context = FakeContext::new(EditSessionBehavior::RunSync);
         let tip = TextServiceFactory::create::<ITfTextInputProcessor>().unwrap();
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         assert!(
             !factory.is_input_disabled(Some(&context)),
@@ -473,7 +473,7 @@ mod tests {
         );
 
         let tip = activate_with(compartments);
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         assert_eq!(
             factory.borrow().unwrap().input_mode,
@@ -495,7 +495,7 @@ mod tests {
         // deliberately no CONVERSION preset: it stays VT_EMPTY
 
         let tip = activate_with(compartments);
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         assert_eq!(
             factory.borrow().unwrap().input_mode,
@@ -561,7 +561,7 @@ mod tests {
         let compartments = Rc::new(CompartmentLog::default());
 
         let tip = activate_with(compartments.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         assert_eq!(factory.borrow().unwrap().input_mode, InputMode::Latin);
 
         compartments.external_set(
@@ -585,7 +585,7 @@ mod tests {
         let compartments = Rc::new(CompartmentLog::default());
 
         let tip = activate_with(compartments.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         factory
             .write_compartments(&InputMode::Kana)
@@ -611,7 +611,7 @@ mod tests {
         let compartments = Rc::new(CompartmentLog::default());
 
         let tip = activate_with(compartments.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         let before = compartments.set_value_calls.get();
         factory.write_compartments(&InputMode::Kana).unwrap();

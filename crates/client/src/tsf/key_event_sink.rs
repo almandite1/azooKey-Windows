@@ -1,9 +1,9 @@
 use windows::{
     Win32::{
-        Foundation::{BOOL, LPARAM, WPARAM},
+        Foundation::{LPARAM, WPARAM},
         UI::TextServices::{ITfContext, ITfKeyEventSink_Impl},
     },
-    core::GUID,
+    core::{BOOL, GUID},
 };
 
 use anyhow::Result;
@@ -19,7 +19,7 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     #[tracing::instrument(skip(self, pic))]
     fn OnTestKeyDown(
         &self,
-        pic: Option<&ITfContext>,
+        pic: windows_core::Ref<'_, ITfContext>,
         wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<BOOL> {
@@ -28,17 +28,22 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         // composition answers TRUE, and the cancel runs in OnKeyDown when
         // the host delivers the key — never here, so a speculative probe
         // cannot discard the user's composition.
-        let result = self.test_key(pic, wparam)?;
+        let result = self.test_key(pic.as_ref(), wparam)?;
 
         Ok(result.into())
     }
 
     #[macros::anyhow]
     #[tracing::instrument(skip(self, pic))]
-    fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+    fn OnKeyDown(
+        &self,
+        pic: windows_core::Ref<'_, ITfContext>,
+        wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> Result<BOOL> {
         // this function is called when a key is pressed
         // we can handle key events here
-        let result = self.handle_key(pic, wparam)?;
+        let result = self.handle_key(pic.as_ref(), wparam)?;
 
         Ok(result.into())
     }
@@ -46,7 +51,7 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnTestKeyUp(
         &self,
-        _pic: Option<&ITfContext>,
+        _pic: windows_core::Ref<'_, ITfContext>,
         _wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<BOOL> {
@@ -55,7 +60,12 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     }
 
     #[macros::anyhow]
-    fn OnKeyUp(&self, _pic: Option<&ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+    fn OnKeyUp(
+        &self,
+        _pic: windows_core::Ref<'_, ITfContext>,
+        _wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> Result<BOOL> {
         // this function is called when a key is released
         // but we handle key events in OnKeyDown function
         // so just return S_OK
@@ -63,7 +73,11 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     }
 
     #[macros::anyhow]
-    fn OnPreservedKey(&self, _pic: Option<&ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
+    fn OnPreservedKey(
+        &self,
+        _pic: windows_core::Ref<'_, ITfContext>,
+        _rguid: *const GUID,
+    ) -> Result<BOOL> {
         // this function is actually not used
         Ok(true.into())
     }

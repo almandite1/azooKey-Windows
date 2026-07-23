@@ -64,7 +64,7 @@ pub fn pin_topmost(hwnd: isize) {
     let _ = unsafe {
         SetWindowPos(
             HWND(hwnd as *mut std::ffi::c_void),
-            HWND_TOPMOST,
+            Some(HWND_TOPMOST),
             0,
             0,
             0,

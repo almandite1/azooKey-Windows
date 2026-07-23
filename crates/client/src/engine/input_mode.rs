@@ -1,4 +1,4 @@
-use crate::{engine::state::IMEState, tsf::factory::TextServiceFactory};
+use crate::{engine::state::IMEState, tsf::factory::TextServiceFactory_Impl};
 
 use anyhow::Result;
 
@@ -9,7 +9,7 @@ pub enum InputMode {
     Kana,
 }
 
-impl TextServiceFactory {
+impl TextServiceFactory_Impl {
     /// Applies `mode` everywhere it is visible: the cached field, the
     /// language bar, and the mode indicator in ui.exe.
     ///

@@ -8,20 +8,20 @@ use super::factory::TextServiceFactory_Impl;
 
 impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
-    fn OnInitDocumentMgr(&self, _pdim: Option<&ITfDocumentMgr>) -> Result<()> {
+    fn OnInitDocumentMgr(&self, _pdim: windows_core::Ref<'_, ITfDocumentMgr>) -> Result<()> {
         Ok(())
     }
 
     #[macros::anyhow]
-    fn OnUninitDocumentMgr(&self, _pdim: Option<&ITfDocumentMgr>) -> Result<()> {
+    fn OnUninitDocumentMgr(&self, _pdim: windows_core::Ref<'_, ITfDocumentMgr>) -> Result<()> {
         Ok(())
     }
 
     #[macros::anyhow]
     fn OnSetFocus(
         &self,
-        focus: Option<&ITfDocumentMgr>,
-        _prevfocus: Option<&ITfDocumentMgr>,
+        focus: windows_core::Ref<'_, ITfDocumentMgr>,
+        _prevfocus: windows_core::Ref<'_, ITfDocumentMgr>,
     ) -> Result<()> {
         // A focus change must ALWAYS end the composition on the document
         // being left; the advisory re-wiring below (language bar, text
@@ -42,7 +42,7 @@ impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
         // advisory: re-advise the text layout sink on the newly focused
         // document so the candidate window tracks its caret. A failure here
         // (e.g. the new document has no top context yet) must not break input
-        if let Some(focus) = focus {
+        if let Some(focus) = focus.as_ref() {
             let advise = (|| {
                 let mut text_service = self.borrow_mut()?;
                 self.advise_text_layout_sink(&mut text_service, focus.clone())
@@ -58,12 +58,12 @@ impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
     }
 
     #[macros::anyhow]
-    fn OnPushContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
+    fn OnPushContext(&self, _pic: windows_core::Ref<'_, ITfContext>) -> Result<()> {
         Ok(())
     }
 
     #[macros::anyhow]
-    fn OnPopContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
+    fn OnPopContext(&self, _pic: windows_core::Ref<'_, ITfContext>) -> Result<()> {
         Ok(())
     }
 }

@@ -35,10 +35,14 @@ serde = { workspace = true }
 [dependencies.windows]
 workspace = true
 features = [
-    "implement",
+    # no "implement" feature since 0.59: the #[implement] macro is now
+    # unconditionally re-exported through windows::core (windows-core)
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_System_Com",
+    # VARIANT moved here from windows::core in 0.62, and the TSF *_Impl traits
+    # for the compartment/property interfaces are gated on it
+    "Win32_System_Variant",
     "Win32_System_Registry",
     "Win32_System_SystemServices",
     "Win32_System_Diagnostics",

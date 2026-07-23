@@ -2,6 +2,7 @@ use macros::anyhow;
 use windows::{
     Win32::{
         Foundation::RECT,
+        System::Variant::VARIANT,
         UI::TextServices::{
             GUID_PROP_ATTRIBUTE, ITfComposition, ITfCompositionSink, ITfContext,
             ITfContextComposition, ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection,
@@ -10,7 +11,7 @@ use windows::{
             TF_TF_MOVESTART, TS_E_NOLAYOUT,
         },
     },
-    core::{AsImpl, VARIANT, implement},
+    core::{AsImpl, implement},
 };
 
 use std::{cell::Cell, mem::ManuallyDrop, rc::Rc, time::Instant};
@@ -19,7 +20,7 @@ use anyhow::Result;
 
 use crate::{engine::state::IMEState, extension::StringExt as _, globals::GUID_DISPLAY_ATTRIBUTE};
 
-use super::factory::TextServiceFactory;
+use super::factory::TextServiceFactory_Impl;
 
 /// Outcome of one `update_pos` attempt. `PendingLayout` and `Clipped` are
 /// normal transient states, not errors: the candidate window keeps its current
@@ -43,7 +44,7 @@ enum PositionUpdate {
 /// genuine error and keeps propagating.
 fn classify_text_ext(
     measured: windows::core::Result<()>,
-    clipped: windows::Win32::Foundation::BOOL,
+    clipped: windows::core::BOOL,
 ) -> Result<PositionUpdate> {
     if let Err(error) = measured {
         if error.code() == TS_E_NOLAYOUT {
@@ -237,7 +238,7 @@ pub(super) fn selected_range(
     Ok(ManuallyDrop::into_inner(selection.range))
 }
 
-impl TextServiceFactory {
+impl TextServiceFactory_Impl {
     /// Shared skeleton for edit sessions that operate on the LIVE
     /// composition: borrows the service and, when no composition is
     /// started, warns and no-ops — a missing composition is a normal race
@@ -572,7 +573,8 @@ mod tests {
     use crate::engine::ipc_service::IPCService;
     use crate::tsf::test_support::{
         EditSessionBehavior, FAKE_COOKIE, FakeComposition, FakeContext, RangeLog, TextExtBehavior,
-        factory_with_context, factory_with_fake_context, fake_context_of, global_state_lock,
+        factory_of, factory_with_context, factory_with_fake_context, fake_context_of,
+        global_state_lock,
     };
     use windows::Win32::Foundation::E_FAIL;
     use windows::Win32::UI::TextServices::ITfTextInputProcessor;
@@ -582,7 +584,7 @@ mod tests {
     fn factory_with_live_composition() -> (ITfTextInputProcessor, Rc<RangeLog>) {
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
         let log = Rc::new(RangeLog::default());
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory
             .borrow()
             .unwrap()
@@ -630,7 +632,7 @@ mod tests {
         let log = Rc::new(RangeLog::default());
         let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
         let tip = factory_with_context(context.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory
             .borrow()
             .unwrap()
@@ -663,7 +665,7 @@ mod tests {
         let log = Rc::new(RangeLog::default());
         let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
         let tip = factory_with_context(context.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         // deliberately NO tip_composition: this is the non-composing case
         IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
 
@@ -692,7 +694,7 @@ mod tests {
         let log = Rc::new(RangeLog::default());
         let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
         let tip = factory_with_context(context.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory
             .borrow()
             .unwrap()
@@ -719,7 +721,7 @@ mod tests {
     fn no_context_is_not_a_failure_for_the_caret_position() {
         let _guard = global_state_lock();
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory.borrow_mut().unwrap().context = None;
 
         factory
@@ -775,7 +777,7 @@ mod tests {
         let log = Rc::new(RangeLog::default());
         let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
         let tip = factory_with_context(context.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory
             .borrow()
             .unwrap()
@@ -839,7 +841,7 @@ mod tests {
     #[test]
     fn start_composition_recovers_from_a_stale_composition() {
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory
             .borrow()
             .unwrap()
@@ -869,7 +871,7 @@ mod tests {
     #[test]
     fn end_composition_drops_the_composition_even_when_the_session_fails() {
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::Reject);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory
             .borrow()
             .unwrap()
@@ -894,7 +896,7 @@ mod tests {
     #[test]
     fn shift_start_measures_utf16_code_units() {
         let (tip, log) = factory_with_live_composition();
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory
             .shift_start("\u{20BB7}", "a")
             .expect("shift_start failed");
@@ -909,7 +911,7 @@ mod tests {
     #[test]
     fn set_text_measures_utf16_code_units() {
         let (tip, log) = factory_with_live_composition();
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory.set_text("\u{20BB7}", "").expect("set_text failed");
         assert_eq!(log.shift_end_reqs.borrow().as_slice(), &[2]);
     }
@@ -919,7 +921,7 @@ mod tests {
     #[test]
     fn set_text_releases_its_ranges() {
         let (tip, log) = factory_with_live_composition();
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory.set_text("a", "b").expect("set_text failed");
         assert_eq!(log.live_ranges(), 0, "every range must be released");
     }
@@ -928,7 +930,7 @@ mod tests {
     #[test]
     fn shift_start_releases_its_ranges() {
         let (tip, log) = factory_with_live_composition();
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory.shift_start("a", "b").expect("shift_start failed");
         assert_eq!(log.live_ranges(), 0);
     }
@@ -937,7 +939,7 @@ mod tests {
     #[test]
     fn end_composition_releases_its_ranges() {
         let (tip, log) = factory_with_live_composition();
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory.end_composition().expect("end_composition failed");
         assert_eq!(log.live_ranges(), 0);
     }
@@ -956,7 +958,7 @@ mod tests {
             .collect();
         *log.text.borrow_mut() = long.clone();
 
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory.end_composition().expect("end_composition failed");
 
         assert_eq!(
@@ -978,7 +980,7 @@ mod tests {
         let text: Vec<u16> = vec!['a' as u16; 1024];
         *log.text.borrow_mut() = text.clone();
 
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory.end_composition().expect("end_composition failed");
 
         assert_eq!(
@@ -1003,7 +1005,7 @@ mod tests {
         let log = Rc::new(RangeLog::default());
         let sentinel = Rc::downgrade(&log);
         {
-            let factory = unsafe { tip.as_impl() };
+            let factory = factory_of(&tip);
             factory
                 .borrow()
                 .unwrap()

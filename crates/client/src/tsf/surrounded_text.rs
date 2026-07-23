@@ -190,11 +190,9 @@ impl TextServiceFactory {
 mod tests {
     use std::rc::Rc;
 
-    use windows::core::AsImpl as _;
-
-    use crate::tsf::factory::TextServiceFactory;
     use crate::tsf::test_support::{
-        EditSessionBehavior, FakeContext, RangeLog, factory_with_context, global_state_lock,
+        EditSessionBehavior, FakeContext, RangeLog, factory_of, factory_with_context,
+        global_state_lock,
     };
 
     /// Drives update_context end to end against the fake host: the
@@ -209,7 +207,7 @@ mod tests {
         *log.text.borrow_mut() = "こんにちは".encode_utf16().collect();
         let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
         let tip = factory_with_context(context.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         // 𠮷 is one char but two UTF-16 units — the difference that matters
         factory.update_context("みず𠮷").unwrap();
@@ -242,7 +240,7 @@ mod tests {
         *log.text.borrow_mut() = "こんにちは".encode_utf16().collect();
         let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
         let tip = factory_with_context(context.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         let long = "あ".repeat(35);
         factory.update_context(&long).unwrap();
