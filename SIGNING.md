@@ -63,17 +63,11 @@ The project's own code is MIT (see `LICENSE`). Bundled components:
 | [azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage) (submodule) | **no licence file** — see below |
 | llama.cpp backends (`llama_cpu`, `llama_cuda`, `llama_vulkan`) | MIT |
 | Swift runtime for Windows | Apache-2.0 with Runtime Library Exception |
-| `zenz.gguf` — [zenz-v3-small-gguf](https://huggingface.co/Miwa-Keita/zenz-v3-small-gguf) | **CC BY-SA 4.0** — see below |
+| `zenz.gguf` — [zenz-v3.2-small-gguf](https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf) | Apache-2.0 |
 | Microsoft Visual C++ runtime, WebView2 runtime | Microsoft redistributables, installed as dependencies rather than shipped |
 
-Two of these are worth stating plainly rather than leaving for someone to
+One of these is worth stating plainly rather than leaving for someone to
 discover:
-
-**`zenz.gguf` is CC BY-SA 4.0**, not an OSI-approved licence. It is a neural
-model — a data file, not code — and CC BY-SA is a free-culture licence, but it
-is not on the OSI list. A signing programme that requires every component to
-carry an OSI-approved licence should be told this up front and allowed to
-decide.
 
 **`azooKey_emoji_dictionary_storage` carries no licence file.** It is a public
 repository from the same author as the main dictionary, but absence of a
