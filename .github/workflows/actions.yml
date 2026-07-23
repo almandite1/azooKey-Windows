@@ -50,7 +50,7 @@ jobs:
       LLAMA_CPU_SHA256: AF34E4DFC7154DF650ED705421F26B3A56C685F2E35ABFDD6DF0CC0CB5C4B259
       LLAMA_CUDA_SHA256: 5307B89AAE1F076E031D6AAB95E63DF5CB96B8D3B1FA7828F412E283A0663019
       LLAMA_VULKAN_SHA256: ED1B7E6AA70CDB2A93EAAAD8586539DCE83F4FA8A44F4DDEE5A1AB09FFB1189B
-      ZENZ_SHA256: 501F605D088F5B988791A00AE19ED46985ED7C48144F364B2F3F1F951C9B2083
+      ZENZ_SHA256: 29C223D4C23327B80FD13EBB5AB2555057A46317997D5DA391584FFBEF0DB673
 
     # every `uses:` below is pinned to a full commit SHA rather than a tag,
     # because tags can be moved after the fact. The downloads further down are
@@ -157,7 +157,7 @@ jobs:
         Copy-Item "$llamaCpuDir\llama.lib" -Destination "server-swift\" -Force
 
         # Download the zenz model
-        $zenzUrl = "https://huggingface.co/Miwa-Keita/zenz-v3-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf"
+        $zenzUrl = "https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf"
         $zenzDest = "zenz.gguf"
         Invoke-WebRequest -Uri $zenzUrl -OutFile $zenzDest
         $zenzActual = (Get-FileHash $zenzDest -Algorithm SHA256).Hash
