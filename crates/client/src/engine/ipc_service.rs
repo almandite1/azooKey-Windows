@@ -174,10 +174,11 @@ impl IPCService {
     }
 
     /// Runs one RPC on the internal runtime with a hard deadline. A timeout or
-    /// a transport-level failure (`Unavailable` — the pipe is gone because the
-    /// server crashed/restarted) is tagged [`ServerUnavailable`] so callers can
-    /// recover the composition; a server-side status (e.g. `InvalidArgument`)
-    /// is surfaced unchanged.
+    /// a transport-level failure (the pipe is gone because the server
+    /// crashed/restarted — see [`shared::pipe::is_transport_failure`] for why
+    /// that is not just `Unavailable`) is tagged [`ServerUnavailable`] so
+    /// callers can recover the composition; a server-side status (e.g.
+    /// `InvalidArgument`) is surfaced unchanged.
     fn exec<T>(
         &self,
         fut: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
@@ -186,7 +187,7 @@ impl IPCService {
             match time::timeout(RPC_TIMEOUT, fut).await {
                 Err(_) => Err(anyhow::Error::new(ServerUnavailable)
                     .context(format!("IPC request timed out after {RPC_TIMEOUT:?}"))),
-                Ok(Err(status)) if status.code() == tonic::Code::Unavailable => {
+                Ok(Err(status)) if shared::pipe::is_transport_failure(&status) => {
                     Err(anyhow::Error::new(ServerUnavailable)
                         .context(format!("IPC transport error: {status}")))
                 }
