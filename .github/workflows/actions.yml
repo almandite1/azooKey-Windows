@@ -82,26 +82,29 @@ jobs:
         swift-version: swift-6.3.3-release
         swift-build: 6.3.3-RELEASE
 
-    # still node20 upstream (no newer release exists), so the runner forces it
-    # onto node24 and warns; nothing to bump until arduino ships a node24 build
-    - name: Install Protoc
-      uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-      with:
-        # this action resolves the protoc release through the GitHub API, and
-        # unauthenticated it shares an hourly quota with every other build on
-        # the runner's IP. That is what failed PR #41's push run. The token
-        # only needs the read access the job already has.
-        repo-token: ${{ secrets.GITHUB_TOKEN }}
-
     - name: Install x86 Rust target
       run: rustup target add i686-pc-windows-msvc
 
-    # a checksum-verified prebuilt binary; `cargo install` rebuilt it from
-    # source on every run and cost ~4.5 min of the ~25 min total
-    - name: Install cargo-make
+    # Both tools from one action, each a checksum-verified prebuilt binary
+    # (the action carries its own manifest of URLs and hashes, so it makes no
+    # GitHub API call to resolve a version and cannot be rate-limited).
+    #
+    # cargo-make: `cargo install` rebuilt it from source on every run and cost
+    # ~4.5 min of the ~25 min total.
+    #
+    # protoc came from arduino/setup-protoc until this. That action is still
+    # node20 upstream — its last release is from 2024-01 and master has not
+    # moved — so the runner forces it onto node24 and annotates every build,
+    # with no version to bump to. This action is a shell composite: it has no
+    # Node runtime to deprecate. It also exports PROTOC, which prost-build
+    # reads in preference to searching PATH, and unpacks protoc's include/
+    # alongside the binary (unused today: neither .proto imports a well-known
+    # type). Version moves from arduino's `26.x` default to protoc 3x latest,
+    # which compiles our two proto3 files identically.
+    - name: Install cargo-make and protoc
       uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
       with:
-        tool: cargo-make
+        tool: cargo-make,protoc
 
     # ~600 MB of pinned artifacts (three llama zips + the zenz model). The
     # key carries every checksum the job verifies, so changing a pin — or
