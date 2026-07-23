@@ -28,9 +28,10 @@ macros = { path = "crates/macros" }
 azookey-server = { path = "crates/server" }
 # external — the tonic/prost family must move in lockstep. Since 0.14 the
 # prost codec lives outside tonic itself, so the generated code needs
-# tonic-prost at run time and tonic-prost-build at build time.
+# tonic-prost at run time and tonic-prost-build at build time. tonic-build
+# itself is deliberately absent: nothing depends on it directly any more, it
+# only arrives transitively under tonic-prost-build.
 tonic = "0.14.6"
-tonic-build = "0.14.6"
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tonic-health = "0.14.6"
