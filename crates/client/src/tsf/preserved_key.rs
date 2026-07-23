@@ -47,16 +47,19 @@ use super::factory::TextServiceFactory_Impl;
 /// `VK_DBE_SBCSCHAR` / `VK_DBE_DBCSCHAR` — the two virtual keys the
 /// Zenkaku/Hankaku key produces depending on the current mode.
 const VK_ZENKAKU_HANKAKU: [u32; 2] = [0xF3, 0xF4];
-/// `VK_KANJI`. The 漢字 key of a JIS keyboard, and what the OS synthesises
-/// for some IME on/off shortcuts.
+/// `VK_KANJI`. The 漢字 key of a JIS keyboard — and, with Alt held, what
+/// Windows translates **Alt+`** into on a 101-key Japanese layout. Measured
+/// on hardware: the key arrives as `OnKeyDown(wparam=0x19)` with the Alt
+/// flag set in lparam and the scan code of the `` ` `` key (0x29). It does
+/// NOT arrive as `VK_OEM_3`, so that reservation alone never fires.
 const VK_KANJI: u32 = 0x19;
-/// `VK_OEM_3` — `` ` `` on a US layout. With Alt this is the standard IME
-/// on/off chord there, and the reason this module exists.
+/// `VK_OEM_3` — `` ` `` on a US layout. Reserved with Alt as well, for
+/// layouts and hosts where the translation above does not happen.
 const VK_OEM_3: u32 = 0xC0;
 
 /// Every key this TIP asks TSF to route through `OnPreservedKey`, with the
 /// description TSF shows in the keyboard-shortcut UI.
-const TOGGLE_KEYS: [(GUID, TF_PRESERVEDKEY, &str); 4] = [
+const TOGGLE_KEYS: [(GUID, TF_PRESERVEDKEY, &str); 5] = [
     (
         GUID_PRESERVEDKEY_TOGGLE_ZENHAN,
         TF_PRESERVEDKEY {
@@ -80,6 +83,20 @@ const TOGGLE_KEYS: [(GUID, TF_PRESERVEDKEY, &str); 4] = [
             uModifiers: 0,
         },
         "azooKey: 入力モード切替 (漢字)",
+    ),
+    // Alt+` on a 101-key Japanese layout. Windows has already turned the
+    // `` ` `` key into VK_KANJI by the time TSF sees it, but Alt is still
+    // held — so the unmodified reservation above does not match and this
+    // one is what actually fires. Without it the chord reaches OnKeyDown,
+    // where the Ctrl/Alt branch discards it as a host shortcut, and a
+    // US-layout user has no keyboard route to the IME at all (issue #19).
+    (
+        GUID_PRESERVEDKEY_TOGGLE_KANJI,
+        TF_PRESERVEDKEY {
+            uVKey: VK_KANJI,
+            uModifiers: TF_MOD_ALT,
+        },
+        "azooKey: 入力モード切替 (Alt+`)",
     ),
     (
         GUID_PRESERVEDKEY_TOGGLE_ALT_GRAVE,
@@ -409,6 +426,40 @@ mod tests {
         assert!(vks.contains(&(0xF4, 0)), "JIS 半角/全角 (the other VK)");
         assert!(vks.contains(&(VK_KANJI, 0)), "JIS 漢字");
         assert!(vks.contains(&(VK_OEM_3, TF_MOD_ALT)), "US Alt+`");
+    }
+
+    /// The reservation that Alt+` ACTUALLY needs. Measured on a 101-key
+    /// Japanese layout: the chord reaches the TIP as VK_KANJI with Alt still
+    /// held, not as VK_OEM_3. Reserving VK_KANJI unmodified does not match
+    /// it, so the first attempt at issue #19 left US-layout users with no
+    /// keyboard route to the IME at all — TSF delivered the chord to
+    /// OnKeyDown, where the Ctrl/Alt branch discarded it.
+    #[test]
+    fn alt_grave_is_reserved_as_alt_plus_vk_kanji() {
+        let vks: Vec<(u32, u32)> = TOGGLE_KEYS
+            .iter()
+            .map(|(_, key, _)| (key.uVKey, key.uModifiers))
+            .collect();
+
+        assert!(
+            vks.contains(&(VK_KANJI, TF_MOD_ALT)),
+            "Alt+` arrives as Alt+VK_KANJI on a 101-key layout: {vks:x?}"
+        );
+    }
+
+    /// Both VK_KANJI reservations must be matchable: the plain 漢字 key with
+    /// no modifier, and the Alt chord. One would exclude the other.
+    #[test]
+    fn both_kanji_reservations_match_their_own_modifier_state() {
+        let kanji: Vec<u32> = TOGGLE_KEYS
+            .iter()
+            .filter(|(_, key, _)| key.uVKey == VK_KANJI)
+            .map(|(_, key, _)| key.uModifiers)
+            .collect();
+
+        assert_eq!(kanji.len(), 2, "plain 漢字 and Alt+`");
+        assert!(modifiers_satisfied(kanji[0], false, false, false));
+        assert!(modifiers_satisfied(kanji[1], true, false, false));
     }
 
     /// Zenkaku/Hankaku's two virtual keys are the same physical key, so they

@@ -1,7 +1,9 @@
 use std::cmp::max;
 
 use crate::{
-    engine::user_action::UserAction, extension::VKeyExt as _, tsf::factory::TextServiceFactory_Impl,
+    engine::user_action::{UserAction, is_ime_toggle_key},
+    extension::VKeyExt as _,
+    tsf::factory::TextServiceFactory_Impl,
 };
 
 use super::{
@@ -333,6 +335,20 @@ impl TextServiceFactory_Impl {
         // (issue #19).
         if self.is_reserved_keystroke(wparam.0)? {
             return Ok(None);
+        }
+
+        // The IME on/off keys outrank the chord branch below. Windows
+        // translates Alt+` on a 101-key Japanese layout into VK_KANJI with
+        // Alt STILL HELD (measured on hardware), so the chord branch would
+        // throw the user's only on/off key away as a host shortcut.
+        //
+        // Only reached when the TSF reservation did not take — the guard
+        // above returns first when it did — so this stays the safety net for
+        // hosts that refuse PreserveKey, not a second delivery path.
+        if is_ime_toggle_key(wparam.0) {
+            let ctx = self.keystroke_context()?;
+            return Ok(transition(&ctx, UserAction::ToggleInputMode)
+                .map(|(next_state, actions)| (actions, next_state)));
         }
 
         // A Ctrl or Alt chord is the host's shortcut. During a composition
