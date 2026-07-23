@@ -1,16 +1,16 @@
 use macros::anyhow;
 use windows::{
-    core::{implement, AsImpl, VARIANT},
     Win32::{
         Foundation::RECT,
         UI::TextServices::{
-            ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
-            ITfEditSession_Impl, ITfInsertAtSelection, ITfRange, GUID_PROP_ATTRIBUTE, TF_AE_NONE,
-            TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_ES_READWRITE,
-            TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE, TF_ST_CORRECTION, TF_TF_MOVESTART,
-            TS_E_NOLAYOUT,
+            GUID_PROP_ATTRIBUTE, ITfComposition, ITfCompositionSink, ITfContext,
+            ITfContextComposition, ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection,
+            ITfRange, TF_AE_NONE, TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION,
+            TF_ES_READWRITE, TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE, TF_ST_CORRECTION,
+            TF_TF_MOVESTART, TS_E_NOLAYOUT,
         },
     },
+    core::{AsImpl, VARIANT, implement},
 };
 
 use std::{cell::Cell, mem::ManuallyDrop, rc::Rc, time::Instant};
@@ -275,8 +275,7 @@ impl TextServiceFactory {
         // service: end_composition borrows it again
         let tip_exists = {
             let text_service = self.borrow()?;
-            let exists = text_service.borrow_composition()?.tip_composition.is_some();
-            exists
+            text_service.borrow_composition()?.tip_composition.is_some()
         };
 
         if tip_exists {
@@ -572,8 +571,8 @@ mod tests {
     use super::*;
     use crate::engine::ipc_service::IPCService;
     use crate::tsf::test_support::{
+        EditSessionBehavior, FAKE_COOKIE, FakeComposition, FakeContext, RangeLog, TextExtBehavior,
         factory_with_context, factory_with_fake_context, fake_context_of, global_state_lock,
-        EditSessionBehavior, FakeComposition, FakeContext, RangeLog, TextExtBehavior, FAKE_COOKIE,
     };
     use windows::Win32::Foundation::E_FAIL;
     use windows::Win32::UI::TextServices::ITfTextInputProcessor;

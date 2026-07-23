@@ -29,14 +29,14 @@
 
 use anyhow::Result;
 use windows::{
-    core::{Interface, BSTR, GUID},
     Win32::{
         Foundation::{BOOL, E_FAIL, E_INVALIDARG},
         UI::TextServices::{
             ITfCandidateListUIElement_Impl, ITfContext, ITfDocumentMgr, ITfUIElement,
-            ITfUIElementMgr, ITfUIElement_Impl,
+            ITfUIElement_Impl, ITfUIElementMgr,
         },
     },
+    core::{BSTR, GUID, Interface},
 };
 
 use crate::{engine::ipc_service::Candidates, globals::GUID_CANDIDATE_LIST_UI_ELEMENT};
@@ -256,17 +256,17 @@ impl ITfCandidateListUIElement_Impl for TextServiceFactory_Impl {
     fn GetDocumentMgr(&self) -> Result<ITfDocumentMgr> {
         let text_service = self.borrow()?;
 
-        if let Ok(context) = text_service.context::<ITfContext>() {
-            if let Ok(doc_mgr) = unsafe { context.GetDocumentMgr() } {
-                return Ok(doc_mgr);
-            }
+        if let Ok(context) = text_service.context::<ITfContext>()
+            && let Ok(doc_mgr) = unsafe { context.GetDocumentMgr() }
+        {
+            return Ok(doc_mgr);
         }
 
         // fall back to whatever currently has focus
-        if let Ok(thread_mgr) = text_service.thread_mgr() {
-            if let Ok(doc_mgr) = unsafe { thread_mgr.GetFocus() } {
-                return Ok(doc_mgr);
-            }
+        if let Ok(thread_mgr) = text_service.thread_mgr()
+            && let Ok(doc_mgr) = unsafe { thread_mgr.GetFocus() }
+        {
+            return Ok(doc_mgr);
         }
 
         Err(windows::core::Error::from_hresult(E_FAIL).into())
@@ -351,15 +351,15 @@ impl ITfCandidateListUIElement_Impl for TextServiceFactory_Impl {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::globals::{DllModule, DLL_INSTANCE};
-    use crate::tsf::test_support::{global_state_lock, FakeThreadMgr, ThreadMgrLog, UiElementLog};
+    use crate::globals::{DLL_INSTANCE, DllModule};
+    use crate::tsf::test_support::{FakeThreadMgr, ThreadMgrLog, UiElementLog, global_state_lock};
     use std::rc::Rc;
-    use windows::core::AsImpl as _;
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
     use windows::Win32::UI::TextServices::{
         ITfCandidateListUIElement, ITfTextInputProcessor, TF_CLUIE_CURRENTPAGE, TF_CLUIE_PAGEINDEX,
         TF_CLUIE_STRING,
     };
+    use windows::core::AsImpl as _;
 
     /// Calls `GetPageIndex` through the raw vtable, the way a host does.
     ///
@@ -372,12 +372,14 @@ mod tests {
         count: u32,
         page_count: *mut u32,
     ) -> windows::core::HRESULT {
-        (Interface::vtable(element).GetPageIndex)(
-            Interface::as_raw(element),
-            pindex,
-            count,
-            page_count,
-        )
+        unsafe {
+            (Interface::vtable(element).GetPageIndex)(
+                Interface::as_raw(element),
+                pindex,
+                count,
+                page_count,
+            )
+        }
     }
 
     fn ensure_dll_module() {

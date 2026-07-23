@@ -5,50 +5,49 @@ use std::{ffi::c_void, ptr::addr_of_mut};
 
 use anyhow::Result;
 use windows::{
-    core::PWSTR,
     Win32::{
-        Foundation::{CloseHandle, BOOL, HANDLE, INVALID_HANDLE_VALUE},
+        Foundation::{BOOL, CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
         Security::{
-            DuplicateTokenEx, GetTokenInformation, LookupPrivilegeValueW, PrivilegeCheck,
-            SecurityAnonymous, SecurityImpersonation, SetTokenInformation, TokenImpersonation,
-            TokenPrimary, TokenSessionId, TokenUIAccess, PRIVILEGE_SET, SE_TCB_NAME,
-            TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-            TOKEN_IMPERSONATE, TOKEN_QUERY,
+            DuplicateTokenEx, GetTokenInformation, LookupPrivilegeValueW, PRIVILEGE_SET,
+            PrivilegeCheck, SE_TCB_NAME, SecurityAnonymous, SecurityImpersonation,
+            SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
+            TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TokenImpersonation, TokenPrimary,
+            TokenSessionId, TokenUIAccess,
         },
         System::{
             Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32,
+                CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next,
                 TH32CS_SNAPPROCESS,
             },
             Environment::GetCommandLineW,
             JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-                SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JobObjectExtendedLimitInformation, SetInformationJobObject,
             },
             SystemServices::PRIVILEGE_SET_ALL_NECESSARY,
             Threading::{
-                CreateProcessAsUserW, ExitProcess, GetCurrentProcess, GetExitCodeProcess,
-                GetStartupInfoW, OpenProcess, OpenProcessToken, ResumeThread, SetThreadToken,
-                TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED, INFINITE,
-                PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+                CREATE_SUSPENDED, CreateProcessAsUserW, ExitProcess, GetCurrentProcess,
+                GetExitCodeProcess, GetStartupInfoW, INFINITE, OpenProcess, OpenProcessToken,
+                PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread, STARTUPINFOW,
+                SetThreadToken, TerminateProcess, WaitForSingleObject,
             },
         },
     },
+    core::PWSTR,
 };
 
 /// get token from current process
 fn open_current_process_token() -> Result<HANDLE> {
     let mut h_token = HANDLE::default();
     unsafe {
-        if let Ok(()) = OpenProcessToken(
+        match OpenProcessToken(
             GetCurrentProcess(),
             TOKEN_DUPLICATE | TOKEN_QUERY,
             &mut h_token,
         ) {
-            Ok(h_token)
-        } else {
-            anyhow::bail!("OpenProcessToken failed");
+            Ok(()) => Ok(h_token),
+            Err(_) => anyhow::bail!("OpenProcessToken failed"),
         }
     }
 }
@@ -109,12 +108,16 @@ pub fn duplicate_winlogon_token(
         if Process32First(snapshot, &mut process_entry).is_ok() {
             loop {
                 if is_winlogon(&process_entry) {
-                    match try_duplicate_token(
+                    // bound to a local rather than matched as a temporary: a
+                    // scrutinee temporary holding a token handle changes drop
+                    // point between editions 2021 and 2024
+                    let duplicated = try_duplicate_token(
                         &process_entry,
                         &mut privilege_set,
                         session_id,
                         desired_access,
-                    ) {
+                    );
+                    match duplicated {
                         Ok(token) => {
                             *h_token = token;
                             result = Ok(());
@@ -344,67 +347,73 @@ pub fn prepare_uiaccess_token() -> Result<()> {
 ///   → the job below tears the child down → restart;
 /// - launcher dies → its kill-on-close job kills the shim → same teardown.
 unsafe fn run_as_supervision_shim(process_info: PROCESS_INFORMATION) -> Result<()> {
-    // Tie the (still suspended) child to this shim's lifetime. A failure is
-    // not fatal — supervision still works via the exit-code mirror; only the
-    // die-with-the-shim guarantee is lost (same policy as the launcher's own
-    // job setup).
-    match create_kill_on_close_job() {
-        // the job handle is deliberately never closed: closing the last
-        // handle kills the child, so it must live exactly as long as this
-        // process
-        Ok(job) => {
-            if let Err(e) = AssignProcessToJobObject(job, process_info.hProcess) {
+    unsafe {
+        // Tie the (still suspended) child to this shim's lifetime. A failure is
+        // not fatal — supervision still works via the exit-code mirror; only the
+        // die-with-the-shim guarantee is lost (same policy as the launcher's own
+        // job setup).
+        match create_kill_on_close_job() {
+            // the job handle is deliberately never closed: closing the last
+            // handle kills the child, so it must live exactly as long as this
+            // process
+            Ok(job) => {
+                if let Err(e) = AssignProcessToJobObject(job, process_info.hProcess) {
+                    eprintln!(
+                        "UIAccess child could not be tied to the shim ({e}); it won't die with it"
+                    );
+                }
+            }
+            Err(e) => {
                 eprintln!(
-                    "UIAccess child could not be tied to the shim ({e}); it won't die with it"
-                );
+                    "shim job creation failed ({e}); the UIAccess child won't die with the shim"
+                )
             }
         }
-        Err(e) => {
-            eprintln!("shim job creation failed ({e}); the UIAccess child won't die with the shim")
+
+        if ResumeThread(process_info.hThread) == u32::MAX {
+            // the child never ran; clean it up and let the caller run without
+            // UIAccess instead of leaving a suspended zombie behind
+            let _ = TerminateProcess(process_info.hProcess, 1);
+            let _ = CloseHandle(process_info.hThread);
+            let _ = CloseHandle(process_info.hProcess);
+            anyhow::bail!("ResumeThread failed for the UIAccess child");
         }
-    }
-
-    if ResumeThread(process_info.hThread) == u32::MAX {
-        // the child never ran; clean it up and let the caller run without
-        // UIAccess instead of leaving a suspended zombie behind
-        let _ = TerminateProcess(process_info.hProcess, 1);
         let _ = CloseHandle(process_info.hThread);
-        let _ = CloseHandle(process_info.hProcess);
-        anyhow::bail!("ResumeThread failed for the UIAccess child");
-    }
-    let _ = CloseHandle(process_info.hThread);
 
-    WaitForSingleObject(process_info.hProcess, INFINITE);
-    let mut code: u32 = 1;
-    if GetExitCodeProcess(process_info.hProcess, &mut code).is_err() {
-        // unknown outcome: report an abnormal exit so the launcher restarts
-        code = 1;
+        WaitForSingleObject(process_info.hProcess, INFINITE);
+        let mut code: u32 = 1;
+        if GetExitCodeProcess(process_info.hProcess, &mut code).is_err() {
+            // unknown outcome: report an abnormal exit so the launcher restarts
+            code = 1;
+        }
+        let _ = CloseHandle(process_info.hProcess);
+        ExitProcess(code);
     }
-    let _ = CloseHandle(process_info.hProcess);
-    ExitProcess(code);
 }
 
 /// A job object that kills its members when the last handle closes, exactly
 /// like the launcher's `CHILD_JOB`.
 unsafe fn create_kill_on_close_job() -> Result<HANDLE> {
-    let job = CreateJobObjectW(None, windows::core::PCWSTR::null())?;
+    unsafe {
+        let job = CreateJobObjectW(None, windows::core::PCWSTR::null())?;
 
-    let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
-            LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    };
-    if let Err(e) = SetInformationJobObject(
-        job,
-        JobObjectExtendedLimitInformation,
-        &info as *const _ as *const c_void,
-        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-    ) {
-        let _ = CloseHandle(job);
-        return Err(e.into());
-    }
+        };
+        if let Err(e) = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) {
+            let _ = CloseHandle(job);
+            return Err(e.into());
+        }
 
-    Ok(job)
+        Ok(job)
+    }
 }

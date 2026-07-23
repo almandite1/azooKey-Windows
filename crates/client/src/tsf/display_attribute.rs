@@ -3,7 +3,6 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering::Relaxed},
 };
 use windows::{
-    core::{implement, BSTR, GUID},
     Win32::{
         Foundation::{E_FAIL, E_INVALIDARG, E_POINTER, S_FALSE},
         UI::TextServices::{
@@ -11,6 +10,7 @@ use windows::{
             ITfDisplayAttributeInfo_Impl, ITfDisplayAttributeProvider_Impl, TF_DISPLAYATTRIBUTE,
         },
     },
+    core::{BSTR, GUID, implement},
 };
 
 use anyhow::Result;

@@ -15,7 +15,6 @@ use hyper_util::rt::TokioIo;
 use tokio::{net::windows::named_pipe::NamedPipeClient, time};
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
-use windows::core::PCWSTR;
 use windows::Win32::{
     Foundation::{ERROR_PIPE_BUSY, HANDLE},
     Storage::FileSystem::{
@@ -25,6 +24,7 @@ use windows::Win32::{
     System::RemoteDesktop::ProcessIdToSessionId,
     System::Threading::GetCurrentProcessId,
 };
+use windows::core::PCWSTR;
 
 /// Access mask we open the client end with: FILE_GENERIC_READ |
 /// FILE_GENERIC_WRITE, but WITHOUT FILE_APPEND_DATA. On a named pipe
@@ -119,22 +119,24 @@ pub fn lazy_pipe_channel(pipe_name: String) -> Result<Channel, tonic::transport:
 /// I/O and its ownership is transferred to the returned client, which closes
 /// it on drop.
 unsafe fn open_pipe_client(pipe_name: &str) -> std::io::Result<NamedPipeClient> {
-    let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
 
-    let handle = CreateFileW(
-        PCWSTR(wide.as_ptr()),
-        PIPE_CLIENT_ACCESS,
-        FILE_SHARE_NONE,
-        None,
-        OPEN_EXISTING,
-        FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-        HANDLE::default(),
-    )
-    // windows returns HRESULT_FROM_WIN32; recover the Win32 code so the
-    // caller's ERROR_PIPE_BUSY retry (raw_os_error) keeps working
-    .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))?;
+        let handle = CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            PIPE_CLIENT_ACCESS,
+            FILE_SHARE_NONE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            HANDLE::default(),
+        )
+        // windows returns HRESULT_FROM_WIN32; recover the Win32 code so the
+        // caller's ERROR_PIPE_BUSY retry (raw_os_error) keeps working
+        .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))?;
 
-    NamedPipeClient::from_raw_handle(handle.0 as RawHandle)
+        NamedPipeClient::from_raw_handle(handle.0 as RawHandle)
+    }
 }
 
 #[cfg(test)]

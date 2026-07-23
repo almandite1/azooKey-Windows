@@ -1,22 +1,22 @@
 use windows::{
-    core::{w, GUID},
     Win32::{
         Globalization::LocaleNameToLCID,
         System::{
-            Com::{CoCreateInstance, CLSCTX_INPROC_SERVER},
+            Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
             Registry::HKEY_CLASSES_ROOT,
         },
         UI::{
             Input::KeyboardAndMouse::HKL,
             TextServices::{
-                CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, ITfCategoryMgr,
-                ITfInputProcessorProfileMgr, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
+                CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles,
+                GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER, GUID_TFCAT_TIP_KEYBOARD,
                 GUID_TFCAT_TIPCAP_COMLESS, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
                 GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
-                GUID_TFCAT_TIPCAP_UIELEMENTENABLED, GUID_TFCAT_TIP_KEYBOARD,
+                GUID_TFCAT_TIPCAP_UIELEMENTENABLED, ITfCategoryMgr, ITfInputProcessorProfileMgr,
             },
         },
     },
+    core::{GUID, w},
 };
 
 use crate::{
@@ -149,7 +149,7 @@ impl CategoryMgr {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, E_ACCESSDENIED};
+    use windows::Win32::Foundation::{E_ACCESSDENIED, ERROR_FILE_NOT_FOUND};
 
     /// An already-deleted key is success — regsvr32 /u must be idempotent.
     #[test]

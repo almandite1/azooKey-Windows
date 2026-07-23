@@ -1,13 +1,12 @@
 use std::sync::{
+    Arc, Mutex, MutexGuard, OnceLock,
     atomic::{AtomicUsize, Ordering},
     mpsc::Sender,
-    Arc, Mutex, MutexGuard, OnceLock,
 };
 
 use anyhow::{Context, Result};
 
 use windows::{
-    core::GUID,
     Win32::{
         Foundation::{FALSE, HMODULE, MAX_PATH},
         System::LibraryLoader::GetModuleFileNameW,
@@ -16,6 +15,7 @@ use windows::{
             TF_LS_SOLID,
         },
     },
+    core::GUID,
 };
 
 pub const CLSID_PREFIX: &str = "CLSID\\";

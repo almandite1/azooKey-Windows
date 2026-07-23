@@ -9,19 +9,19 @@ use tokio::{
 };
 use tonic::transport::server::Connected;
 use windows::{
-    core::{HSTRING, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL},
+        Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
                 SDDL_REVISION,
             },
-            GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-            TOKEN_USER,
+            GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+            TOKEN_USER, TokenUser,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     },
+    core::{HSTRING, PCWSTR, PWSTR},
 };
 
 // repr(transparent): the pipe-creation calls pass `&mut security_attributes
@@ -159,7 +159,9 @@ fn current_user_sid_string() -> io::Result<String> {
 
 impl TonicNamedPipeServer {
     /// Accepts connections on `path`, with no interest in when they end.
-    pub fn new(path: &str) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>>> {
+    pub fn new(
+        path: &str,
+    ) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>> + use<>> {
         Self::build(path, None)
     }
 
@@ -171,14 +173,14 @@ impl TonicNamedPipeServer {
     pub fn with_disconnect_notify(
         path: &str,
         disconnect_tx: mpsc::UnboundedSender<i64>,
-    ) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>>> {
+    ) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>> + use<>> {
         Self::build(path, Some(disconnect_tx))
     }
 
     fn build(
         path: &str,
         disconnect_tx: Option<mpsc::UnboundedSender<i64>>,
-    ) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>>> {
+    ) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>> + use<>> {
         // set security attributes to allow ipc from sandboxed processes
         // see https://nathancorvussolis.blogspot.com/2018/05/windows-ime-security.html
 
@@ -236,7 +238,12 @@ impl TonicNamedPipeServer {
                 static NEXT_SESSION_ID: AtomicI64 = AtomicI64::new(1);
 
                 loop {
-                    match server.connect().await {
+                    // the accept and create results below are bound to locals
+                    // rather than matched as temporaries: a scrutinee temporary
+                    // holding a pipe handle changes drop point between editions
+                    // 2021 and 2024, and this loop must not depend on which
+                    let accepted = server.connect().await;
+                    match accepted {
                         Ok(()) => {
                             yield Ok(TonicNamedPipeServer {
                                 inner: server,
@@ -251,10 +258,11 @@ impl TonicNamedPipeServer {
                     }
 
                     server = loop {
-                        match ServerOptions::new().create_with_security_attributes_raw(
+                        let created = ServerOptions::new().create_with_security_attributes_raw(
                             &name,
                             addr_of_mut!(security_attributes) as *mut c_void,
-                        ) {
+                        );
+                        match created {
                             Ok(s) => break s,
                             Err(e) => {
                                 tracing::warn!("failed to create next pipe instance: {e}");

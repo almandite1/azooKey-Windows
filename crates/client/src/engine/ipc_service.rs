@@ -106,7 +106,9 @@ impl From<shared::proto::ComposingText> for Candidates {
 /// A `None` is a protocol error — the caller always sent text to convert, so
 /// the server owed a reading back — and becomes an ordinary error rather than
 /// a silent empty list.
-fn candidates_or_missing(composing_text: Option<shared::proto::ComposingText>) -> Result<Candidates> {
+fn candidates_or_missing(
+    composing_text: Option<shared::proto::ComposingText>,
+) -> Result<Candidates> {
     composing_text
         .map(Candidates::from)
         .ok_or_else(|| anyhow::anyhow!("composing_text is None"))

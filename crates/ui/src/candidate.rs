@@ -2,8 +2,8 @@ use anyhow::Result;
 use tao::{event_loop::EventLoop, window::Window};
 use wry::{WebContext, WebViewBuilder};
 
-use crate::window::create_overlay_window;
 use crate::UserEvent;
+use crate::window::create_overlay_window;
 
 pub fn create_candidate_window(event_loop: &EventLoop<UserEvent>) -> Result<Window> {
     create_overlay_window(event_loop, "CandidateList", false)

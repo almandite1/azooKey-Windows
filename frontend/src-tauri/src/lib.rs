@@ -58,12 +58,12 @@ fn update_config(state: tauri::State<AppState>, new_config: AppConfig) -> Result
         }
     }
 
-    if let Some(ipc) = ipc_guard.as_mut() {
-        if let Err(e) = ipc.update_config() {
-            // drop the broken connection so the next call reconnects
-            *ipc_guard = None;
-            return Err(format!("failed to notify azookey server: {e}"));
-        }
+    if let Some(ipc) = ipc_guard.as_mut()
+        && let Err(e) = ipc.update_config()
+    {
+        // drop the broken connection so the next call reconnects
+        *ipc_guard = None;
+        return Err(format!("failed to notify azookey server: {e}"));
     }
 
     Ok(())

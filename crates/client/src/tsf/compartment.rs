@@ -28,14 +28,14 @@
 
 use anyhow::Result;
 use windows::{
-    core::{Interface, GUID, VARIANT},
     Win32::UI::TextServices::{
-        ITfCompartment, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr,
-        ITfContext, ITfSource, GUID_COMPARTMENT_EMPTYCONTEXT, GUID_COMPARTMENT_KEYBOARD_DISABLED,
+        GUID_COMPARTMENT_EMPTYCONTEXT, GUID_COMPARTMENT_KEYBOARD_DISABLED,
         GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
-        TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_FULLSHAPE, TF_CONVERSIONMODE_NATIVE,
-        TF_CONVERSIONMODE_ROMAN,
+        ITfCompartment, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr,
+        ITfContext, ITfSource, TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_FULLSHAPE,
+        TF_CONVERSIONMODE_NATIVE, TF_CONVERSIONMODE_ROMAN,
     },
+    core::{GUID, Interface, VARIANT},
 };
 
 use crate::engine::input_mode::InputMode;
@@ -290,10 +290,10 @@ impl TextServiceFactory {
                 &GUID_COMPARTMENT_KEYBOARD_DISABLED,
                 &GUID_COMPARTMENT_EMPTYCONTEXT,
             ] {
-                if let Ok(compartment) = compartment_of(&mgr, guid) {
-                    if is_set(&compartment) {
-                        return true;
-                    }
+                if let Ok(compartment) = compartment_of(&mgr, guid)
+                    && is_set(&compartment)
+                {
+                    return true;
                 }
             }
         }
@@ -342,15 +342,15 @@ impl ITfCompartmentEventSink_Impl for TextServiceFactory_Impl {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::globals::{DllModule, DLL_INSTANCE};
+    use crate::globals::{DLL_INSTANCE, DllModule};
     use crate::tsf::test_support::{
-        global_state_lock, CompartmentLog, EditSessionBehavior, FakeContext, FakeThreadMgr,
-        ThreadMgrLog,
+        CompartmentLog, EditSessionBehavior, FakeContext, FakeThreadMgr, ThreadMgrLog,
+        global_state_lock,
     };
     use std::rc::Rc;
-    use windows::core::AsImpl as _;
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
     use windows::Win32::UI::TextServices::{ITfTextInputProcessor, TF_CONVERSIONMODE_KATAKANA};
+    use windows::core::AsImpl as _;
 
     fn ensure_dll_module() {
         let _ = DLL_INSTANCE.set(std::sync::Mutex::new(DllModule::new()));

@@ -2,7 +2,7 @@
 //! engine lives here, together with the string-conversion and ownership
 //! plumbing. The gRPC service (service.rs) never touches the FFI directly.
 
-use std::ffi::{c_char, c_int, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int};
 
 use shared::proto::Suggestion;
 

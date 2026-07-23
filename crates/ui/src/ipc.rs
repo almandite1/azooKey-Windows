@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use azookey_server::PipeConnectInfo;
 use shared::proto::{
-    window_service_server::WindowService as WindowServiceProto, EmptyResponse, SetCandidateRequest,
-    SetInputModeRequest, SetPositionRequest, SetSelectionRequest,
+    EmptyResponse, SetCandidateRequest, SetInputModeRequest, SetPositionRequest,
+    SetSelectionRequest, window_service_server::WindowService as WindowServiceProto,
 };
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};

@@ -8,11 +8,10 @@ mod tsf;
 
 use std::{ffi::c_void, sync::Mutex};
 
-use globals::{DllModule, DLL_INSTANCE, GUID_TEXT_SERVICE};
+use globals::{DLL_INSTANCE, DllModule, GUID_TEXT_SERVICE};
 use register::{CLSIDMgr, CategoryMgr, ProfileMgr};
 use tsf::factory::TextServiceFactory;
 use windows::{
-    core::{IUnknown, Interface as _, GUID, HRESULT},
     Win32::{
         Foundation::{
             CLASS_E_CLASSNOTAVAILABLE, E_INVALIDARG, E_NOINTERFACE, HMODULE, S_FALSE, S_OK,
@@ -23,6 +22,7 @@ use windows::{
             SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH},
         },
     },
+    core::{GUID, HRESULT, IUnknown, Interface as _},
 };
 
 // Logger setup is deferred out of DllMain: spawning threads or doing real
@@ -39,7 +39,7 @@ fn ensure_logger() {
 // -- Dll Export Functions --
 // The IME DLL needs to implement the following four functions to operate as a COM server.
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn DllMain(
     hinst: HMODULE,
     fdw_reason: u32,
@@ -77,7 +77,7 @@ pub extern "system" fn DllMain(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// # Safety
 /// This function uses raw pointers
 pub unsafe extern "system" fn DllGetClassObject(
@@ -126,7 +126,7 @@ pub unsafe extern "system" fn DllGetClassObject(
     S_OK
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn DllRegisterServer() -> HRESULT {
     // Register the CLSID of the TextService
     // Called when the DLL is registered using regsvr32
@@ -146,7 +146,7 @@ pub extern "system" fn DllRegisterServer() -> HRESULT {
     check_err!(result, SELFREG_E_CLASS)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn DllUnregisterServer() -> HRESULT {
     // Unregister the CLSID of the TextService
     // Called when the DLL is unregistered using regsvr32
@@ -175,7 +175,7 @@ pub extern "system" fn DllUnregisterServer() -> HRESULT {
     check_err!(result, SELFREG_E_CLASS)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     // Always refuse to unload: DllModule's ref count does not yet track every
     // live COM object, so claiming S_OK could let the host unload the DLL

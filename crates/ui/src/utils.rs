@@ -1,6 +1,6 @@
 use windows::Win32::{
     Foundation::RECT,
-    Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST},
+    Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect},
 };
 
 /// The caret rectangle the TIP last reported (physical px, screen

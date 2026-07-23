@@ -12,10 +12,10 @@ use tao::window::Window;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::UserEvent;
 use crate::ipc::WindowAction;
 use crate::utils::{self, CandidatePlacement, CaretRect, ShowDecision};
 use crate::window::{is_visible, notify_ime_event, pin_topmost, set_visibility};
-use crate::UserEvent;
 use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_IME_CHANGE, EVENT_OBJECT_IME_HIDE, EVENT_OBJECT_IME_SHOW,
 };

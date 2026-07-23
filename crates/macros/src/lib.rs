@@ -1,19 +1,16 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Error, GenericArgument, ItemFn, PathArguments, ReturnType, Type};
+use syn::{Error, GenericArgument, ItemFn, PathArguments, ReturnType, Type, parse_macro_input};
 
 fn extract_ok_type(return_type: &ReturnType) -> Result<&Type, TokenStream> {
     if let ReturnType::Type(_, ty) = return_type {
-        if let Type::Path(type_path) = &**ty {
-            if let Some(segment) = type_path.path.segments.last() {
-                if segment.ident == "Result" {
-                    if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                        if let Some(GenericArgument::Type(ok_type)) = args.args.first() {
-                            return Ok(ok_type);
-                        }
-                    }
-                }
-            }
+        if let Type::Path(type_path) = &**ty
+            && let Some(segment) = type_path.path.segments.last()
+            && segment.ident == "Result"
+            && let PathArguments::AngleBracketed(args) = &segment.arguments
+            && let Some(GenericArgument::Type(ok_type)) = args.args.first()
+        {
+            return Ok(ok_type);
         }
         Err(
             Error::new_spanned(ty, "Expected a Result<T, anyhow::Error> return type")
