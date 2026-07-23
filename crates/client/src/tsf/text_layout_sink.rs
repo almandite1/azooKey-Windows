@@ -12,8 +12,16 @@ use super::factory::TextServiceFactory_Impl;
 use super::text_service::TextService;
 
 impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
-    // This function is called when the text display position changes when the IME is enabled.
-    // However, this function **will not be called** in Microsoft Store applications such as Notepad, so be careful.
+    // Called when the text display position changes while the IME is active.
+    //
+    // A long-standing comment here claimed this is **never** called in
+    // Microsoft Store applications such as Notepad, and issue #37 was opened
+    // on that basis. Measured on Windows 11 with the packaged Notepad
+    // (Microsoft.WindowsNotepad 11.2605.34.0, under WindowsApps), it is
+    // called: 83 firings for 85 keystrokes. VS Code (75/57) and LibreOffice
+    // (195/71) fire it too, and none of the three ever answered
+    // TS_E_NOLAYOUT. The claim may have held for an older Notepad; it does
+    // not hold now, so do not design around it without re-measuring.
     #[macros::anyhow]
     fn OnLayoutChange(
         &self,
@@ -21,6 +29,12 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
         _lcode: TfLayoutCode,
         _pview: windows_core::Ref<'_, ITfContextView>,
     ) -> Result<()> {
+        // Entry-level, deliberately: whether a host fires this at all is the
+        // question issue #37 turns on, and a successful call otherwise logs
+        // nothing of its own (only the skip and failure paths do), so the
+        // firing rate could not be compared against set_window_position.
+        tracing::debug!("OnLayoutChange fired");
+
         let should_skip = match self.borrow_mut() {
             Ok(mut text_service) => text_service
                 .update_pos_state
