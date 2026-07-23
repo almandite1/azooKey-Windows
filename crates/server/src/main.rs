@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // hangs without touching the engine.
     // "" is the gRPC health protocol's "overall server" service name; the
     // launcher checks that instead of a per-service name
-    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_service_status("", tonic_health::ServingStatus::Serving)
         .await;

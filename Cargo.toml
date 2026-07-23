@@ -26,12 +26,16 @@ version = "0.1.0-alpha.2"
 shared = { path = "crates/shared" }
 macros = { path = "crates/macros" }
 azookey-server = { path = "crates/server" }
-# external — the tonic/prost family must move in lockstep
-tonic = "0.12.3"
-tonic-build = "0.12.3"
-tonic-health = "0.12.3"
-tonic-reflection = "0.12.3"
-prost = "0.13.4"
+# external — the tonic/prost family must move in lockstep. Since 0.14 the
+# prost codec lives outside tonic itself, so the generated code needs
+# tonic-prost at run time and tonic-prost-build at build time.
+tonic = "0.14.6"
+tonic-build = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+tonic-health = "0.14.6"
+tonic-reflection = "0.14.6"
+prost = "0.14.4"
 tokio = "1.42.0"
 # the windows family must move in lockstep
 windows = "0.58.0"
