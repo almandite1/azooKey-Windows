@@ -302,6 +302,13 @@ async fn main() -> anyhow::Result<()> {
                         physical.width,
                         physical.height,
                     );
+
+                    // the window is now the size it is going to be, so a Show
+                    // that was waiting on the measurement can be honoured
+                    // (issue #59)
+                    if placement.on_height() {
+                        window_actions::show_candidate(&candidate_window);
+                    }
                 }
                 UserEvent::ShowDeadline => {
                     // the position never came (a host that reports no layout

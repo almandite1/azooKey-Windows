@@ -50,6 +50,12 @@ pub enum ShowDecision {
 /// So a position is not merely remembered, it is remembered as *fresh* or
 /// not: fresh means "reported since the last hide", i.e. belonging to the
 /// composition being shown.
+///
+/// The window's SIZE is the other half of the same problem. Until the webview
+/// has measured itself the window still has tao's default (800x600), so a
+/// `Show` that early puts an oversized window on screen — clamped against the
+/// wrong height, hence in the wrong place — which then snaps down to its real
+/// size. Both gates must be satisfied before a `Show` is honoured.
 #[derive(Default, Debug)]
 pub struct CandidatePlacement {
     /// The last caret rect the TIP reported. Outlives the hide on purpose —
@@ -57,16 +63,26 @@ pub struct CandidatePlacement {
     pub caret: Option<CaretRect>,
     /// Whether `caret` belongs to the composition currently being shown.
     fresh: bool,
-    /// A `Show` arrived before any fresh position did.
+    /// Whether the webview has reported its measured height yet.
+    ///
+    /// Deliberately NOT reset by `on_hide`, unlike `fresh`: the candidate
+    /// window's height does not vary with the list. `adjustWindowSize` in
+    /// candidate.js measures five sample rows once, on `DOMContentLoaded`,
+    /// and never runs again — so the height is a property of the *window*,
+    /// settled once per ui.exe lifetime. Clearing it per composition would
+    /// mean waiting out the full grace period on every single one, for a
+    /// measurement that is never coming.
+    height_measured: bool,
+    /// A `Show` arrived before both gates were satisfied.
     deferred: bool,
 }
 
 impl CandidatePlacement {
     /// A `Show` request. Deferring returns the window's visibility decision
-    /// to `on_position` (or to `on_deadline`, so a host that never reports a
-    /// layout still gets its candidates).
+    /// to `on_position`/`on_height` (or to `on_deadline`, so a host that
+    /// never reports a layout still gets its candidates).
     pub fn on_show(&mut self) -> ShowDecision {
-        if self.fresh {
+        if self.ready() {
             self.deferred = false;
             ShowDecision::ShowNow
         } else {
@@ -79,14 +95,39 @@ impl CandidatePlacement {
     pub fn on_position(&mut self, caret: CaretRect) -> bool {
         self.caret = Some(caret);
         self.fresh = true;
-        std::mem::take(&mut self.deferred)
+        self.take_deferred_if_ready()
+    }
+
+    /// The webview reported its measured height. Returns true when that
+    /// releases a deferred `Show` — the mirror image of `on_position`.
+    pub fn on_height(&mut self) -> bool {
+        self.height_measured = true;
+        self.take_deferred_if_ready()
     }
 
     /// A `Hide`. The rect stays for re-clamping; its freshness does not — the
-    /// next composition's `Show` must wait for a position of its own.
+    /// next composition's `Show` must wait for a position of its own. The
+    /// measured height stays too (see the field).
     pub fn on_hide(&mut self) {
         self.fresh = false;
         self.deferred = false;
+    }
+
+    /// Whether a `Show` can be honoured: the caret belongs to this
+    /// composition AND the window is the size it is going to be.
+    fn ready(&self) -> bool {
+        self.fresh && self.height_measured
+    }
+
+    /// Consumes a pending `Show` once both gates are satisfied. A gate that
+    /// arrives while the other is still open must leave the `Show` deferred,
+    /// not swallow it.
+    fn take_deferred_if_ready(&mut self) -> bool {
+        if self.ready() {
+            std::mem::take(&mut self.deferred)
+        } else {
+            false
+        }
     }
 
     /// The grace period ran out. Returns true when a `Show` is still waiting,
@@ -382,11 +423,19 @@ mod tests {
         right: 260,
     };
 
+    /// A placement past its one-off startup measurement — the state every
+    /// composition after the first runs in.
+    fn measured() -> CandidatePlacement {
+        let mut placement = CandidatePlacement::default();
+        placement.on_height();
+        placement
+    }
+
     /// Issue #59: the ordinary path. The TIP positions before it shows, so
     /// the position is already fresh and the Show needs no deferral.
     #[test]
     fn a_show_after_a_position_is_immediate() {
-        let mut placement = CandidatePlacement::default();
+        let mut placement = measured();
         placement.on_position(CARET);
 
         assert_eq!(placement.on_show(), ShowDecision::ShowNow);
@@ -397,7 +446,7 @@ mod tests {
     /// the origin. The Show waits, and the position releases it.
     #[test]
     fn a_show_without_a_position_waits_for_one() {
-        let mut placement = CandidatePlacement::default();
+        let mut placement = measured();
 
         assert_eq!(placement.on_show(), ShowDecision::Defer);
         assert!(
@@ -410,12 +459,54 @@ mod tests {
         );
     }
 
+    /// The other half of issue #59: until the webview reports its measured
+    /// height the window still has tao's default size, so showing puts an
+    /// oversized window up — clamped against the wrong height, hence in the
+    /// wrong place — which then snaps down.
+    #[test]
+    fn a_show_before_the_height_is_measured_waits_for_it() {
+        let mut placement = CandidatePlacement::default();
+        placement.on_position(CARET);
+
+        assert_eq!(
+            placement.on_show(),
+            ShowDecision::Defer,
+            "a positioned but unmeasured window must not be shown yet"
+        );
+        assert!(
+            placement.on_height(),
+            "the measurement must release the deferred show"
+        );
+        assert!(
+            !placement.on_deadline(),
+            "and it must not be shown a second time when the grace period ends"
+        );
+    }
+
+    /// Neither gate on its own is enough, and the one that arrives first must
+    /// leave the `Show` deferred rather than swallow it.
+    #[test]
+    fn one_gate_alone_does_not_release_a_deferred_show() {
+        let mut placement = CandidatePlacement::default();
+        assert_eq!(placement.on_show(), ShowDecision::Defer);
+
+        assert!(
+            !placement.on_position(CARET),
+            "the height is still unmeasured"
+        );
+        assert!(placement.on_height(), "now both gates are satisfied");
+        assert!(
+            !placement.on_deadline(),
+            "the show was already honoured exactly once"
+        );
+    }
+
     /// The freshness is per composition: a rect from the PREVIOUS one is
     /// exactly the stale spot this exists to avoid, so a hide must invalidate
     /// it even though the rect itself is kept for re-clamping (issue #3).
     #[test]
     fn a_hide_invalidates_the_position_but_keeps_the_rect() {
-        let mut placement = CandidatePlacement::default();
+        let mut placement = measured();
         placement.on_position(CARET);
         placement.on_hide();
 
@@ -427,6 +518,24 @@ mod tests {
         assert!(
             placement.caret.is_some(),
             "the rect stays available for re-clamping"
+        );
+    }
+
+    /// …but the measurement is NOT per composition. candidate.js measures
+    /// once on DOMContentLoaded and never again, so clearing this on hide
+    /// would make every composition after the first sit out the full grace
+    /// period waiting for an UpdateHeight that never comes.
+    #[test]
+    fn a_hide_keeps_the_measured_height() {
+        let mut placement = measured();
+        placement.on_position(CARET);
+        placement.on_hide();
+        placement.on_position(CARET);
+
+        assert_eq!(
+            placement.on_show(),
+            ShowDecision::ShowNow,
+            "the next composition must not wait for a second measurement"
         );
     }
 
