@@ -1,6 +1,8 @@
 use crate::extension::VKeyExt;
 use anyhow::Result;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, ToUnicode, VK_KANA, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyboardState, ToUnicode, VK_CAPITAL, VK_KANA, VK_SHIFT,
+};
 
 /// Interprets what `ToUnicode` wrote, given what it returned.
 ///
@@ -20,6 +22,35 @@ fn decoded_text(count: i32, units: &[u16]) -> Option<String> {
     let text = String::from_utf16(units).ok()?;
 
     (!text.is_empty()).then_some(text)
+}
+
+/// Clears the keyboard *locks* that must not colour the romaji decoding.
+///
+/// Both of these are toggles whose entire purpose is to change what a Latin
+/// key produces, and `ToUnicode` honours them — but the engine takes plain
+/// lowercase romaji, so neither answer is ever what we want:
+///
+/// * **Kana lock** (`VK_KANA`): with the lock on, the A key answers ち. Not
+///   hypothetical — ATOK's かな入力 mode leaves the lock set, and switching
+///   back to azooKey then typed ﾁ for every A.
+/// * **Caps Lock** (`VK_CAPITAL`): with the lock on, the A key answers 'A',
+///   and the engine cannot make kana of uppercase. Typing あいうえお
+///   produced `AIUEO` instead, i.e. Japanese input stopped working entirely
+///   (issue #80).
+///
+/// Safe to do unconditionally even though direct-input users legitimately
+/// want Caps Lock: in `InputMode::Latin` the transition table hands the key
+/// straight back to the host (`transition` answers `None` for `Input`), so
+/// the host applies the lock to the key itself and this decoding is never
+/// consulted.
+///
+/// Clearing the whole byte drops the toggle bit (0) and the pressed bit (7)
+/// alike, which is what keeps the decoding independent of whatever another
+/// IME left behind.
+fn without_input_locks(mut key_state: [u8; 256]) -> [u8; 256] {
+    key_state[VK_KANA.0 as usize] = 0;
+    key_state[VK_CAPITAL.0 as usize] = 0;
+    key_state
 }
 
 /// Whether a virtual key means "switch the IME on/off".
@@ -123,19 +154,7 @@ impl TryFrom<usize> for UserAction {
                         GetKeyboardState(&mut key_state)?;
                     }
 
-                    // Ignore the kana lock. ToUnicode honours the VK_KANA
-                    // toggle, so with the lock on it answers ち for the A
-                    // key instead of 'a'. The engine takes romaji, so that
-                    // reading is never what we want.
-                    //
-                    // This is not hypothetical: ATOK's かな入力 mode leaves
-                    // the lock set, and switching back to azooKey then typed
-                    // ﾁ for every A. Clearing both the toggle (bit 0) and the
-                    // pressed (bit 7) flag keeps our decoding independent of
-                    // whatever the previous IME left behind.
-                    key_state[VK_KANA.0 as usize] = 0;
-
-                    key_state
+                    without_input_locks(key_state)
                 };
                 let text = {
                     // Bit 2 = "do not change keyboard state" (Win10 1607+;
@@ -231,6 +250,56 @@ mod tests {
     #[test]
     fn a_count_past_the_buffer_is_refused() {
         assert_eq!(decoded_text(9, &[0x0061; 4]), None);
+    }
+
+    /// Issue #80: with Caps Lock on, `ToUnicode` answers 'A' for the A key
+    /// and the engine — which takes lowercase romaji — cannot make kana of
+    /// it. Japanese input stopped working entirely: あいうえお came out as
+    /// `AIUEO`. The kana lock was already cleared here for exactly the same
+    /// reason; Caps Lock was not.
+    #[test]
+    fn caps_lock_is_cleared_before_decoding() {
+        let mut key_state = [0u8; 256];
+        // a toggled lock: bit 0 set (and bit 7 while the key is held)
+        key_state[VK_CAPITAL.0 as usize] = 0x81;
+
+        assert_eq!(
+            without_input_locks(key_state)[VK_CAPITAL.0 as usize],
+            0,
+            "the toggle AND the pressed bit must both go, or ToUnicode still \
+             sees the lock"
+        );
+    }
+
+    /// The original lock this guard existed for (ATOK's かな入力 leaves it
+    /// set). Guarding it here so a future edit cannot drop one while adding
+    /// the other.
+    #[test]
+    fn the_kana_lock_is_cleared_before_decoding() {
+        let mut key_state = [0u8; 256];
+        key_state[VK_KANA.0 as usize] = 0x01;
+
+        assert_eq!(without_input_locks(key_state)[VK_KANA.0 as usize], 0);
+    }
+
+    /// Only the locks. Shift is a per-keystroke modifier the user is holding
+    /// on purpose, and the decoding of every other key must be untouched.
+    #[test]
+    fn no_other_key_state_is_disturbed() {
+        let mut key_state = [0u8; 256];
+        key_state[VK_SHIFT.0 as usize] = 0x80;
+        key_state[0x41] = 0x80; // A held
+        key_state[VK_CAPITAL.0 as usize] = 0x01;
+
+        let cleaned = without_input_locks(key_state);
+
+        assert_eq!(cleaned[VK_SHIFT.0 as usize], 0x80, "Shift is deliberate");
+        assert_eq!(cleaned[0x41], 0x80);
+        assert_eq!(
+            cleaned.iter().filter(|b| **b != 0).count(),
+            2,
+            "exactly the two keys set above survive"
+        );
     }
 
     /// VK_KANJI is an IME on/off key, not a character key: Windows
