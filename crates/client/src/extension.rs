@@ -142,7 +142,8 @@ impl VKeyExt for VIRTUAL_KEY {
 
 #[cfg(test)]
 mod tests {
-    use super::StringExt;
+    use super::{GUIDExt, StringExt};
+    use windows::core::GUID;
 
     #[test]
     fn to_wide_is_even_length_with_two_byte_nul_terminator() {
@@ -165,5 +166,40 @@ mod tests {
         // even-length and end in a two-byte NUL regardless.
         assert_eq!(bytes.len() % 2, 0);
         assert_eq!(&bytes[bytes.len() - 2..], &[0x00, 0x00]);
+    }
+
+    /// The registry format, hand-rolled from the `data4` bytes. `register.rs`
+    /// builds `CLSID\{...}` keys out of this, so a formatting slip does not
+    /// misbehave subtly — it registers the IME under a key TSF never looks up.
+    #[test]
+    fn guid_is_formatted_as_a_braced_registry_string() {
+        let guid = GUID::from_u128(0xffdefe79_2fc2_11ef_b16b_94e70b2c378c);
+
+        assert_eq!(
+            GUIDExt::to_string(&guid),
+            "{ffdefe79-2fc2-11ef-b16b-94e70b2c378c}"
+        );
+    }
+
+    /// Every byte is zero-padded: a `data4` byte below 0x10 must not shorten
+    /// the string (`{...-0a...}`, never `{...-a...}`), and neither may the
+    /// leading groups.
+    #[test]
+    fn guid_groups_are_zero_padded() {
+        let guid = GUID::from_u128(0x00000001_0002_0003_0405_060708090a0b);
+
+        assert_eq!(
+            GUIDExt::to_string(&guid),
+            "{00000001-0002-0003-0405-060708090a0b}"
+        );
+    }
+
+    /// 8-4-4-4-12 hex digits between braces, for any value.
+    #[test]
+    fn guid_string_has_the_canonical_shape() {
+        let formatted = GUIDExt::to_string(&GUID::from_u128(u128::MAX));
+
+        assert_eq!(formatted, "{ffffffff-ffff-ffff-ffff-ffffffffffff}");
+        assert_eq!(formatted.len(), 38);
     }
 }

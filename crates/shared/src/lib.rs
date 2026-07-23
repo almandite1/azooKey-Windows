@@ -502,4 +502,52 @@ mod tests {
         assert_eq!(local_data_root_in(None), None);
         assert_eq!(local_data_root_in(Some("".into())), None);
     }
+
+    /// `#[serde(default)]` is per FIELD, not per struct: a settings.json that
+    /// predates one zenzai key (or was hand-edited down to the keys the user
+    /// cared about) must keep every key it does have. `backend` is covered by
+    /// `older_version_is_migrated_and_stamped`; these are the other two.
+    #[test]
+    fn a_missing_enable_defaults_without_losing_the_other_keys() {
+        let root = TempConfigRoot::new();
+        root.write_settings(r#"{"version":"0.0.1","zenzai":{"profile":"p","backend":"cuda"}}"#);
+
+        let config = AppConfig::new_in(root.path());
+
+        assert!(!config.zenzai.enable, "missing field gets a default");
+        assert_eq!(config.zenzai.profile, "p");
+        assert_eq!(config.zenzai.backend, "cuda");
+    }
+
+    #[test]
+    fn a_missing_profile_defaults_without_losing_the_other_keys() {
+        let root = TempConfigRoot::new();
+        root.write_settings(r#"{"version":"0.0.1","zenzai":{"enable":true,"backend":"cuda"}}"#);
+
+        let config = AppConfig::new_in(root.path());
+
+        assert_eq!(config.zenzai.profile, "", "missing field gets a default");
+        assert!(config.zenzai.enable);
+        assert_eq!(config.zenzai.backend, "cuda");
+    }
+
+    /// The degenerate end of the same rule: an empty (or absent) zenzai
+    /// object is a valid file, not a malformed one — no backup, no reset of
+    /// anything else.
+    #[test]
+    fn an_empty_zenzai_object_yields_the_defaults() {
+        let root = TempConfigRoot::new();
+        root.write_settings(r#"{"version":"0.0.1","zenzai":{}}"#);
+
+        let config = AppConfig::new_in(root.path());
+
+        let defaults = ZenzaiConfig::default();
+        assert_eq!(config.zenzai.enable, defaults.enable);
+        assert_eq!(config.zenzai.profile, defaults.profile);
+        assert_eq!(config.zenzai.backend, defaults.backend);
+        assert!(
+            !root.path().join(SETTINGS_BACKUP_FILENAME).exists(),
+            "a partial file is not corruption"
+        );
+    }
 }

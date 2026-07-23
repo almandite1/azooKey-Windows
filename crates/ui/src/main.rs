@@ -37,21 +37,11 @@ pub enum UserEvent {
     ShowDeadline,
 }
 
-/// Where WebView2 keeps its profile. Left unset it defaults to
-/// `<exe dir>\ui.exe.WebView2`, and the exe dir is Program Files: a standard
-/// (non-elevated) user cannot create it there. That is not a soft failure —
-/// environment creation returns 0x80080005 and the webview never builds, so
-/// neither window ever appears. The logon task's `HighestAvailable` does not
-/// save us; it is a no-op for standard users (issue #54).
-///
-/// Falls back to the temp dir rather than to wry's default: with no
-/// `LOCALAPPDATA` we still need somewhere every user can write, and the
-/// profile is a cache we are free to lose.
+/// Where WebView2 keeps its profile (issue #54). The decision itself lives
+/// in `utils::webview2_data_dir_in` so it can be tested without the
+/// environment; this only resolves the root.
 fn webview2_data_dir() -> std::path::PathBuf {
-    match shared::local_data_root() {
-        Some(root) => root.join("WebView2"),
-        None => std::env::temp_dir().join("Azookey").join("WebView2"),
-    }
+    utils::webview2_data_dir_in(shared::local_data_root())
 }
 
 /// how often the event loop's liveness is probed
@@ -267,17 +257,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 UserEvent::UpdateInputMethod(input_method) => {
-                    // Serialize through serde_json so the value becomes a
-                    // properly quoted/escaped JS string literal, exactly like
-                    // updateCandidates above. The mode string ("あ"/"A") comes
-                    // over the SetInputMode RPC, which any local process on the
-                    // pipe can call with an arbitrary payload; a raw `"{}"`
-                    // interpolation let a `"`/`\` break out of the string and
-                    // inject script into the (UIAccess) webview.
-                    let arg =
-                        serde_json::to_string(&input_method).unwrap_or_else(|_| "\"\"".to_string());
-                    if let Err(e) =
-                        indicator_webview.evaluate_script(&format!("updateInputMethod({arg})"))
+                    // quoted and escaped through serde_json (see the function's
+                    // comment): the mode string is untrusted RPC input
+                    if let Err(e) = indicator_webview
+                        .evaluate_script(&utils::update_input_method_script(&input_method))
                     {
                         eprintln!("evaluate_script failed: {e}");
                     }
