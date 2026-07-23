@@ -34,13 +34,33 @@ if ($LASTEXITCODE -ne 0) { throw "swift test failed with exit code $LASTEXITCODE
 # pipeline, and `swift test` builds the dependency graph again with
 # testability enabled — output post_build must never pick up.
 
+# `cargo make build --debug` is documented (README) and the rest of the flow
+# accepts it — post_build maps `--debug`/`--release`/nothing onto the target
+# subdirectory. cargo itself has no `--debug` flag though (debug IS its
+# default), so forwarding the argument verbatim made the documented command
+# fail outright. cargo-make's command+args form cannot branch on an argument,
+# hence the script (issue #5).
 [tasks.build_x64]
-command = "cargo"
-args = ["build", "${@}"]
+script_runner = "powershell"
+script_extension = "ps1"
+script = """
+$ErrorActionPreference = "Stop"
+$flags = @($args | Where-Object { $_ -and $_ -ne '--debug' })
+cargo build @flags
+if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
+"""
+args = ["${@}"]
 
 [tasks.build_x86]
-command = "cargo"
-args = ["build", "-p", "azookey-windows", "--target=i686-pc-windows-msvc", "${@}"]
+script_runner = "powershell"
+script_extension = "ps1"
+script = """
+$ErrorActionPreference = "Stop"
+$flags = @($args | Where-Object { $_ -and $_ -ne '--debug' })
+cargo build -p azookey-windows --target=i686-pc-windows-msvc @flags
+if ($LASTEXITCODE -ne 0) { throw "cargo build (i686) failed with exit code $LASTEXITCODE" }
+"""
+args = ["${@}"]
 
 [tasks.build_tauri]
 description = "Build the Tauri settings app"
