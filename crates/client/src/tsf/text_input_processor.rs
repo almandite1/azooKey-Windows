@@ -191,23 +191,44 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             }
         };
 
-        let mut text_service = self.borrow_mut()?;
-        text_service.tid = tid;
-        text_service.thread_mgr = Some(thread_mgr.clone());
+        // Scoped on purpose: the advise below must hold NO borrow. TSF gives
+        // the focus to a freshly advised key sink synchronously, from inside
+        // AdviseKeyEventSink, and our OnSetFocus goes on to
+        // sync_input_mode_from_compartments -> apply_input_mode, which
+        // re-enters this very RefCell. Holding the borrow across the advise
+        // made that fail on every activation (issue #62).
+        {
+            let mut text_service = self.borrow_mut()?;
+            text_service.tid = tid;
+            text_service.thread_mgr = Some(thread_mgr.clone());
+        }
 
         // The key-event sink is the lifeline: without it NO keystroke reaches
         // the TIP and nothing composes or converts. This is the ONLY step
         // whose failure is fatal — undo tid/thread_mgr and the dll ref, and
         // report it.
+        //
+        // The compartments are not initialised yet at this point, so the
+        // re-entrant OnSetFocus reads a VT_EMPTY open/close on a fresh thread
+        // — which `decode` already treats as "nobody has decided" rather than
+        // as a failure.
         tracing::debug!("AdviseKeyEventSink");
         if let Err(error) = self.advise_key_sink(&thread_mgr, tid) {
             tracing::error!("AdviseKeyEventSink failed; the TIP cannot receive keys: {error:?}");
-            text_service.tid = 0;
-            text_service.thread_mgr = None;
-            drop(text_service);
+            // re-take the borrow for the rollback; a borrow that is somehow
+            // unavailable here must not mask the advise failure itself
+            match self.borrow_mut() {
+                Ok(mut text_service) => {
+                    text_service.tid = 0;
+                    text_service.thread_mgr = None;
+                }
+                Err(error) => tracing::warn!("could not roll back the activation: {error:?}"),
+            }
             dll_instance.release();
             return Err(error);
         }
+
+        let mut text_service = self.borrow_mut()?;
 
         // Everything below is ADVISORY. A failure here must NOT abort Activate:
         //   - returning Err leaves the previously active IME's icon up (the
@@ -356,14 +377,17 @@ mod tests {
     use std::sync::Mutex;
 
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
-    use windows::Win32::UI::TextServices::{ITfTextInputProcessor, ITfThreadMgr};
+    use windows::Win32::UI::TextServices::{
+        GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, ITfTextInputProcessor, ITfThreadMgr,
+    };
 
     use crate::engine::composition::CompositionState;
     use crate::engine::state::IMEState;
     use crate::globals::{DLL_INSTANCE, DllModule};
     use crate::tsf::factory::TextServiceFactory;
     use crate::tsf::test_support::{
-        EditSessionBehavior, FakeContext, FakeThreadMgr, ThreadMgrLog, factory_of, fake_context_of,
+        CompartmentLog, EditSessionBehavior, FakeContext, FakeThreadMgr, ThreadMgrLog, factory_of,
+        fake_context_of,
     };
 
     // Activate/Deactivate mutate the process-global IMEState and DllModule,
@@ -586,6 +610,49 @@ mod tests {
             factory.borrow().unwrap().tid,
             1,
             "a successful (advisory-degraded) Activate keeps the tid"
+        );
+
+        unsafe { tip.Deactivate() }.expect("Deactivate must succeed");
+        reset_ime_state();
+    }
+
+    /// Issue #62: TSF gives the focus to a freshly advised key sink from
+    /// *inside* `AdviseKeyEventSink`, synchronously on this thread. Activate
+    /// therefore must hold no borrow of the TextService when it advises —
+    /// otherwise `OnSetFocus` -> `sync_input_mode_from_compartments` fails
+    /// with `RefCell already mutably borrowed` on every single activation.
+    #[test]
+    fn a_synchronous_focus_during_advise_can_read_the_text_service() {
+        let _guard = crate::tsf::test_support::global_state_lock();
+        ensure_dll_module();
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        reset_ime_state();
+
+        // an OS that already holds "IME on" — what the callback goes to read
+        let compartments = Rc::new(CompartmentLog::default());
+        compartments.preset(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, 1);
+
+        let log = Rc::new(ThreadMgrLog::default());
+        let thread_mgr = FakeThreadMgr::with_sync_focus_on_advise(log.clone(), compartments);
+        let tip = TextServiceFactory::create::<ITfTextInputProcessor>()
+            .expect("failed to create the TIP");
+
+        unsafe { tip.Activate(Some(&thread_mgr), 1) }
+            .expect("a synchronous OnSetFocus must not break Activate");
+
+        assert_eq!(
+            log.borrow_ok_in_sync_focus.get(),
+            Some(true),
+            "the TextService must be borrowable during the OnSetFocus that \
+             AdviseKeyEventSink dispatches (issue #62)"
+        );
+
+        // and the callback really did its work: the mode the OS held is live
+        let factory = factory_of(&tip);
+        assert_eq!(
+            factory.borrow().unwrap().input_mode,
+            crate::engine::input_mode::InputMode::Kana,
+            "the synchronous focus must have adopted the OS mode"
         );
 
         unsafe { tip.Deactivate() }.expect("Deactivate must succeed");
