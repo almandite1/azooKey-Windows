@@ -1,9 +1,7 @@
 use std::cmp::max;
 
 use crate::{
-    engine::user_action::UserAction,
-    extension::VKeyExt as _,
-    tsf::factory::{TextServiceFactory, TextServiceFactory_Impl},
+    engine::user_action::UserAction, extension::VKeyExt as _, tsf::factory::TextServiceFactory_Impl,
 };
 
 use super::{
@@ -200,7 +198,7 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
     fn OnCompositionTerminated(
         &self,
         _ecwrite: u32,
-        _pcomposition: Option<&ITfComposition>,
+        _pcomposition: windows_core::Ref<'_, ITfComposition>,
     ) -> Result<()> {
         // if user clicked outside the composition, the composition will be terminated
         tracing::debug!("OnCompositionTerminated");
@@ -222,7 +220,7 @@ const CANDIDATES_CHANGED: u32 = TF_CLUIE_COUNT
 /// Flags for `ui_update` when only the highlighted candidate moved.
 const SELECTION_CHANGED: u32 = TF_CLUIE_SELECTION | TF_CLUIE_CURRENTPAGE;
 
-impl TextServiceFactory {
+impl TextServiceFactory_Impl {
     /// Hands the candidate list to the host (UILess mode) and, unless the
     /// host said it draws them itself, to our own window.
     ///
@@ -735,12 +733,11 @@ mod tests {
     use crate::engine::client_action::SetTextType;
     use crate::engine::ipc_service::{FakeIpc, IPCService, IpcCall};
     use crate::tsf::test_support::{
-        EditSessionBehavior, FakeComposition, FakeContext, RangeLog, factory_with_context,
-        factory_with_fake_context, global_state_lock,
+        EditSessionBehavior, FakeComposition, FakeContext, RangeLog, factory_of,
+        factory_with_context, factory_with_fake_context, global_state_lock,
     };
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
-    use windows::core::AsImpl as _;
 
     #[test]
     fn raw_input_kept_for_count_keeps_the_leading_keystrokes() {
@@ -804,7 +801,7 @@ mod tests {
         let fake = install_fake_ipc(scripted(&["水", "未"], "みず", &[4, 4], &[2, 2]));
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
@@ -854,7 +851,7 @@ mod tests {
         let fake = install_fake_ipc(scripted(&["水", "未"], "みず", &[4, 4], &[2, 2]));
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
@@ -916,7 +913,7 @@ mod tests {
         let fake = install_fake_ipc(scripted(&["水"], "みず", &[4], &[2]));
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
@@ -957,7 +954,7 @@ mod tests {
         let fake = install_fake_ipc(scripted(&["ん"], "ん", &[1], &[1]));
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
@@ -1017,7 +1014,7 @@ mod tests {
         let fake = install_fake_ipc(Candidates::default());
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
@@ -1092,7 +1089,7 @@ mod tests {
         let fake = install_fake_ipc(Candidates::default());
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
@@ -1134,7 +1131,7 @@ mod tests {
         let fake = install_fake_ipc(Candidates::default());
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
@@ -1175,7 +1172,7 @@ mod tests {
         // the fake host has no thread manager, so apply_input_mode fails
         // on its own — no extra hook needed
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
@@ -1230,7 +1227,7 @@ mod tests {
         *log.text.borrow_mut() = "こんにちは".encode_utf16().collect();
         let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
         let tip = factory_with_context(context.clone());
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
@@ -1262,7 +1259,7 @@ mod tests {
         let fake = install_fake_ipc(Candidates::default());
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         factory
             .handle_action(
@@ -1296,7 +1293,7 @@ mod tests {
         IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         {
             let text_service = factory.borrow().unwrap();
@@ -1352,7 +1349,7 @@ mod tests {
         fake.lock().unwrap().engine_unavailable = true;
 
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
@@ -1422,7 +1419,7 @@ mod tests {
         // a host that rejects every edit session: set_text and
         // end_composition both fail
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::Reject);
-        let factory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         {
             let text_service = factory.borrow().unwrap();

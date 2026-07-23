@@ -1,6 +1,6 @@
 use windows::{
     Win32::{
-        Foundation::{BOOL, E_INVALIDARG, POINT, RECT},
+        Foundation::{E_INVALIDARG, HINSTANCE, POINT, RECT},
         System::Ole::CONNECT_E_CANNOTCONNECT,
         UI::{
             TextServices::{
@@ -12,7 +12,7 @@ use windows::{
             WindowsAndMessaging::{HICON, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW},
         },
     },
-    core::{BSTR, GUID, IUnknown, Interface as _, PCWSTR},
+    core::{BOOL, BSTR, GUID, IUnknown, Interface as _, PCWSTR},
 };
 
 use crate::{
@@ -25,9 +25,9 @@ use crate::{
 
 use anyhow::{Context as _, Result};
 
-use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
+use super::factory::TextServiceFactory_Impl;
 
-impl TextServiceFactory {
+impl TextServiceFactory_Impl {
     /// Adds our mode button to the host's language bar. Extracted so the
     /// three sites that touch the langbar item (Activate, Deactivate via
     /// `remove_langbar_item`, and `update_lang_bar`'s remove-then-add icon
@@ -113,7 +113,7 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
 
     // this method should not be called
     #[macros::anyhow]
-    fn InitMenu(&self, _pmenu: Option<&ITfMenu>) -> Result<()> {
+    fn InitMenu(&self, _pmenu: windows_core::Ref<'_, ITfMenu>) -> Result<()> {
         Ok(())
     }
 
@@ -148,7 +148,11 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
 
         unsafe {
             let handle = LoadImageW(
-                dll_module.hinst.context("Dll instance not found")?,
+                // 0.62 takes an Option<HINSTANCE> here rather than the HMODULE
+                // the DLL entry point handed us; same handle either way
+                Some(HINSTANCE(
+                    dll_module.hinst.context("Dll instance not found")?.0,
+                )),
                 PCWSTR(icon_id as *mut u16),
                 IMAGE_ICON,
                 0,
@@ -168,7 +172,7 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
 
 impl ITfSource_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
-    fn AdviseSink(&self, riid: *const GUID, punk: Option<&IUnknown>) -> Result<u32> {
+    fn AdviseSink(&self, riid: *const GUID, punk: windows_core::Ref<'_, IUnknown>) -> Result<u32> {
         // a raw deref in a COM callback is a segfault, which catch_unwind
         // cannot turn into an HRESULT (same guard as GetPageIndex)
         if riid.is_null() {

@@ -6,7 +6,7 @@ use std::{ffi::c_void, ptr::addr_of_mut};
 use anyhow::Result;
 use windows::{
     Win32::{
-        Foundation::{BOOL, CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+        Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
         Security::{
             DuplicateTokenEx, GetTokenInformation, LookupPrivilegeValueW, PRIVILEGE_SET,
             PrivilegeCheck, SE_TCB_NAME, SecurityAnonymous, SecurityImpersonation,
@@ -34,7 +34,7 @@ use windows::{
             },
         },
     },
-    core::PWSTR,
+    core::{BOOL, PWSTR},
 };
 
 /// get token from current process
@@ -245,7 +245,7 @@ pub fn create_uiaccess_token(token_handle: &mut HANDLE) -> Result<()> {
             // impersonate winlogon only for the duplication below, then
             // revert no matter how it goes
             let impersonated = (|| {
-                SetThreadToken(None, system_token_handle)?;
+                SetThreadToken(None, Some(system_token_handle))?;
                 DuplicateTokenEx(
                     token_self,
                     TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
@@ -307,9 +307,9 @@ pub fn prepare_uiaccess_token() -> Result<()> {
         // shim's kill-on-close job below — a child that starts first can
         // outlive the whole supervision chain and squat on the pipe name
         let created = CreateProcessAsUserW(
-            token_handle,
+            Some(token_handle),
             None,
-            PWSTR(GetCommandLineW().as_ptr() as *mut u16),
+            Some(PWSTR(GetCommandLineW().as_ptr() as *mut u16)),
             None,
             None,
             false,

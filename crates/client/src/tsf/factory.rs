@@ -5,7 +5,7 @@ use std::{
 
 use windows::{
     Win32::{
-        Foundation::{BOOL, CLASS_E_NOAGGREGATION, E_NOINTERFACE},
+        Foundation::{CLASS_E_NOAGGREGATION, E_NOINTERFACE},
         System::Com::{IClassFactory, IClassFactory_Impl},
         UI::TextServices::{
             ITfCandidateListUIElement, ITfCompartmentEventSink, ITfCompositionSink,
@@ -14,7 +14,7 @@ use windows::{
             ITfThreadMgrEventSink,
         },
     },
-    core::{GUID, IUnknown, Interface, implement},
+    core::{BOOL, GUID, IUnknown, IUnknownImpl as _, Interface, implement},
 };
 
 use anyhow::Result;
@@ -48,7 +48,7 @@ impl IClassFactory_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn CreateInstance(
         &self,
-        punkouter: Option<&IUnknown>,
+        punkouter: windows_core::Ref<'_, IUnknown>,
         riid: *const GUID,
         ppvobject: *mut *mut c_void,
     ) -> Result<()> {
@@ -123,26 +123,39 @@ impl TextServiceFactory {
         this.cast::<I>().map_err(anyhow::Error::new)
     }
 
-    /// QueryInterface on the containing COM object. Replaces the old stored
-    /// `TextService.this` self-reference, which kept the refcount above zero
-    /// forever and leaked one TextService per profile switch (B15). Both
-    /// paths are a QI on the same COM identity, so the sink pointers handed
-    /// to TSF are unchanged.
-    ///
-    /// SAFETY invariant: every `TextServiceFactory` is moved into its COM
-    /// allocation (via `ITfTextInputProcessor::from` / `IUnknown::from` in
-    /// `create()` and `CreateInstance`) before any method is called on it;
-    /// no bare stack instance ever calls `this()`.
-    pub fn this<I: Interface>(&self) -> Result<I> {
-        unsafe { self.cast::<I>().map_err(anyhow::Error::new) }
-    }
-
     pub fn borrow_mut(&self) -> Result<RefMut<'_, TextService>> {
         Ok(self.text_service.try_borrow_mut()?)
     }
 
     pub fn borrow(&self) -> Result<Ref<'_, TextService>> {
         Ok(self.text_service.try_borrow()?)
+    }
+}
+
+/// `#[implement]` does not derive Debug on the generated outer type, and the
+/// `#[tracing::instrument]` attributes on the methods below record `self`.
+/// Delegating to the inner factory keeps every span's fields exactly what they
+/// were when these methods lived on `TextServiceFactory` (issue #1).
+impl std::fmt::Debug for TextServiceFactory_Impl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.get_impl(), f)
+    }
+}
+
+/// Helpers that need the *containing COM object* rather than the inner
+/// `TextServiceFactory`. Since windows 0.62 the inner type has no way back to
+/// its outer `_Impl` box (the `#[implement]` macro no longer generates a
+/// `cast` on it), so anything performing a QueryInterface on our own identity
+/// has to live here. `_Impl` derefs to `TextServiceFactory`, so these can
+/// still use `borrow()` and friends freely.
+impl TextServiceFactory_Impl {
+    /// QueryInterface on the containing COM object. Replaces the old stored
+    /// `TextService.this` self-reference, which kept the refcount above zero
+    /// forever and leaked one TextService per profile switch (B15). Both
+    /// paths are a QI on the same COM identity, so the sink pointers handed
+    /// to TSF are unchanged.
+    pub fn this<I: Interface>(&self) -> Result<I> {
+        self.to_object().cast::<I>().map_err(anyhow::Error::new)
     }
 
     /// Advises this TIP as a sink of type `S` on `source` and remembers the

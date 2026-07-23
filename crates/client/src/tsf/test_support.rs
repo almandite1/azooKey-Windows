@@ -22,8 +22,9 @@ use std::rc::Rc;
 
 use windows::{
     Win32::{
-        Foundation::{BOOL, E_FAIL, E_NOTIMPL, HWND, LPARAM, POINT, RECT, S_OK, WPARAM},
+        Foundation::{E_FAIL, E_NOTIMPL, HWND, LPARAM, POINT, RECT, S_OK, WPARAM},
         System::Com::IDataObject,
+        System::Variant::VARIANT,
         UI::TextServices::{
             IEnumITfCompositionView, IEnumTfContextViews, IEnumTfContexts, IEnumTfDocumentMgrs,
             IEnumTfFunctionProviders, IEnumTfLangBarItems, IEnumTfProperties, IEnumTfRanges,
@@ -42,7 +43,7 @@ use windows::{
             TF_S_ASYNC, TF_SELECTION, TS_E_NOLAYOUT, TS_STATUS,
         },
     },
-    core::{BSTR, GUID, IUnknown, PCWSTR, PWSTR, Result as WinResult, VARIANT, implement},
+    core::{BOOL, BSTR, GUID, IUnknown, OutRef, PCWSTR, PWSTR, Result as WinResult, implement},
 };
 
 /// The edit cookie the fake hands to `DoEditSession`. Any non-zero value
@@ -194,7 +195,11 @@ impl ITfCompartmentMgr_Impl for FakeContext_Impl {
 }
 
 impl ITfSource_Impl for FakeContext_Impl {
-    fn AdviseSink(&self, _riid: *const GUID, _punk: Option<&IUnknown>) -> WinResult<u32> {
+    fn AdviseSink(
+        &self,
+        _riid: *const GUID,
+        _punk: windows_core::Ref<'_, windows_core::IUnknown>,
+    ) -> WinResult<u32> {
         let cookie = self.next_sink_cookie.get();
         self.next_sink_cookie.set(cookie + 1);
         self.sink_advises.borrow_mut().push(cookie);
@@ -211,7 +216,7 @@ impl ITfContext_Impl for FakeContext_Impl {
     fn RequestEditSession(
         &self,
         tid: u32,
-        pes: Option<&ITfEditSession>,
+        pes: windows_core::Ref<'_, ITfEditSession>,
         dwflags: TF_CONTEXT_EDIT_CONTEXT_FLAGS,
     ) -> WinResult<windows::core::HRESULT> {
         self.requests.borrow_mut().push(EditSessionRequest {
@@ -221,7 +226,9 @@ impl ITfContext_Impl for FakeContext_Impl {
 
         match self.behavior.get() {
             EditSessionBehavior::RunSync => {
-                let session = pes.ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
+                let session = pes
+                    .as_ref()
+                    .ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
                 // phrSession carries the session's own result, which is
                 // exactly what the TIP currently throws away
                 Ok(match unsafe { session.DoEditSession(FAKE_COOKIE) } {
@@ -236,7 +243,9 @@ impl ITfContext_Impl for FakeContext_Impl {
                 if (dwflags.0 & TF_ES_SYNC.0) != 0 {
                     Err(windows::core::Error::from_hresult(TF_E_SYNCHRONOUS))
                 } else {
-                    let session = pes.ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
+                    let session = pes
+                        .as_ref()
+                        .ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
                     Ok(match unsafe { session.DoEditSession(FAKE_COOKIE) } {
                         Ok(()) => S_OK,
                         Err(e) => e.code(),
@@ -338,7 +347,11 @@ impl ITfContext_Impl for FakeContext_Impl {
         Err(E_NOTIMPL.into())
     }
 
-    fn CreateRangeBackup(&self, _ec: u32, _prange: Option<&ITfRange>) -> WinResult<ITfRangeBackup> {
+    fn CreateRangeBackup(
+        &self,
+        _ec: u32,
+        _prange: windows_core::Ref<'_, ITfRange>,
+    ) -> WinResult<ITfRangeBackup> {
         Err(E_NOTIMPL.into())
     }
 }
@@ -347,8 +360,8 @@ impl ITfContextComposition_Impl for FakeContext_Impl {
     fn StartComposition(
         &self,
         _ecwrite: u32,
-        _pcompositionrange: Option<&ITfRange>,
-        _psink: Option<&ITfCompositionSink>,
+        _pcompositionrange: windows_core::Ref<'_, ITfRange>,
+        _psink: windows_core::Ref<'_, ITfCompositionSink>,
     ) -> WinResult<ITfComposition> {
         Ok(FakeComposition::new())
     }
@@ -360,7 +373,7 @@ impl ITfContextComposition_Impl for FakeContext_Impl {
     fn FindComposition(
         &self,
         _ecread: u32,
-        _ptestrange: Option<&ITfRange>,
+        _ptestrange: windows_core::Ref<'_, ITfRange>,
     ) -> WinResult<IEnumITfCompositionView> {
         Err(E_NOTIMPL.into())
     }
@@ -368,8 +381,8 @@ impl ITfContextComposition_Impl for FakeContext_Impl {
     fn TakeOwnership(
         &self,
         _ecwrite: u32,
-        _pcomposition: Option<&ITfCompositionView>,
-        _psink: Option<&ITfCompositionSink>,
+        _pcomposition: windows_core::Ref<'_, ITfCompositionView>,
+        _psink: windows_core::Ref<'_, ITfCompositionSink>,
     ) -> WinResult<ITfComposition> {
         Err(E_NOTIMPL.into())
     }
@@ -395,7 +408,7 @@ impl ITfInsertAtSelection_Impl for FakeContext_Impl {
         &self,
         _ec: u32,
         _dwflags: u32,
-        _pdataobject: Option<&IDataObject>,
+        _pdataobject: windows_core::Ref<'_, IDataObject>,
     ) -> WinResult<ITfRange> {
         Err(E_NOTIMPL.into())
     }
@@ -452,7 +465,7 @@ impl ITfContextView_Impl for FakeContextView_Impl {
     fn GetTextExt(
         &self,
         _ec: u32,
-        _prange: Option<&ITfRange>,
+        _prange: windows_core::Ref<'_, ITfRange>,
         prc: *mut RECT,
         pfclipped: *mut BOOL,
     ) -> WinResult<()> {
@@ -503,14 +516,14 @@ impl ITfDocumentMgr_Impl for FakeDocumentMgr_Impl {
         &self,
         _tidowner: u32,
         _dwflags: u32,
-        _punk: Option<&IUnknown>,
-        _ppic: *mut Option<ITfContext>,
+        _punk: windows_core::Ref<'_, windows_core::IUnknown>,
+        _ppic: OutRef<'_, ITfContext>,
         _pectextstore: *mut u32,
     ) -> WinResult<()> {
         Err(E_NOTIMPL.into())
     }
 
-    fn Push(&self, _pic: Option<&ITfContext>) -> WinResult<()> {
+    fn Push(&self, _pic: windows_core::Ref<'_, ITfContext>) -> WinResult<()> {
         Err(E_NOTIMPL.into())
     }
 
@@ -627,7 +640,7 @@ impl ITfRange_Impl for FakeRange_Impl {
         &self,
         _ec: u32,
         _dwflags: u32,
-        _pdataobject: Option<&IDataObject>,
+        _pdataobject: windows_core::Ref<'_, IDataObject>,
     ) -> WinResult<()> {
         Err(E_NOTIMPL.into())
     }
@@ -663,7 +676,7 @@ impl ITfRange_Impl for FakeRange_Impl {
     fn ShiftStartToRange(
         &self,
         _ec: u32,
-        _prange: Option<&ITfRange>,
+        _prange: windows_core::Ref<'_, ITfRange>,
         _apos: windows::Win32::UI::TextServices::TfAnchor,
     ) -> WinResult<()> {
         Err(E_NOTIMPL.into())
@@ -672,7 +685,7 @@ impl ITfRange_Impl for FakeRange_Impl {
     fn ShiftEndToRange(
         &self,
         _ec: u32,
-        _prange: Option<&ITfRange>,
+        _prange: windows_core::Ref<'_, ITfRange>,
         _apos: windows::Win32::UI::TextServices::TfAnchor,
     ) -> WinResult<()> {
         Err(E_NOTIMPL.into())
@@ -709,7 +722,7 @@ impl ITfRange_Impl for FakeRange_Impl {
     fn IsEqualStart(
         &self,
         _ec: u32,
-        _pwith: Option<&ITfRange>,
+        _pwith: windows_core::Ref<'_, ITfRange>,
         _apos: windows::Win32::UI::TextServices::TfAnchor,
     ) -> WinResult<BOOL> {
         Err(E_NOTIMPL.into())
@@ -718,7 +731,7 @@ impl ITfRange_Impl for FakeRange_Impl {
     fn IsEqualEnd(
         &self,
         _ec: u32,
-        _pwith: Option<&ITfRange>,
+        _pwith: windows_core::Ref<'_, ITfRange>,
         _apos: windows::Win32::UI::TextServices::TfAnchor,
     ) -> WinResult<BOOL> {
         Err(E_NOTIMPL.into())
@@ -727,7 +740,7 @@ impl ITfRange_Impl for FakeRange_Impl {
     fn CompareStart(
         &self,
         _ec: u32,
-        _pwith: Option<&ITfRange>,
+        _pwith: windows_core::Ref<'_, ITfRange>,
         _apos: windows::Win32::UI::TextServices::TfAnchor,
     ) -> WinResult<i32> {
         Err(E_NOTIMPL.into())
@@ -736,7 +749,7 @@ impl ITfRange_Impl for FakeRange_Impl {
     fn CompareEnd(
         &self,
         _ec: u32,
-        _pwith: Option<&ITfRange>,
+        _pwith: windows_core::Ref<'_, ITfRange>,
         _apos: windows::Win32::UI::TextServices::TfAnchor,
     ) -> WinResult<i32> {
         Err(E_NOTIMPL.into())
@@ -785,13 +798,13 @@ impl ITfReadOnlyProperty_Impl for FakeProperty_Impl {
     fn EnumRanges(
         &self,
         _ec: u32,
-        _ppenum: *mut Option<IEnumTfRanges>,
-        _ptargetrange: Option<&ITfRange>,
+        _ppenum: OutRef<'_, IEnumTfRanges>,
+        _ptargetrange: windows_core::Ref<'_, ITfRange>,
     ) -> WinResult<()> {
         Err(E_NOTIMPL.into())
     }
 
-    fn GetValue(&self, _ec: u32, _prange: Option<&ITfRange>) -> WinResult<VARIANT> {
+    fn GetValue(&self, _ec: u32, _prange: windows_core::Ref<'_, ITfRange>) -> WinResult<VARIANT> {
         Err(E_NOTIMPL.into())
     }
 
@@ -804,8 +817,8 @@ impl ITfProperty_Impl for FakeProperty_Impl {
     fn FindRange(
         &self,
         _ec: u32,
-        _prange: Option<&ITfRange>,
-        _pprange: *mut Option<ITfRange>,
+        _prange: windows_core::Ref<'_, ITfRange>,
+        _pprange: OutRef<'_, ITfRange>,
         _apos: windows::Win32::UI::TextServices::TfAnchor,
     ) -> WinResult<()> {
         Err(E_NOTIMPL.into())
@@ -814,8 +827,8 @@ impl ITfProperty_Impl for FakeProperty_Impl {
     fn SetValueStore(
         &self,
         _ec: u32,
-        _prange: Option<&ITfRange>,
-        _ppropstore: Option<&ITfPropertyStore>,
+        _prange: windows_core::Ref<'_, ITfRange>,
+        _ppropstore: windows_core::Ref<'_, ITfPropertyStore>,
     ) -> WinResult<()> {
         Err(E_NOTIMPL.into())
     }
@@ -823,13 +836,13 @@ impl ITfProperty_Impl for FakeProperty_Impl {
     fn SetValue(
         &self,
         _ec: u32,
-        _prange: Option<&ITfRange>,
+        _prange: windows_core::Ref<'_, ITfRange>,
         _pvarvalue: *const VARIANT,
     ) -> WinResult<()> {
         Ok(())
     }
 
-    fn Clear(&self, _ec: u32, _prange: Option<&ITfRange>) -> WinResult<()> {
+    fn Clear(&self, _ec: u32, _prange: windows_core::Ref<'_, ITfRange>) -> WinResult<()> {
         Ok(())
     }
 }
@@ -856,11 +869,15 @@ impl ITfComposition_Impl for FakeComposition_Impl {
         Ok(FakeRange::new(self.log.clone()))
     }
 
-    fn ShiftStart(&self, _ecwrite: u32, _pnewstart: Option<&ITfRange>) -> WinResult<()> {
+    fn ShiftStart(
+        &self,
+        _ecwrite: u32,
+        _pnewstart: windows_core::Ref<'_, ITfRange>,
+    ) -> WinResult<()> {
         Ok(())
     }
 
-    fn ShiftEnd(&self, _ecwrite: u32, _pnewend: Option<&ITfRange>) -> WinResult<()> {
+    fn ShiftEnd(&self, _ecwrite: u32, _pnewend: windows_core::Ref<'_, ITfRange>) -> WinResult<()> {
         Ok(())
     }
 
@@ -1014,8 +1031,14 @@ impl ITfCompartment_Impl for FakeCompartment_Impl {
 }
 
 impl ITfSource_Impl for FakeCompartment_Impl {
-    fn AdviseSink(&self, _riid: *const GUID, punk: Option<&IUnknown>) -> WinResult<u32> {
-        let punk = punk.ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
+    fn AdviseSink(
+        &self,
+        _riid: *const GUID,
+        punk: windows_core::Ref<'_, windows_core::IUnknown>,
+    ) -> WinResult<u32> {
+        let punk = punk
+            .as_ref()
+            .ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
         let sink: ITfCompartmentEventSink = windows::core::Interface::cast(punk)?;
 
         let cookie = self.log.next_cookie.get() + 1;
@@ -1173,7 +1196,7 @@ impl ITfCompartmentMgr_Impl for FakeThreadMgr_Impl {
 impl ITfUIElementMgr_Impl for FakeThreadMgr_Impl {
     fn BeginUIElement(
         &self,
-        _pelement: Option<&ITfUIElement>,
+        _pelement: windows_core::Ref<'_, ITfUIElement>,
         pbshow: *mut BOOL,
         pdwuielementid: *mut u32,
     ) -> WinResult<()> {
@@ -1238,13 +1261,13 @@ impl ITfThreadMgr_Impl for FakeThreadMgr_Impl {
             None => Err(E_FAIL.into()),
         }
     }
-    fn SetFocus(&self, _pdimfocus: Option<&ITfDocumentMgr>) -> WinResult<()> {
+    fn SetFocus(&self, _pdimfocus: windows_core::Ref<'_, ITfDocumentMgr>) -> WinResult<()> {
         Err(E_NOTIMPL.into())
     }
     fn AssociateFocus(
         &self,
         _hwnd: HWND,
-        _pdimnew: Option<&ITfDocumentMgr>,
+        _pdimnew: windows_core::Ref<'_, ITfDocumentMgr>,
     ) -> WinResult<ITfDocumentMgr> {
         Err(E_NOTIMPL.into())
     }
@@ -1266,7 +1289,7 @@ impl ITfKeystrokeMgr_Impl for FakeThreadMgr_Impl {
     fn AdviseKeyEventSink(
         &self,
         _tid: u32,
-        psink: Option<&ITfKeyEventSink>,
+        psink: windows_core::Ref<'_, ITfKeyEventSink>,
         _fforeground: BOOL,
     ) -> WinResult<()> {
         self.log.key_sink_advises.borrow_mut().push(psink.is_some());
@@ -1295,7 +1318,7 @@ impl ITfKeystrokeMgr_Impl for FakeThreadMgr_Impl {
     }
     fn GetPreservedKey(
         &self,
-        _pic: Option<&ITfContext>,
+        _pic: windows_core::Ref<'_, ITfContext>,
         _pprekey: *const TF_PRESERVEDKEY,
     ) -> WinResult<GUID> {
         Err(E_NOTIMPL.into())
@@ -1337,7 +1360,7 @@ impl ITfKeystrokeMgr_Impl for FakeThreadMgr_Impl {
     }
     fn SimulatePreservedKey(
         &self,
-        _pic: Option<&ITfContext>,
+        _pic: windows_core::Ref<'_, ITfContext>,
         _rguid: *const GUID,
     ) -> WinResult<BOOL> {
         Err(E_NOTIMPL.into())
@@ -1345,7 +1368,11 @@ impl ITfKeystrokeMgr_Impl for FakeThreadMgr_Impl {
 }
 
 impl ITfSource_Impl for FakeThreadMgr_Impl {
-    fn AdviseSink(&self, _riid: *const GUID, punk: Option<&IUnknown>) -> WinResult<u32> {
+    fn AdviseSink(
+        &self,
+        _riid: *const GUID,
+        punk: windows_core::Ref<'_, windows_core::IUnknown>,
+    ) -> WinResult<u32> {
         if punk.is_none() {
             return Err(E_FAIL.into());
         }
@@ -1367,14 +1394,14 @@ impl ITfLangBarItemMgr_Impl for FakeThreadMgr_Impl {
     fn GetItem(&self, _rguid: *const GUID) -> WinResult<ITfLangBarItem> {
         Err(E_NOTIMPL.into())
     }
-    fn AddItem(&self, _punk: Option<&ITfLangBarItem>) -> WinResult<()> {
+    fn AddItem(&self, _punk: windows_core::Ref<'_, ITfLangBarItem>) -> WinResult<()> {
         self.log.langbar_adds.set(self.log.langbar_adds.get() + 1);
         if self.fail_add_item {
             return Err(E_FAIL.into());
         }
         Ok(())
     }
-    fn RemoveItem(&self, _punk: Option<&ITfLangBarItem>) -> WinResult<()> {
+    fn RemoveItem(&self, _punk: windows_core::Ref<'_, ITfLangBarItem>) -> WinResult<()> {
         self.log
             .langbar_removes
             .set(self.log.langbar_removes.get() + 1);
@@ -1382,7 +1409,7 @@ impl ITfLangBarItemMgr_Impl for FakeThreadMgr_Impl {
     }
     fn AdviseItemSink(
         &self,
-        _punk: Option<&ITfLangBarItemSink>,
+        _punk: windows_core::Ref<'_, ITfLangBarItemSink>,
         _pdwcookie: *mut u32,
         _rguiditem: *const GUID,
     ) -> WinResult<()> {
@@ -1408,7 +1435,7 @@ impl ITfLangBarItemMgr_Impl for FakeThreadMgr_Impl {
     fn GetItems(
         &self,
         _ulcount: u32,
-        _ppitem: *mut Option<ITfLangBarItem>,
+        _ppitem: OutRef<'_, ITfLangBarItem>,
         _pinfo: *mut TF_LANGBARITEMINFO,
         _pdwstatus: *mut u32,
         _pcfetched: *mut u32,
@@ -1462,6 +1489,20 @@ pub fn factory_with_context(
     }
 
     tip
+}
+
+/// The factory behind a TIP interface, as the *outer* COM object.
+///
+/// `as_impl()` yields the inner `TextServiceFactory`, and since windows 0.62
+/// the inner type has no route back to its outer `_Impl` box — which is where
+/// the factory's own methods now live, because they QueryInterface our own
+/// identity. Tests therefore go through a `ComObject`, which derefs to the
+/// `_Impl` (and on through to the inner, so `borrow()` still works).
+pub fn factory_of(
+    tip: &windows::Win32::UI::TextServices::ITfTextInputProcessor,
+) -> windows::core::ComObject<super::factory::TextServiceFactory> {
+    windows::core::ComObject::<super::factory::TextServiceFactory>::cast_from(tip)
+        .expect("the TIP must be our own factory")
 }
 
 /// [`factory_with_context`] over a plain [`FakeContext`] with the given

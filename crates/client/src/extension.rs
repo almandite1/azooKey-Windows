@@ -81,7 +81,8 @@ impl RegKey for HKEY {
             let result = RegCreateKeyExW(
                 *self,
                 PCWSTR(subkey_name_w.as_ptr()),
-                0,
+                // the reserved parameter, modelled as an Option since 0.62
+                None,
                 None,
                 REG_OPTION_NON_VOLATILE,
                 KEY_WRITE,
@@ -101,7 +102,8 @@ impl RegKey for HKEY {
             let result = RegSetValueExW(
                 *self,
                 PCWSTR(value_name_w.as_ptr()),
-                0,
+                // ditto: reserved
+                None,
                 REG_SZ,
                 Some(value_w.as_slice()),
             );

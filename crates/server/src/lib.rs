@@ -148,7 +148,7 @@ fn current_user_sid_string() -> io::Result<String> {
                 .map_err(|e| io::Error::other(format!("SID string was not valid UTF-16: {e}")));
             // ConvertSidToStringSidW allocates with LocalAlloc; free it whether
             // or not the UTF-16 decode succeeded.
-            let _ = LocalFree(HLOCAL(sid_string.0 as *mut c_void));
+            let _ = LocalFree(Some(HLOCAL(sid_string.0 as *mut c_void)));
             owned
         })();
 

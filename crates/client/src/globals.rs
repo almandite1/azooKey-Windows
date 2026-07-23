@@ -100,7 +100,7 @@ impl DllModule {
         // returned length is strictly less than its size (i.e. it fit).
         let mut buffer: Vec<u16> = vec![0; MAX_PATH as usize];
         loop {
-            let length = unsafe { GetModuleFileNameW(dll_instance, &mut buffer) } as usize;
+            let length = unsafe { GetModuleFileNameW(Some(dll_instance), &mut buffer) } as usize;
 
             if length == 0 {
                 return Err(anyhow::anyhow!("GetModuleFileNameW failed: {:?}", unsafe {

@@ -30,18 +30,18 @@
 use anyhow::Result;
 use windows::{
     Win32::{
-        Foundation::{BOOL, E_FAIL, E_INVALIDARG},
+        Foundation::{E_FAIL, E_INVALIDARG},
         UI::TextServices::{
             ITfCandidateListUIElement_Impl, ITfContext, ITfDocumentMgr, ITfUIElement,
             ITfUIElement_Impl, ITfUIElementMgr,
         },
     },
-    core::{BSTR, GUID, Interface},
+    core::{BOOL, BSTR, GUID, Interface},
 };
 
 use crate::{engine::ipc_service::Candidates, globals::GUID_CANDIDATE_LIST_UI_ELEMENT};
 
-use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
+use super::factory::TextServiceFactory_Impl;
 
 /// Candidates per page, as reported to the host.
 ///
@@ -70,7 +70,7 @@ fn force_candidate_window() -> bool {
     })
 }
 
-impl TextServiceFactory {
+impl TextServiceFactory_Impl {
     /// The host's UILess element manager, or `None` when the host has no
     /// `ITfUIElementMgr` — such a host wants our own window, so every caller
     /// treats `None` as "fall back, advisory". A borrow conflict still
@@ -351,15 +351,19 @@ impl ITfCandidateListUIElement_Impl for TextServiceFactory_Impl {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    // the tests build a bare factory; the module itself only needs the
+    // generated outer type now
     use crate::globals::{DLL_INSTANCE, DllModule};
-    use crate::tsf::test_support::{FakeThreadMgr, ThreadMgrLog, UiElementLog, global_state_lock};
+    use crate::tsf::factory::TextServiceFactory;
+    use crate::tsf::test_support::{
+        FakeThreadMgr, ThreadMgrLog, UiElementLog, factory_of, global_state_lock,
+    };
     use std::rc::Rc;
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
     use windows::Win32::UI::TextServices::{
         ITfCandidateListUIElement, ITfTextInputProcessor, TF_CLUIE_CURRENTPAGE, TF_CLUIE_PAGEINDEX,
         TF_CLUIE_STRING,
     };
-    use windows::core::AsImpl as _;
 
     /// Calls `GetPageIndex` through the raw vtable, the way a host does.
     ///
@@ -410,7 +414,7 @@ mod tests {
         let _guard = global_state_lock();
         let ui = Rc::new(UiElementLog::default());
         let tip = activate_with(ui.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         assert!(factory.ui_begin().unwrap(), "pbShow=TRUE means we may draw");
         assert_eq!(ui.begin_calls.get(), 1);
@@ -426,7 +430,7 @@ mod tests {
         let _guard = global_state_lock();
         let ui = Rc::new(UiElementLog::suppressing());
         let tip = activate_with(ui.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         assert!(
             !factory.ui_begin().unwrap(),
@@ -445,7 +449,7 @@ mod tests {
         let _guard = global_state_lock();
         ensure_dll_module();
         let tip = TextServiceFactory::create::<ITfTextInputProcessor>().unwrap();
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         // never activated: no thread manager at all
         assert!(factory.ui_begin().unwrap());
@@ -459,7 +463,7 @@ mod tests {
         let _guard = global_state_lock();
         let ui = Rc::new(UiElementLog::default());
         let tip = activate_with(ui.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory.ui_begin().unwrap();
 
         factory
@@ -483,7 +487,7 @@ mod tests {
         let _guard = global_state_lock();
         let ui = Rc::new(UiElementLog::default());
         let tip = activate_with(ui);
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory.ui_begin().unwrap();
         factory
             .ui_update(&candidates(&["水"]), 0, TF_CLUIE_STRING)
@@ -504,7 +508,7 @@ mod tests {
         let _guard = global_state_lock();
         let ui = Rc::new(UiElementLog::default());
         let tip = activate_with(ui);
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory.ui_begin().unwrap();
         // 7 candidates over pages of 5 -> 2 pages
         factory
@@ -558,7 +562,7 @@ mod tests {
         let _guard = global_state_lock();
         let ui = Rc::new(UiElementLog::default());
         let tip = activate_with(ui.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         factory.ui_begin().unwrap();
         assert_eq!(ui.live_elements(), 1, "an element is open");
@@ -579,7 +583,7 @@ mod tests {
         let _guard = global_state_lock();
         let ui = Rc::new(UiElementLog::default());
         let tip = activate_with(ui.clone());
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
 
         factory
             .ui_end()
@@ -599,7 +603,7 @@ mod tests {
         let _guard = global_state_lock();
         let ui = Rc::new(UiElementLog::default());
         let tip = activate_with(ui);
-        let factory: &TextServiceFactory = unsafe { tip.as_impl() };
+        let factory = factory_of(&tip);
         factory.ui_begin().unwrap();
 
         let list = candidates(&["1", "2", "3", "4", "5", "6", "7"]);
