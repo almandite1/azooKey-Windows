@@ -191,10 +191,11 @@ impl TextServiceFactory_Impl {
     /// Whether an on/off keystroke is a second delivery of a press already
     /// handled.
     ///
-    /// One press can reach the TIP twice — measured at 5-7ms apart on a
-    /// 101-key layout — and the second flip cancels the first, so the key
-    /// looks dead. The window is deliberately tiny: no human double-tap
-    /// fits inside it (that would be 20 presses a second).
+    /// Precautionary: were one press ever delivered twice, the second flip
+    /// would cancel the first and the key would look dead. No host tested so
+    /// far does this. The window is deliberately tiny — no human double-tap
+    /// fits inside it (that would be 20 presses a second) — so a guard that
+    /// is never needed also never gets in the way.
     pub fn toggle_is_duplicate(&self) -> Result<bool> {
         Ok(self
             .borrow()?
@@ -388,10 +389,10 @@ mod tests {
         teardown(&tip);
     }
 
-    /// The double-delivery guard: one physical press delivered twice must
-    /// toggle once. Measured on a 101-key layout, Alt+` reaches OnKeyDown
-    /// twice 5-7ms apart, and the second flip cancelled the first — the key
-    /// simply looked dead.
+    /// The double-delivery guard: were one physical press ever delivered
+    /// twice, it must still toggle once. Precautionary — no host tested so
+    /// far does this — but the failure it prevents is silent (two flips
+    /// cancel and the key looks dead), which is worth a cheap guard.
     #[test]
     fn a_second_delivery_of_one_press_is_ignored() {
         let _guard = global_state_lock();
@@ -415,8 +416,8 @@ mod tests {
 
     /// The guard is only armed if an actual toggle arms it. `act_set_ime_mode`
     /// is the one place the mode changes, whichever path asked for it, so the
-    /// stamp lives there — putting it in `OnPreservedKey` alone left the
-    /// raw-VK-twice case (the one that actually happens) unguarded.
+    /// stamp lives there rather than in `OnPreservedKey` — which on the hosts
+    /// tested never fires at all.
     #[test]
     fn performing_a_toggle_arms_the_guard() {
         let _guard = global_state_lock();
