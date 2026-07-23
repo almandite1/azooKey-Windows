@@ -18,8 +18,8 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
     // Microsoft Store applications such as Notepad, and issue #37 was opened
     // on that basis. Measured on Windows 11 with the packaged Notepad
     // (Microsoft.WindowsNotepad 11.2605.34.0, under WindowsApps), it is
-    // called: 83 firings for 85 keystrokes. VS Code (75/57) and LibreOffice
-    // (195/71) fire it too, and none of the three ever answered
+    // called: 83 firings for 85 keystrokes. Two third-party Win32 hosts
+    // (75/57 and 195/71) fire it too, and none of the three ever answered
     // TS_E_NOLAYOUT. The claim may have held for an older Notepad; it does
     // not hold now, so do not design around it without re-measuring.
     #[macros::anyhow]
