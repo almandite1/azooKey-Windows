@@ -157,6 +157,30 @@ fn current_user_sid_string() -> io::Result<String> {
     }
 }
 
+/// The pipe's security descriptor, in SDDL, for the owning user's SID.
+///
+/// DACL: sandboxed principals may CONNECT but not CREATE pipe instances.
+/// GENERIC_ALL (GA) includes FILE_CREATE_PIPE_INSTANCE, so the original
+/// all-GA descriptor let any AppContainer (AC) or restricted (RC) process
+/// stand up a rogue instance of this pipe and receive a peer client's
+/// connection — intercepting the raw keystroke stream (AppendText). AC/RC get
+/// 0x12019B (FILE_GENERIC_READ|FILE_GENERIC_WRITE minus FILE_APPEND_DATA ==
+/// minus FILE_CREATE_PIPE_INSTANCE), which is exactly what the client opens
+/// with (see `shared::pipe::PIPE_CLIENT_ACCESS`), so connecting still works.
+/// The owning user's SID (not the whole BU group) keeps GA: the server runs as
+/// that user and must create instances, while a *different* local user — whose
+/// token lacks this SID — is no longer granted access, closing the RDP / fast-
+/// user-switching cross-session hole. SY/BA keep GA for SYSTEM and an elevated
+/// server. SACL: low-IL clients (sandboxed browsers) may still write up to the
+/// pipe.
+///
+/// See https://nathancorvussolis.blogspot.com/2018/05/windows-ime-security.html
+fn pipe_sddl(user_sid: &str) -> String {
+    format!(
+        "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{user_sid})(A;;0x12019b;;;AC)(A;;0x12019b;;;RC)S:(ML;;NW;;;LW)"
+    )
+}
+
 impl TonicNamedPipeServer {
     /// Accepts connections on `path`, with no interest in when they end.
     pub fn new(
@@ -181,32 +205,14 @@ impl TonicNamedPipeServer {
         path: &str,
         disconnect_tx: Option<mpsc::UnboundedSender<i64>>,
     ) -> io::Result<impl Stream<Item = io::Result<TonicNamedPipeServer>> + use<>> {
-        // set security attributes to allow ipc from sandboxed processes
-        // see https://nathancorvussolis.blogspot.com/2018/05/windows-ime-security.html
+        // security attributes that let sandboxed processes do IPC without
+        // being able to hijack the pipe — see `pipe_sddl`
 
         let name = format!("\\\\.\\pipe\\{}", path);
 
         let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
 
-        // DACL: sandboxed principals may CONNECT but not CREATE pipe instances.
-        // GENERIC_ALL (GA) includes FILE_CREATE_PIPE_INSTANCE, so the original
-        // all-GA descriptor let any AppContainer (AC) or restricted (RC)
-        // process stand up a rogue instance of this pipe and receive a peer
-        // client's connection — intercepting the raw keystroke stream
-        // (AppendText). AC/RC get 0x12019B (FILE_GENERIC_READ|FILE_GENERIC_WRITE
-        // minus FILE_APPEND_DATA == minus FILE_CREATE_PIPE_INSTANCE), which is
-        // exactly what the client opens with (see shared::pipe::
-        // PIPE_CLIENT_ACCESS), so connecting still works. The owning user's SID
-        // (not the whole BU group) keeps GA: the server runs as that user and
-        // must create instances, while a *different* local user — whose token
-        // lacks this SID — is no longer granted access, closing the RDP / fast-
-        // user-switching cross-session hole. SY/BA keep GA for SYSTEM and an
-        // elevated server. SACL unchanged: low-IL clients (sandboxed browsers)
-        // may still write up to the pipe.
-        let user_sid = current_user_sid_string()?;
-        let sddl = HSTRING::from(format!(
-            "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{user_sid})(A;;0x12019b;;;AC)(A;;0x12019b;;;RC)S:(ML;;NW;;;LW)"
-        ));
+        let sddl = HSTRING::from(pipe_sddl(&current_user_sid_string()?));
 
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -273,5 +279,78 @@ impl TonicNamedPipeServer {
                 }
             })
         }
+    }
+}
+
+/// The pipe DACL is a security boundary: every application on the desktop can
+/// open this pipe, and what it may do there is decided entirely by this
+/// string. The descriptor itself is only checked by Windows at pipe-creation
+/// time, so a typo would show up as "the IME still works" — with the
+/// hardening silently gone.
+#[cfg(test)]
+mod tests {
+    use super::pipe_sddl;
+
+    const USER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+
+    /// The owning user's own SID, not the Builtin Users group: a *different*
+    /// local user (RDP, fast user switching) must not be granted anything,
+    /// even though the pipe name is predictable.
+    #[test]
+    fn the_owning_user_is_granted_full_access_by_sid() {
+        let sddl = pipe_sddl(USER);
+
+        assert!(
+            sddl.contains(&format!("(A;;GA;;;{USER})")),
+            "the user's SID must be embedded verbatim: {sddl}"
+        );
+        assert!(!sddl.contains(";;;BU)"), "the Users group must not appear");
+    }
+
+    /// The hardening itself: sandboxed principals get the client's access
+    /// mask, never GENERIC_ALL. GA would include FILE_CREATE_PIPE_INSTANCE
+    /// and let an AppContainer stand up a rogue instance of this pipe and
+    /// receive a peer's keystrokes.
+    #[test]
+    fn sandboxed_principals_cannot_create_pipe_instances() {
+        let sddl = pipe_sddl(USER);
+
+        assert!(sddl.contains("(A;;0x12019b;;;AC)"), "{sddl}");
+        assert!(sddl.contains("(A;;0x12019b;;;RC)"), "{sddl}");
+        assert!(
+            !sddl.contains("(A;;GA;;;AC)") && !sddl.contains("(A;;GA;;;RC)"),
+            "no sandboxed principal may hold GENERIC_ALL: {sddl}"
+        );
+    }
+
+    /// The granted mask must be exactly the one the client opens with, or
+    /// connecting breaks. `shared::pipe`'s own test pins
+    /// `PIPE_CLIENT_ACCESS == 0x0012_019B`; this is the other end of that
+    /// pairing, and the two literals must be changed together.
+    #[test]
+    fn the_sandboxed_mask_is_the_one_the_client_opens_with() {
+        // the value `shared::pipe::PIPE_CLIENT_ACCESS` computes and its own
+        // test pins
+        const CLIENT_ACCESS: u32 = 0x0012_019B;
+        let sddl = pipe_sddl(USER);
+
+        assert_eq!(
+            sddl.matches(&format!("{CLIENT_ACCESS:#x}")).count(),
+            2,
+            "both sandboxed principals carry exactly the client's mask: {sddl}"
+        );
+    }
+
+    /// SYSTEM and the Administrators group keep GENERIC_ALL (an elevated
+    /// server must be able to create instances), and the SACL keeps low-IL
+    /// clients — sandboxed browsers — able to write up to the pipe. Losing
+    /// the mandatory label would break input in every sandboxed host.
+    #[test]
+    fn system_administrators_and_low_integrity_clients_keep_their_access() {
+        let sddl = pipe_sddl(USER);
+
+        assert!(sddl.contains("(A;;GA;;;SY)"), "{sddl}");
+        assert!(sddl.contains("(A;;GA;;;BA)"), "{sddl}");
+        assert!(sddl.ends_with("S:(ML;;NW;;;LW)"), "{sddl}");
     }
 }
