@@ -13,7 +13,7 @@ use super::{
     ipc_service::{Candidates, IPCService, ServerUnavailable},
     state::IMEState,
     text_util::{to_half_katakana, to_katakana},
-    transition::{is_modifier_key, shortcut_transition, transition, KeystrokeContext},
+    transition::{KeystrokeContext, is_modifier_key, shortcut_transition, transition},
 };
 use windows::Win32::{
     Foundation::WPARAM,
@@ -339,8 +339,7 @@ impl TextServiceFactory {
         if VK_CONTROL.is_pressed() || VK_MENU.is_pressed() {
             let state = {
                 let text_service = self.borrow()?;
-                let state = text_service.borrow_composition()?.state.clone();
-                state
+                text_service.borrow_composition()?.state.clone()
             };
             return Ok(shortcut_transition(&state, is_modifier_key(wparam.0))
                 .map(|(next_state, actions)| (actions, next_state)));
@@ -478,11 +477,7 @@ impl TextServiceFactory {
         drop(composition);
         drop(text_service);
 
-        if recovered {
-            Ok(())
-        } else {
-            result
-        }
+        if recovered { Ok(()) } else { result }
     }
 
     /// Locally tears down the composition after the server became unreachable
@@ -740,8 +735,8 @@ mod tests {
     use crate::engine::client_action::SetTextType;
     use crate::engine::ipc_service::{FakeIpc, IPCService, IpcCall};
     use crate::tsf::test_support::{
-        factory_with_context, factory_with_fake_context, global_state_lock, EditSessionBehavior,
-        FakeComposition, FakeContext, RangeLog,
+        EditSessionBehavior, FakeComposition, FakeContext, RangeLog, factory_with_context,
+        factory_with_fake_context, global_state_lock,
     };
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};

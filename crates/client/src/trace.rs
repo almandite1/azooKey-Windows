@@ -6,7 +6,7 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
 #[cfg(not(debug_assertions))]
 use crate::extension::StringExt as _;
 #[cfg(not(debug_assertions))]
-use windows::{core::PCWSTR, Win32::System::Diagnostics::Debug::OutputDebugStringW};
+use windows::{Win32::System::Diagnostics::Debug::OutputDebugStringW, core::PCWSTR};
 
 // debug-only: file logging (and its folder) exist only in debug builds
 #[cfg(debug_assertions)]

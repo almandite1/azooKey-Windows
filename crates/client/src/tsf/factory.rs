@@ -4,7 +4,6 @@ use std::{
 };
 
 use windows::{
-    core::{implement, IUnknown, Interface, GUID},
     Win32::{
         Foundation::{BOOL, CLASS_E_NOAGGREGATION, E_NOINTERFACE},
         System::Com::{IClassFactory, IClassFactory_Impl},
@@ -15,6 +14,7 @@ use windows::{
             ITfThreadMgrEventSink,
         },
     },
+    core::{GUID, IUnknown, Interface, implement},
 };
 
 use anyhow::Result;
@@ -90,7 +90,7 @@ impl IClassFactory_Impl for TextServiceFactory_Impl {
                 _ => {
                     return Err(anyhow::Error::new(windows::core::Error::from_hresult(
                         E_NOINTERFACE,
-                    )))
+                    )));
                 }
             };
         }

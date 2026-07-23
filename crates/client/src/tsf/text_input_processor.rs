@@ -7,16 +7,16 @@ use crate::{
 
 use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 use windows::{
-    core::Interface as _,
     Win32::{
         Foundation::BOOL,
-        System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER},
+        System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
         UI::TextServices::{
             CLSID_TF_CategoryMgr, ITfCategoryMgr, ITfKeyEventSink, ITfKeystrokeMgr, ITfSource,
-            ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
+            ITfTextInputProcessor_Impl, ITfTextInputProcessorEx_Impl, ITfThreadMgr,
             ITfThreadMgrEventSink,
         },
     },
+    core::Interface as _,
 };
 
 use anyhow::Result;
@@ -229,10 +229,10 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         }
 
         tracing::debug!("AdviseTextLayoutSink");
-        if let Ok(doc_mgr) = unsafe { thread_mgr.GetFocus() } {
-            if let Err(error) = self.advise_text_layout_sink(&mut text_service, doc_mgr) {
-                tracing::warn!("AdviseTextLayoutSink failed (non-fatal): {error:?}");
-            }
+        if let Ok(doc_mgr) = unsafe { thread_mgr.GetFocus() }
+            && let Err(error) = self.advise_text_layout_sink(&mut text_service, doc_mgr)
+        {
+            tracing::warn!("AdviseTextLayoutSink failed (non-fatal): {error:?}");
         }
 
         tracing::debug!("Initialize display attribute");
@@ -271,10 +271,10 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // user's choice survives a profile switch. Must happen after the
         // borrow is released -- apply_input_mode re-enters the RefCell.
         drop(text_service);
-        if let Some(mode) = adopted {
-            if let Err(error) = self.apply_input_mode(mode, false) {
-                tracing::warn!("adopting the compartment mode failed (non-fatal): {error:?}");
-            }
+        if let Some(mode) = adopted
+            && let Err(error) = self.apply_input_mode(mode, false)
+        {
+            tracing::warn!("adopting the compartment mode failed (non-fatal): {error:?}");
         }
 
         tracing::debug!("Activate success");
@@ -350,15 +350,15 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Mutex;
 
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
     use windows::Win32::UI::TextServices::{ITfTextInputProcessor, ITfThreadMgr};
 
     use crate::engine::composition::CompositionState;
     use crate::engine::state::IMEState;
-    use crate::globals::{DllModule, DLL_INSTANCE};
+    use crate::globals::{DLL_INSTANCE, DllModule};
     use crate::tsf::factory::TextServiceFactory;
     use crate::tsf::test_support::{
-        fake_context_of, EditSessionBehavior, FakeContext, FakeThreadMgr, ThreadMgrLog,
+        EditSessionBehavior, FakeContext, FakeThreadMgr, ThreadMgrLog, fake_context_of,
     };
     use windows::core::AsImpl as _;
 

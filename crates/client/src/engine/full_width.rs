@@ -78,7 +78,7 @@ pub fn to_halfwidth(s: &str) -> String {
     s.chars()
         .map(|c| {
             let key = c.to_string();
-            if let Some((&k, _)) = HALF_FULL_AZOOKEY.iter().find(|(_, &v)| v == key) {
+            if let Some((&k, _)) = HALF_FULL_AZOOKEY.iter().find(|&(_, &v)| v == key) {
                 k.to_string()
             } else {
                 c.to_string()
@@ -92,10 +92,8 @@ pub fn to_fullwidth(s: &str, process_alphabet: bool) -> String {
         .map(|c| {
             let key = c.to_string();
 
-            if process_alphabet {
-                if let Some(&v) = HALF_FULL.get(key.as_str()) {
-                    return v.to_string();
-                }
+            if process_alphabet && let Some(&v) = HALF_FULL.get(key.as_str()) {
+                return v.to_string();
             }
 
             if let Some(&v) = HALF_FULL_AZOOKEY.get(key.as_str()) {

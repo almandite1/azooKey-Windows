@@ -1,17 +1,18 @@
 use windows::{
-    core::{IUnknown, Interface as _, BSTR, GUID, PCWSTR},
     Win32::{
         Foundation::{BOOL, E_INVALIDARG, POINT, RECT},
         System::Ole::CONNECT_E_CANNOTCONNECT,
         UI::{
             TextServices::{
-                ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
-                ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu, ITfSource_Impl, ITfThreadMgr,
-                TfLBIClick, GUID_LBI_INPUTMODE, TF_LANGBARITEMINFO, TF_LBI_STYLE_BTN_BUTTON,
+                GUID_LBI_INPUTMODE, ITfLangBarItem_Impl, ITfLangBarItemButton,
+                ITfLangBarItemButton_Impl, ITfLangBarItemMgr, ITfLangBarItemSink, ITfMenu,
+                ITfSource_Impl, ITfThreadMgr, TF_LANGBARITEMINFO, TF_LBI_STYLE_BTN_BUTTON,
+                TfLBIClick,
             },
-            WindowsAndMessaging::{LoadImageW, HICON, IMAGE_ICON, LR_DEFAULTCOLOR},
+            WindowsAndMessaging::{HICON, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW},
         },
     },
+    core::{BSTR, GUID, IUnknown, Interface as _, PCWSTR},
 };
 
 use crate::{

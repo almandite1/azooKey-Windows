@@ -5,11 +5,11 @@ use std::{mem::ManuallyDrop, rc::Rc};
 
 use anyhow::Result;
 use windows::{
-    core::{IUnknown, Interface},
     Win32::UI::TextServices::{
-        ITfCompartmentMgr, ITfContext, ITfDocumentMgr, GUID_COMPARTMENT_TRANSITORYEXTENSION_PARENT,
+        GUID_COMPARTMENT_TRANSITORYEXTENSION_PARENT, ITfCompartmentMgr, ITfContext, ITfDocumentMgr,
         TF_ANCHOR_START, TF_HALTCOND, TF_HF_OBJECT, TF_TF_MOVESTART, TS_SS_TRANSITORY,
     },
+    core::{IUnknown, Interface},
 };
 
 use crate::engine::state::IMEState;
@@ -194,7 +194,7 @@ mod tests {
 
     use crate::tsf::factory::TextServiceFactory;
     use crate::tsf::test_support::{
-        factory_with_context, global_state_lock, EditSessionBehavior, FakeContext, RangeLog,
+        EditSessionBehavior, FakeContext, RangeLog, factory_with_context, global_state_lock,
     };
 
     /// Drives update_context end to end against the fake host: the

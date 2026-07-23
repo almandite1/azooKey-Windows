@@ -1,9 +1,9 @@
 use windows::{
-    core::Interface as _,
     Win32::UI::TextServices::{
         ITfContext, ITfContextView, ITfDocumentMgr, ITfSource, ITfTextLayoutSink,
         ITfTextLayoutSink_Impl, TfLayoutCode,
     },
+    core::Interface as _,
 };
 
 use anyhow::Result;
@@ -61,7 +61,11 @@ impl TextServiceFactory {
 
         let context = unsafe { doc_mgr.GetTop()? };
         text_service.layout_context = Some(context.clone());
-        self.advise_sink::<ITfTextLayoutSink>(&context.cast::<ITfSource>()?, text_service)
+        // bound to a local rather than left a temporary in the tail
+        // expression: the release point of an interface temporary moves
+        // between editions 2021 and 2024
+        let source = context.cast::<ITfSource>()?;
+        self.advise_sink::<ITfTextLayoutSink>(&source, text_service)
     }
 
     pub fn unadvise_text_layout_sink(&self, text_service: &mut TextService) -> Result<()> {

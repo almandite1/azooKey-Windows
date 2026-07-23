@@ -21,29 +21,28 @@ use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use windows::{
-    core::{implement, IUnknown, Result as WinResult, BSTR, GUID, PCWSTR, PWSTR, VARIANT},
     Win32::{
         Foundation::{BOOL, E_FAIL, E_NOTIMPL, HWND, LPARAM, POINT, RECT, S_OK, WPARAM},
         System::Com::IDataObject,
         UI::TextServices::{
             IEnumITfCompositionView, IEnumTfContextViews, IEnumTfContexts, IEnumTfDocumentMgrs,
             IEnumTfFunctionProviders, IEnumTfLangBarItems, IEnumTfProperties, IEnumTfRanges,
-            IEnumTfUIElements, ITfCompartment, ITfCompartmentEventSink, ITfCompartmentMgr,
-            ITfCompartmentMgr_Impl, ITfCompartment_Impl, ITfComposition, ITfCompositionSink,
-            ITfCompositionView, ITfComposition_Impl, ITfContext, ITfContextComposition,
-            ITfContextComposition_Impl, ITfContextView, ITfContextView_Impl, ITfContext_Impl,
-            ITfDocumentMgr, ITfDocumentMgr_Impl, ITfEditSession, ITfFunctionProvider,
-            ITfInsertAtSelection, ITfInsertAtSelection_Impl, ITfKeyEventSink, ITfKeystrokeMgr,
-            ITfKeystrokeMgr_Impl, ITfLangBarItem, ITfLangBarItemMgr, ITfLangBarItemMgr_Impl,
-            ITfLangBarItemSink, ITfProperty, ITfPropertyStore, ITfProperty_Impl, ITfRange,
-            ITfRangeBackup, ITfRange_Impl, ITfReadOnlyProperty, ITfReadOnlyProperty_Impl,
-            ITfSource, ITfSource_Impl, ITfThreadMgr, ITfThreadMgr_Impl, ITfUIElement,
-            ITfUIElementMgr, ITfUIElementMgr_Impl, INSERT_TEXT_AT_SELECTION_FLAGS,
-            TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_SYNC, TF_E_SYNCHRONOUS, TF_HALTCOND,
-            TF_LANGBARITEMINFO, TF_PRESERVEDKEY, TF_SELECTION, TF_S_ASYNC, TS_E_NOLAYOUT,
-            TS_STATUS,
+            IEnumTfUIElements, INSERT_TEXT_AT_SELECTION_FLAGS, ITfCompartment, ITfCompartment_Impl,
+            ITfCompartmentEventSink, ITfCompartmentMgr, ITfCompartmentMgr_Impl, ITfComposition,
+            ITfComposition_Impl, ITfCompositionSink, ITfCompositionView, ITfContext,
+            ITfContext_Impl, ITfContextComposition, ITfContextComposition_Impl, ITfContextView,
+            ITfContextView_Impl, ITfDocumentMgr, ITfDocumentMgr_Impl, ITfEditSession,
+            ITfFunctionProvider, ITfInsertAtSelection, ITfInsertAtSelection_Impl, ITfKeyEventSink,
+            ITfKeystrokeMgr, ITfKeystrokeMgr_Impl, ITfLangBarItem, ITfLangBarItemMgr,
+            ITfLangBarItemMgr_Impl, ITfLangBarItemSink, ITfProperty, ITfProperty_Impl,
+            ITfPropertyStore, ITfRange, ITfRange_Impl, ITfRangeBackup, ITfReadOnlyProperty,
+            ITfReadOnlyProperty_Impl, ITfSource, ITfSource_Impl, ITfThreadMgr, ITfThreadMgr_Impl,
+            ITfUIElement, ITfUIElementMgr, ITfUIElementMgr_Impl, TF_CONTEXT_EDIT_CONTEXT_FLAGS,
+            TF_E_SYNCHRONOUS, TF_ES_SYNC, TF_HALTCOND, TF_LANGBARITEMINFO, TF_PRESERVEDKEY,
+            TF_S_ASYNC, TF_SELECTION, TS_E_NOLAYOUT, TS_STATUS,
         },
     },
+    core::{BSTR, GUID, IUnknown, PCWSTR, PWSTR, Result as WinResult, VARIANT, implement},
 };
 
 /// The edit cookie the fake hands to `DoEditSession`. Any non-zero value
@@ -1436,8 +1435,10 @@ impl ITfLangBarItemMgr_Impl for FakeThreadMgr_Impl {
 /// # Safety
 /// The context must have come from [`FakeContext::new`].
 pub unsafe fn fake_context_of(context: &ITfContext) -> &FakeContext {
-    use windows::core::AsImpl as _;
-    context.as_impl()
+    unsafe {
+        use windows::core::AsImpl as _;
+        context.as_impl()
+    }
 }
 
 /// Builds a `TextServiceFactory` wired to the given (usually fake) context,
@@ -1445,8 +1446,8 @@ pub unsafe fn fake_context_of(context: &ITfContext) -> &FakeContext {
 pub fn factory_with_context(
     context: ITfContext,
 ) -> windows::Win32::UI::TextServices::ITfTextInputProcessor {
-    use windows::core::AsImpl as _;
     use windows::Win32::UI::TextServices::ITfTextInputProcessor;
+    use windows::core::AsImpl as _;
 
     use super::factory::TextServiceFactory;
 

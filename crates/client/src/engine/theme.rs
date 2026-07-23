@@ -1,6 +1,6 @@
 use windows::{
+    Win32::System::Registry::{HKEY_CURRENT_USER, REG_VALUE_TYPE, RRF_RT_REG_DWORD, RegGetValueW},
     core::w,
-    Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, REG_VALUE_TYPE, RRF_RT_REG_DWORD},
 };
 
 use anyhow::Result;

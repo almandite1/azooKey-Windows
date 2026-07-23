@@ -1,9 +1,9 @@
 use windows::{
-    core::GUID,
     Win32::{
         Foundation::{BOOL, LPARAM, WPARAM},
         UI::TextServices::{ITfContext, ITfKeyEventSink_Impl},
     },
+    core::GUID,
 };
 
 use anyhow::Result;

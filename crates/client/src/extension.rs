@@ -1,12 +1,12 @@
 use windows::{
-    core::{GUID, HSTRING, PCWSTR},
     Win32::{
         System::Registry::{
-            RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY, KEY_WRITE,
-            REG_OPTION_NON_VOLATILE, REG_SZ,
+            HKEY, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW,
+            RegDeleteTreeW, RegSetValueExW,
         },
         UI::Input::KeyboardAndMouse::{GetKeyState, VIRTUAL_KEY},
     },
+    core::{GUID, HSTRING, PCWSTR},
 };
 
 use crate::check_win32_err;

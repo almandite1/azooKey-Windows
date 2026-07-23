@@ -5,8 +5,8 @@ use std::{
 };
 
 use windows::{
-    core::{Interface, GUID},
     Win32::UI::TextServices::{ITfCompartment, ITfContext, ITfThreadMgr},
+    core::{GUID, Interface},
 };
 
 use anyhow::{Context, Result};
