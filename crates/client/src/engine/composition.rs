@@ -340,9 +340,9 @@ impl TextServiceFactory_Impl {
         //
         // Reaching this at all means TSF did NOT route the key through
         // OnPreservedKey — a reserved key is not also delivered raw — so the
-        // press is ours to handle. What must NOT happen is handling one
-        // press twice: this host delivers Alt+` to OnKeyDown twice, 5-7ms
-        // apart, and the second flip cancelled the first (issue #19).
+        // press is ours to handle. The recency check below is a precaution
+        // against one press being delivered twice, which no host tested so
+        // far does; two flips would cancel and the key would look dead.
         if is_ime_toggle_key(wparam.0) {
             if self.toggle_is_duplicate()? {
                 tracing::debug!("ignoring a second delivery of one on/off press");
