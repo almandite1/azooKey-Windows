@@ -134,8 +134,12 @@ begin
   ExtractTemporaryFile('{#TauriSetupExe}');
   Dependency_AddVC2015To2022x64;
   Dependency_AddVC2015To2022x86;
+  // /S, not /q: NSIS spells its silent switch with a capital S, and Tauri's
+  // installer is NSIS. `/q` is the MSI convention — NSIS ignores it and shows
+  // its wizard, so the user was asked for an install location a second time
+  // (https://github.com/almandite1/azooKey-Windows/issues/84).
   Dependency_Add('{#TauriSetupExe}',
-    '/q',
+    '/S',
     'Azookey',
     '', '', True, False);
 
@@ -161,12 +165,37 @@ begin
     end;
   end;
 end;
+// Runs `schtasks` and reports whether it actually succeeded: ShellExec can
+// fail to launch at all (returns False), and the process it launched can
+// still exit non-zero. Both used to be discarded, which is how a task that
+// was never created went unnoticed — see
+// https://github.com/almandite1/azooKey-Windows/issues/83
+function RunSchTasks(Args: String; var ErrorText: String): Boolean;
+var
+  ExitCode: Integer;
+begin
+  ErrorText := '';
+  if not ShellExec('', 'schtasks', Args, '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+  begin
+    ErrorText := 'schtasks を起動できませんでした (code ' + IntToStr(ExitCode) + ')';
+    Result := False;
+    Exit;
+  end;
+  if ExitCode <> 0 then
+  begin
+    ErrorText := 'schtasks が終了コード ' + IntToStr(ExitCode) + ' で失敗しました';
+    Result := False;
+    Exit;
+  end;
+  Result := True;
+end;
+
 procedure UpdateTaskXml();
 var
   TaskXmlPath: string;
   TaskXmlContentAnsi: AnsiString;
   TaskXmlContent: String;
-  Dummy: Integer;
+  ErrorText: String;
 begin
   ExtractTemporaryFile('Azookey Startup.xml'); // ファイル展開
   TaskXmlPath := ExpandConstant('{tmp}\Azookey Startup.xml');
@@ -179,8 +208,29 @@ begin
   TaskXmlContentAnsi := AnsiString(TaskXmlContent);
   SaveStringToFile(TaskXmlPath, TaskXmlContentAnsi, False);
 
-  ShellExec('', 'schtasks', '/Create /F /TN "Azookey Startup" /XML "' + TaskXmlPath + '"', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
-  ShellExec('', 'schtasks', '/Run /TN "Azookey Startup"', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
+  // The install itself is fine either way — everything is already placed and
+  // registered — so a failure here warns rather than aborts. But it must not
+  // be silent: without the task the IME simply never starts at logon, and
+  // nothing else would ever say why.
+  if not RunSchTasks('/Create /F /TN "Azookey Startup" /XML "' + TaskXmlPath + '"', ErrorText) then
+  begin
+    MsgBox('自動起動タスクを作成できませんでした。' + #13#10 + ErrorText + #13#10#13#10 +
+           'インストール自体は完了しています。ログオン時に azooKey が自動で起動しないため、' + #13#10 +
+           '使用するたびに次を管理者として実行してください:' + #13#10 +
+           ExpandConstant('{app}\launcher.exe'),
+           mbError, MB_OK);
+    Exit;
+  end;
+
+  // NOTE: never start a continuation line with `#`. The preprocessor runs
+  // first and reads a leading `#` as a directive, so a wrapped string that
+  // begins with `#13#10` fails to compile with "Unknown preprocessor
+  // directive" — keep the character constants at the end of a line.
+  if not RunSchTasks('/Run /TN "Azookey Startup"', ErrorText) then
+    MsgBox('自動起動タスクは作成できましたが、今すぐ開始できませんでした。' + #13#10 +
+           ErrorText + #13#10 + #13#10 +
+           '次回のログオンからは自動で起動します。',
+           mbInformation, MB_OK);
 end;
 
 procedure CreateVbsFile();

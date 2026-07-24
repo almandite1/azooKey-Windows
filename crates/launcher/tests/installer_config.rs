@@ -74,11 +74,25 @@ fn task_xml_survives_switching_to_battery_power() {
     );
 }
 
-/// The file is written and round-tripped (LoadStringFromFile /
-/// SaveStringToFile as AnsiString) as 8-bit text, so the XML declaration
-/// must not claim UTF-16 — MSXML may refuse the mismatch outright.
+/// The declaration must name **no** encoding at all.
+///
+/// `schtasks /Create /XML` widens the file's bytes to a wide string before
+/// handing it to MSXML, so the parser already knows it is looking at Unicode.
+/// A declaration that then names a byte encoding contradicts that, and MSXML
+/// refuses with "Switch from current encoding to specified encoding not
+/// supported" — the task is never created, and the installer discards the
+/// error, so the only symptom is an IME that does not start at logon.
+///
+/// Both halves of this have been got wrong. The file shipped as 8-bit bytes
+/// declaring `UTF-16`, which reads as a lie about the bytes; "fixing" it to
+/// `UTF-8` made the document self-consistent and broke the only consumer it
+/// has. Measured against real `schtasks`: no declaration, `UTF-16`, and
+/// UTF-16LE bytes with a `UTF-16` declaration are all accepted; 8-bit bytes
+/// declaring `UTF-8` is the one combination that fails. Naming nothing is the
+/// only form that is neither a lie nor a conflict, so that is what is pinned
+/// here.
 #[test]
-fn task_xml_encoding_declaration_matches_the_bytes() {
+fn task_xml_declares_no_encoding() {
     let path = installer_dir().join("Azookey Startup.xml");
     let bytes = std::fs::read(&path).unwrap();
 
@@ -89,10 +103,66 @@ fn task_xml_encoding_declaration_matches_the_bytes() {
     );
 
     let xml = String::from_utf8(bytes).expect("task XML should be valid UTF-8");
+    let declaration = xml.lines().next().unwrap_or_default();
     assert!(
-        !xml.contains(r#"encoding="UTF-16""#),
-        "the declaration claims UTF-16 but the bytes are 8-bit; \
-         declare UTF-8 instead"
+        !declaration.contains("encoding="),
+        "the XML declaration must not name an encoding (found {declaration:?}); \
+         schtasks parses this as Unicode and rejects any byte encoding named here"
+    );
+}
+
+/// The install side must chain the settings app with `/S`, the same switch
+/// the uninstall side already used.
+///
+/// It passed `/q` — the MSI convention — which NSIS ignores, so Tauri's
+/// installer showed its wizard and asked for an install location a second
+/// time (issue #84). The two halves disagreeing is what made it easy to miss.
+#[test]
+fn install_chains_the_settings_app_silently() {
+    let iss = read("Installer.iss");
+    let start = iss
+        .find("Dependency_Add('{#TauriSetupExe}'")
+        .expect("Installer.iss should chain the Tauri setup through Dependency_Add");
+    let call = &iss[start..start + 200.min(iss.len() - start)];
+
+    assert!(
+        call.contains("'/S'"),
+        "the chained NSIS installer must be passed /S; found: {call:?}"
+    );
+    assert!(
+        !call.contains("'/q'"),
+        "/q is the MSI switch and NSIS ignores it, showing its wizard"
+    );
+}
+
+/// Neither `schtasks` call may have its result discarded.
+///
+/// The startup task failed to be created on every install for days, and
+/// nothing said so: `ShellExec`'s return value and the exit code it writes
+/// were both thrown away (issue #83). The install can legitimately continue
+/// without the task, but it must not do so silently.
+#[test]
+fn task_creation_failures_are_reported() {
+    let iss = read("Installer.iss");
+    let start = iss
+        .find("procedure UpdateTaskXml")
+        .expect("Installer.iss should define UpdateTaskXml");
+    let rest = &iss[start..];
+    let end = rest[1..]
+        .find("\nprocedure ")
+        .map(|i| i + 1)
+        .unwrap_or(rest.len());
+    let proc_body = &rest[..end];
+
+    assert!(
+        !proc_body.contains("ShellExec("),
+        "UpdateTaskXml must not call ShellExec directly — go through the \
+         helper that checks the result"
+    );
+    assert!(
+        proc_body.contains("MsgBox("),
+        "a failure to create the startup task must reach the user; without it \
+         the only symptom is an IME that never starts at logon"
     );
 }
 
