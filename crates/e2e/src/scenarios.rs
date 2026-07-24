@@ -17,10 +17,6 @@ use crate::{engine, keyboard, logs, overlay, poll_until, uia::Uia, winevent};
 /// scenario failure is about the input path, not conversion quality.
 const READING: &str = "mizu";
 const EXPECTED: &str = "水";
-/// What the reading looks like while it is still composing — the preedit the
-/// host holds before Space converts it. Read straight out of the control, so
-/// it says "a composition started here" without depending on `ui.exe`.
-const READING_KANA: &str = "みず";
 
 /// How long conversion output has to appear once the keys are sent.
 const CONVERSION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -173,71 +169,63 @@ fn second_host_converts(ctx: &Ctx) -> Result<String> {
 /// Scenario 4: the IME disengages in a password field.
 ///
 /// A TSF host sets the disable-IME compartment on a password control, and the
-/// TIP must fall back to direct input. The field itself cannot answer whether
-/// it did — UI Automation refuses to hand out a password's value, by design —
-/// so the observable is the **candidate window**: composing opens it, and in a
-/// password field nothing should compose at all.
+/// TIP must fall back to direct input there. Reading that back took three
+/// tries, because the obvious observables are all blind here:
+///
+/// * the password field's own value — UI Automation refuses to hand out a
+///   password's text, by design;
+/// * the preedit — a plain EDIT is bridged to TSF by CUAS, which keeps an
+///   in-flight composition out of the control's buffer until it is committed,
+///   so nothing is readable mid-composition (Notepad, natively TSF-aware,
+///   shows its preedit and misled the first attempt);
+/// * the candidate window — it never came up for this host at all, which is
+///   its own open question and not this scenario's to answer.
+///
+/// So the host publishes it: `bin/azookey-e2e-host.rs` echoes the password
+/// field into a read-only mirror the test can read (see `State::mirror`). Raw
+/// `mizu` in the mirror means direct input; kana or kanji, or nothing at all
+/// (a composition still pending), means the IME did not disengage.
 fn password_field_disables_ime(ctx: &Ctx) -> Result<String> {
+    /// AutomationId of the mirror control, from the host's `ID_MIRROR`.
+    const MIRROR_ID: &str = "3";
+
     let host = HostApp::launch(&custom_host_path()?, CUSTOM_HOST_IMAGE)?;
     enter_kana(&host)?;
 
-    // whatever an earlier scenario left on screen must be down first, or the
-    // "it came up" check below would pass on a stale window
-    keyboard::tap(keyboard::escape())?;
-    wait_for_candidates(false, "開始時に候補ウィンドウが閉じている")?;
-
-    // The ordinary field first, to establish the baseline. The signal is the
-    // PREEDIT in the control, not the candidate window: this half must be able
-    // to fail for its own reason ("nothing composed") separately from
-    // "ui.exe never showed a window", which is a different defect entirely.
-    keyboard::type_ascii(READING)?;
-    let composed = poll_until(SETTLE_TIMEOUT, || {
-        let text = ctx.uia.text_of(host.window)?;
-        text.contains(READING_KANA).then_some(text)
-    });
-    let Some(composed) = composed else {
-        bail!(
-            "通常欄で合成が始まりませんでした（{READING_KANA} が現れない）。読み取れた本文: {:?}\n\
-             Kana 切替か、このホストへの TIP のアタッチを疑う。",
-            ctx.uia.text_of(host.window)
-        );
-    };
-
-    // Did the candidate window come up for it? That is what the password half
-    // has to compare against, so a "no" here means this scenario cannot decide
-    // anything — and says so rather than blaming the password field.
-    let candidates_shown = poll_until(SETTLE_TIMEOUT, || {
-        overlay::candidates_visible().then_some(())
-    })
-    .is_some();
-
-    keyboard::tap(keyboard::escape())?;
-    std::thread::sleep(Duration::from_millis(500));
-
-    if !candidates_shown {
-        bail!(
-            "通常欄では合成が始まった（本文 {composed:?}）のに候補ウィンドウが出ませんでした。\n\
-             パスワード欄との比較材料が無いので判定できません。ui.exe の候補ウィンドウが\n\
-             このホストで出ない理由（UIElement 経路 / 位置未報告）を先に調べてください。"
-        );
-    }
+    // the ordinary field, as the positive control: the IME must be genuinely
+    // active in this host before "it did not engage" means anything
+    let before = expected_count(ctx.uia, &host);
+    convert_reading(READING)?;
+    wait_for_new_expected(ctx.uia, &host, before)
+        .context("通常欄で変換できていないので、パスワード欄の判定材料がありません")?;
 
     // Tab into the password field
     keyboard::tap(keyboard::tab())?;
     std::thread::sleep(Duration::from_millis(500));
 
-    // and there, the same keys must not start a composition. The field itself
-    // cannot answer — UI Automation refuses to hand out a password's value, by
-    // design — so the candidate window is the observable.
+    // the same keys again — this time they must land as plain latin
     keyboard::type_ascii(READING)?;
-    std::thread::sleep(SETTLE_TIMEOUT);
-    let leaked = overlay::candidates_visible();
+    let mirrored = poll_until(SETTLE_TIMEOUT, || {
+        let value = ctx.uia.value_by_automation_id(host.window, MIRROR_ID)?;
+        (!value.is_empty()).then_some(value)
+    });
+
     keyboard::tap(keyboard::escape())?;
 
-    if leaked {
-        bail!("パスワード欄で候補ウィンドウが出ました = IME が無効化されていない");
+    let Some(mirrored) = mirrored else {
+        bail!(
+            "パスワード欄に何も入りませんでした。IME が合成を抱えたまま確定していない\
+             （= 無効化されていない）疑いが濃厚です。"
+        );
+    };
+    if mirrored != READING {
+        bail!(
+            "パスワード欄に {mirrored:?} が入りました（生の {READING:?} であるべき）\
+             = IME が無効化されていない"
+        );
     }
-    Ok("ordinary field composed, password field stayed on direct input".to_string())
+
+    Ok(format!("password field received raw {mirrored:?}"))
 }
 
 /// Scenario 5: kill the engine, and conversion comes back once launcher has
