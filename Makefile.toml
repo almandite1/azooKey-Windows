@@ -89,6 +89,55 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build (i686) failed with exit code $LAST
 """
 args = ["${@}"]
 
+# Tier 2 of docs/e2e-automation-plan.md, host side. Stages exactly what the
+# test VM needs into one archive: `Copy-Item -ToSession` is per-file and the
+# dictionary alone is 4,200 of them, so a single zip is the difference between
+# seconds and many minutes.
+#
+# Deliberately NOT the whole of build/: that directory accumulates every
+# renamed TIP DLL of every batch, the installer, and the CUDA/Vulkan backends.
+# llama_cpu IS included even though Zenzai runs off — the Swift engine links
+# llama.dll at load time, so the server will not start without it.
+[tasks.e2e_payload]
+description = "Stage the artifacts the E2E test VM needs into one archive"
+script_runner = "powershell"
+script_extension = "ps1"
+script = """
+$ErrorActionPreference = "Stop"
+$flags = @($args | Where-Object { $_ -and $_ -ne '--debug' })
+$profileDir = if ($flags -contains '--release') { 'release' } else { 'debug' }
+
+cargo build -p azookey-e2e @flags
+if ($LASTEXITCODE -ne 0) { throw "cargo build -p azookey-e2e failed with exit code $LASTEXITCODE" }
+
+if (-not (Test-Path "build/launcher.exe")) {
+    throw "build/ is empty; run cargo make build first"
+}
+
+$stage = Join-Path $env:TEMP "azookey-e2e-payload"
+Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory $stage | Out-Null
+
+# no renamed DLLs from past batches, no installer, no spare copies
+Get-ChildItem build -File | Where-Object {
+    $_.Name -notmatch '^azookey_windows_' -and $_.Name -notmatch '\\.prev\\.' -and
+    $_.Name -notmatch 'azookey-setup|zenz-v3-backup|ui_release_prev|launch_dev'
+} | Copy-Item -Destination $stage
+
+foreach ($d in 'Dictionary', 'EmojiDictionary', 'llama_cpu', 'x86') {
+    Copy-Item "build/$d" $stage -Recurse
+}
+
+Copy-Item "target/$profileDir/azookey-e2e.exe" $stage
+
+$zip = Join-Path $env:TEMP "azookey-e2e.zip"
+Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
+# no -f format strings: cargo-make mangles brace placeholders
+$mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+Write-Host "payload: $zip ($mb MB)"
+"""
+args = ["${@}"]
+
 [tasks.build_tauri]
 description = "Build the Tauri settings app"
 script_runner = "@shell"

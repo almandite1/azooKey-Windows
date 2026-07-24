@@ -1,0 +1,33 @@
+[package]
+name = "azookey-e2e"
+version.workspace = true
+edition = "2024"
+
+# Tier 2 of docs/e2e-automation-plan.md: drives the IME through a real host
+# application with synthesised keystrokes. It switches the DEFAULT INPUT
+# METHOD of whoever runs it and types into whatever has focus, so it belongs
+# in the test VM and nowhere else — `cargo make e2e` is the only supported
+# way to run it, and the binary refuses to start outside a VM.
+
+[dependencies]
+anyhow = { workspace = true }
+
+[dependencies.windows]
+workspace = true
+features = [
+    # LocaleNameToLCID, for the ja-JP language id the profile is registered under
+    "Win32_Globalization",
+    # CoCreateInstance for the TSF profile manager and the UIA client
+    "Win32_System_Com",
+    # QueryFullProcessImageNameW, to tell the host application's windows from
+    # everyone else's
+    "Win32_System_Threading",
+    # IUIAutomation: reading back what the host application actually received
+    "Win32_UI_Accessibility",
+    # SendInput
+    "Win32_UI_Input_KeyboardAndMouse",
+    # ITfInputProcessorProfiles::SetDefaultLanguageProfile
+    "Win32_UI_TextServices",
+    # EnumWindows / SetForegroundWindow / IsWindowVisible
+    "Win32_UI_WindowsAndMessaging",
+]
