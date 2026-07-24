@@ -48,7 +48,10 @@ fn run() -> Result<bool> {
 
     let uia = uia::Uia::new()?;
     let scenarios = scenarios::all();
-    println!("\n{} 個のシナリオを実行します\n", scenarios.len());
+    match scenarios::hang_after_secs() {
+        Some(secs) => println!("\nハングフック armed ({secs}s): watchdog シナリオのみ実行します\n"),
+        None => println!("\n{} 個のシナリオを実行します\n", scenarios.len()),
+    }
 
     let mut results = Vec::new();
     for scenario in &scenarios {
