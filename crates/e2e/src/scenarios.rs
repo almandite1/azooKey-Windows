@@ -87,8 +87,10 @@ pub fn hang_after_secs() -> Option<u64> {
 fn basic_conversion(uia: &Uia) -> Result<String> {
     let host = HostApp::launch("notepad.exe", "notepad.exe")?;
     enter_kana(&host)?;
+
+    let before = expected_count(uia, &host);
     convert_reading(READING)?;
-    let text = wait_for_expected(uia, &host)?;
+    let text = wait_for_new_expected(uia, &host, before)?;
     Ok(text)
 }
 
@@ -116,8 +118,9 @@ fn long_input_survives(uia: &Uia) -> Result<String> {
 
     // and still converts — a live process that no longer answers would pass
     // the check above but fail here
+    let before = expected_count(uia, &host);
     convert_reading(READING)?;
-    let text = wait_for_expected(uia, &host)
+    let text = wait_for_new_expected(uia, &host, before)
         .context("server は生存しているが変換が返らない（ハング疑い）")?;
     Ok(format!("engine alive; {text:?}"))
 }
@@ -130,8 +133,12 @@ fn second_host_converts(uia: &Uia) -> Result<String> {
     let exe = custom_host_path()?;
     let host = HostApp::launch(&exe, "azookey-e2e-host.exe")?;
     enter_kana(&host)?;
+
+    // this host starts genuinely empty (no session restore), but count anyway
+    // so every scenario asserts the same way
+    let before = expected_count(uia, &host);
     convert_reading(READING)?;
-    let text = wait_for_expected(uia, &host)?;
+    let text = wait_for_new_expected(uia, &host, before)?;
     Ok(text)
 }
 
@@ -249,17 +256,20 @@ fn convert_reading(reading: &str) -> Result<()> {
 /// reading. Retrying absorbs that — and the fresh server may still be loading
 /// its dictionary, which the overall [`RESTART_TIMEOUT`] budget covers.
 fn convert_with_recovery(uia: &Uia, host: &HostApp) -> Result<String> {
+    // counted once, before any attempt: every retry must still be judged
+    // against the text as it stood BEFORE recovery was attempted
+    let before = expected_count(uia, host);
     let deadline = std::time::Instant::now() + RESTART_TIMEOUT;
     let mut attempt = 0;
     loop {
         attempt += 1;
-        // clear anything a previous attempt left composing
+        // drop anything a previous attempt left composing
         keyboard::tap(keyboard::escape())?;
         convert_reading(READING)?;
 
         let found = poll_until(CONVERSION_TIMEOUT, || {
             let text = uia.text_of(host.window)?;
-            text.contains(EXPECTED).then_some(text)
+            (text.matches(EXPECTED).count() > before).then_some(text)
         });
         if let Some(text) = found {
             println!("   converted on attempt {attempt}");
@@ -267,8 +277,8 @@ fn convert_with_recovery(uia: &Uia, host: &HostApp) -> Result<String> {
         }
         if std::time::Instant::now() >= deadline {
             bail!(
-                "{EXPECTED} が {RESTART_TIMEOUT:?} 以内に復帰しませんでした（{attempt} 回試行）。\
-                 最後の本文: {:?}",
+                "{EXPECTED} が {RESTART_TIMEOUT:?} 以内に増えませんでした（{attempt} 回試行、\
+                 開始時 {before} 個）。最後の本文: {:?}",
                 uia.text_of(host.window)
             );
         }
@@ -276,15 +286,24 @@ fn convert_with_recovery(uia: &Uia, host: &HostApp) -> Result<String> {
     }
 }
 
-/// Waits for [`EXPECTED`] to appear in the host's text.
+/// How many times [`EXPECTED`] already appears in the host's text.
 ///
-/// `contains`, never equality: the VM's Notepad keeps a fixed `1234567890`
-/// prefix (Phase 0), and in general the harness does not control every byte a
-/// real application already holds.
-fn wait_for_expected(uia: &Uia, host: &HostApp) -> Result<String> {
+/// **Never assert `contains`.** Windows 11's Notepad restores its previous
+/// session, so a "fresh" one opens holding whatever the last scenario left —
+/// including its 水. Scenarios 2, 5 and 6 all passed against that leftover
+/// without their own conversion ever landing. The honest question is not
+/// whether 水 is present but whether one MORE appeared.
+fn expected_count(uia: &Uia, host: &HostApp) -> usize {
+    uia.text_of(host.window)
+        .map(|text| text.matches(EXPECTED).count())
+        .unwrap_or(0)
+}
+
+/// Waits for another [`EXPECTED`] to appear beyond the `before` count.
+fn wait_for_new_expected(uia: &Uia, host: &HostApp, before: usize) -> Result<String> {
     let found = poll_until(CONVERSION_TIMEOUT, || {
         let text = uia.text_of(host.window)?;
-        text.contains(EXPECTED).then_some(text)
+        (text.matches(EXPECTED).count() > before).then_some(text)
     });
 
     match found {
@@ -292,9 +311,10 @@ fn wait_for_expected(uia: &Uia, host: &HostApp) -> Result<String> {
         None => {
             let seen = uia.text_of(host.window);
             bail!(
-                "{EXPECTED} は現れませんでした（{CONVERSION_TIMEOUT:?}）。読み取れた本文: {seen:?}\n\
-                 空なら打鍵が届いていない、ローマ字のままなら Kana 切替が効いていない、\n\
-                 「みず」で止まりなら変換要求がエンジンに届いていない。"
+                "{EXPECTED} が増えませんでした（{CONVERSION_TIMEOUT:?}、開始時 {before} 個）。\
+                 読み取れた本文: {seen:?}\n\
+                 変化なしなら打鍵が届いていない、ローマ字が増えているなら Kana 切替が\n\
+                 効いていない、「みず」で止まりなら変換要求がエンジンに届いていない。"
             )
         }
     }
