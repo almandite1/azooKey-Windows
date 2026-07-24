@@ -19,6 +19,9 @@ use crate::poll_until;
 /// The engine process launcher supervises.
 pub const SERVER_IMAGE: &str = "azookey-server.exe";
 
+/// The supervisor. Exactly one per session — see [`preflight`].
+pub const LAUNCHER_IMAGE: &str = "launcher.exe";
+
 /// Whether a process with this image name is currently running.
 pub fn is_running(image: &str) -> bool {
     pid_of(image).is_some()
@@ -31,16 +34,23 @@ pub fn server_pid() -> Option<u32> {
 
 /// The pid of the first process with this image name.
 fn pid_of(image: &str) -> Option<u32> {
+    pids_of(image).into_iter().next()
+}
+
+/// Every pid with this image name.
+pub fn pids_of(image: &str) -> Vec<u32> {
     let wanted = image.to_ascii_lowercase();
+    let mut pids = Vec::new();
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return pids;
+        };
 
         let mut entry = PROCESSENTRY32W {
             dwSize: size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
 
-        let mut pid = None;
         if Process32FirstW(snapshot, &mut entry).is_ok() {
             loop {
                 let end = entry
@@ -50,8 +60,7 @@ fn pid_of(image: &str) -> Option<u32> {
                     .unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
                 if name.eq_ignore_ascii_case(&wanted) {
-                    pid = Some(entry.th32ProcessID);
-                    break;
+                    pids.push(entry.th32ProcessID);
                 }
                 if Process32NextW(snapshot, &mut entry).is_err() {
                     break;
@@ -60,8 +69,50 @@ fn pid_of(image: &str) -> Option<u32> {
         }
 
         let _ = CloseHandle(snapshot);
-        pid
     }
+    pids
+}
+
+/// Refuses to run against an engine that is missing or duplicated.
+///
+/// A second `launcher.exe` is the failure that cost a VM: the pipe is
+/// first-instance, so the extra supervisor can never bring its server up, and
+/// it keeps respawning one that keeps failing — which burns through the
+/// session's resources until nothing new can start at all (a plain
+/// `powershell.exe` stopped launching). Starting launcher once per boot is the
+/// rule; this is what enforces it.
+pub fn preflight() -> Result<()> {
+    let launchers = pids_of(LAUNCHER_IMAGE);
+    match launchers.len() {
+        0 => bail!(
+            "{LAUNCHER_IMAGE} が動いていません。先に管理者で起動してください:\n\
+             \x20   Start-Process C:\\e2e\\build\\launcher.exe"
+        ),
+        1 => {}
+        n => bail!(
+            "{LAUNCHER_IMAGE} が {n} 個動いています (pids {launchers:?})。\n\
+             パイプは first-instance なので余分な supervisor は server を上げられず、\n\
+             失敗し続ける server を再生成してセッション資源を食い潰します。\n\
+             \"clean\" チェックポイントから復元してやり直してください。"
+        ),
+    }
+
+    let servers = pids_of(SERVER_IMAGE);
+    if servers.len() > 1 {
+        bail!(
+            "{SERVER_IMAGE} が {} 個動いています (pids {servers:?})。同上。",
+            servers.len()
+        );
+    }
+    if servers.is_empty() {
+        bail!(
+            "{SERVER_IMAGE} が動いていません。launcher が起動しきるまで待つか、\n\
+             ログ (%LOCALAPPDATA%\\Azookey\\logs) を確認してください。"
+        );
+    }
+
+    println!("engine ok: launcher {launchers:?}, server {servers:?}");
+    Ok(())
 }
 
 /// Force-kills a process by pid via `taskkill`, the same tool the manual
