@@ -2,15 +2,14 @@
 //!
 //! Notepad is the obvious host, but it is a packaged application whose editor
 //! changes shape between Windows releases; pinning "conversion works in a
-//! second application" to a control we own keeps that scenario stable. It is
-//! deliberately tiny: one overlapped window with a single multiline EDIT
-//! child that always holds the focus, so a TSF input method composes straight
-//! into it and UI Automation reads it back through the Value pattern.
+//! second application" to a control we own keeps that scenario stable.
 //!
-//! This also lays the groundwork for the password-field scenario (the plan's
-//! #4): a second EDIT with `ES_PASSWORD` slots in the same way.
+//! Three controls: an ordinary multiline EDIT, an `ES_PASSWORD` field Tab
+//! reaches, and a read-only mirror of the latter. Owning the host is what
+//! makes the password scenario decidable at all — see [`State::mirror`].
 //!
-//! Not a test by itself — it is launched BY the harness (`second_host_converts`).
+//! Not a test by itself — it is launched BY the harness
+//! (`second_host_converts`, `password_field_disables_ime`).
 
 #![windows_subsystem = "windows"]
 
@@ -20,12 +19,13 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW, GWLP_USERDATA,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, HMENU, IDC_ARROW, IsDialogMessageW, LoadCursorW,
-    MSG, MoveWindow, PostQuitMessage, RegisterClassW, SW_SHOW, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CREATE, WM_DESTROY, WM_SETFOCUS, WM_SIZE,
-    WNDCLASSW, WS_CHILD, WS_EX_LEFT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowTextW, HMENU, IDC_ARROW,
+    IsDialogMessageW, LoadCursorW, MSG, MoveWindow, PostQuitMessage, RegisterClassW, SW_SHOW,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_CHILD, WS_EX_LEFT,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
-use windows::core::{Result, w};
+use windows::core::{PCWSTR, Result, w};
 
 /// The edit controls, kept so `WM_SIZE`/`WM_SETFOCUS` can reach them. Stashed
 /// in the window's `GWLP_USERDATA` rather than a global, so nothing is shared
@@ -37,13 +37,36 @@ struct State {
     /// a password control, and the TIP is supposed to fall back to direct
     /// input there — the plan's scenario 4. Tab moves between the two.
     password: HWND,
+    /// A read-only echo of what the password field currently holds.
+    ///
+    /// The test cannot read the password field itself: UI Automation refuses
+    /// to hand out a password's value, by design, and a plain EDIT does not
+    /// surface an in-flight composition either (CUAS keeps it out of the
+    /// control's buffer until it is committed) — which is exactly why the
+    /// earlier attempts at this scenario could observe nothing at all. The
+    /// host owns the control, so it can read it with `GetWindowTextW` and
+    /// publish it somewhere the test CAN read.
+    ///
+    /// This exists only in the E2E fixture, never in anything shipped, and the
+    /// only thing ever typed into that field is the test's own `mizu`.
+    mirror: HWND,
 }
+
+/// Control ids. UI Automation exposes a Win32 control's id as its
+/// AutomationId, which is how the test addresses one field rather than
+/// whichever happens to come first in the tree.
+const ID_EDIT: usize = 1;
+const ID_PASSWORD: usize = 2;
+pub const ID_MIRROR: usize = 3;
 
 // Standard EDIT control window styles (windows 0.62 does not surface these as
 // named constants, so the values are inlined with the constant they mirror).
 const ES_MULTILINE: i32 = 0x0004;
 const ES_WANTRETURN: i32 = 0x1000;
 const ES_PASSWORD: i32 = 0x0020;
+const ES_READONLY: i32 = 0x0800;
+/// `EN_CHANGE`, the EDIT notification carried in `WM_COMMAND`'s high word.
+const EN_CHANGE: u16 = 0x0300;
 
 fn main() -> Result<()> {
     unsafe {
@@ -117,7 +140,7 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
                     0,
                     0,
                     Some(window),
-                    Some(HMENU::default()),
+                    Some(HMENU(ID_EDIT as *mut std::ffi::c_void)),
                     Some(instance),
                     None,
                 )
@@ -135,13 +158,34 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
                     0,
                     0,
                     Some(window),
-                    Some(HMENU::default()),
+                    Some(HMENU(ID_PASSWORD as *mut std::ffi::c_void)),
                     Some(instance),
                     None,
                 )
                 .expect("failed to create the password control");
 
-                let state = Box::into_raw(Box::new(State { edit, password }));
+                // not a tab stop, so Tab cycles between the two real fields
+                let mirror = CreateWindowExW(
+                    WS_EX_LEFT,
+                    w!("EDIT"),
+                    w!(""),
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_READONLY as u32),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(window),
+                    Some(HMENU(ID_MIRROR as *mut std::ffi::c_void)),
+                    Some(instance),
+                    None,
+                )
+                .expect("failed to create the mirror control");
+
+                let state = Box::into_raw(Box::new(State {
+                    edit,
+                    password,
+                    mirror,
+                }));
                 SetWindowLongPtrW(window, GWLP_USERDATA, state as isize);
 
                 let _ = SetFocus(Some(edit));
@@ -151,19 +195,41 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
                 if let Some(state) = state_of(window) {
                     let mut rect = RECT::default();
                     let _ = GetClientRect(window, &mut rect);
-                    // the text field takes everything above a fixed-height
-                    // password box at the bottom
-                    const PASSWORD_HEIGHT: i32 = 28;
-                    let text_height = (rect.bottom - PASSWORD_HEIGHT).max(0);
+                    // the text field takes everything above the password box
+                    // and its mirror, both fixed height, at the bottom
+                    const ROW_HEIGHT: i32 = 28;
+                    let text_height = (rect.bottom - ROW_HEIGHT * 2).max(0);
                     let _ = MoveWindow(state.edit, 0, 0, rect.right, text_height, true);
+                    let _ =
+                        MoveWindow(state.password, 0, text_height, rect.right, ROW_HEIGHT, true);
                     let _ = MoveWindow(
-                        state.password,
+                        state.mirror,
                         0,
-                        text_height,
+                        text_height + ROW_HEIGHT,
                         rect.right,
-                        PASSWORD_HEIGHT,
+                        ROW_HEIGHT,
                         true,
                     );
+                }
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                // republish the password field's content where the test can
+                // read it (see `State::mirror`)
+                let id = wparam.0 & 0xFFFF;
+                let notification = ((wparam.0 >> 16) & 0xFFFF) as u16;
+                if id == ID_PASSWORD
+                    && notification == EN_CHANGE
+                    && let Some(state) = state_of(window)
+                {
+                    let mut buffer = [0u16; 256];
+                    let len = GetWindowTextW(state.password, &mut buffer);
+                    let text: Vec<u16> = buffer[..len as usize]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    let _ = SetWindowTextW(state.mirror, PCWSTR(text.as_ptr()));
                 }
                 LRESULT(0)
             }

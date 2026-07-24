@@ -44,6 +44,20 @@ impl Uia {
         None
     }
 
+    /// The value of one specific control, addressed by the AutomationId that
+    /// UI Automation derives from a Win32 control's id.
+    ///
+    /// `text_of` returns whichever element happens to carry text first, which
+    /// is fine when a host has one field and useless when it has three. This
+    /// is how the password scenario reads the mirror field and nothing else.
+    pub fn value_by_automation_id(&self, window: HWND, id: &str) -> Option<String> {
+        let elements = self.descendants(window)?;
+        elements.into_iter().find_map(|element| {
+            let matches = unsafe { element.CurrentAutomationId() }.is_ok_and(|found| found == id);
+            matches.then(|| value_of(&element).unwrap_or_default())
+        })
+    }
+
     fn descendants(&self, window: HWND) -> Option<Vec<IUIAutomationElement>> {
         unsafe {
             let root = self.automation.ElementFromHandle(window).ok()?;
