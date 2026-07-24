@@ -72,7 +72,7 @@
 - [Swift for Windows](https://www.swift.org/install/windows/) (Swift 6.0以上)
 - [protoc](https://protobuf.dev/installation/) 
 - [node.js](https://nodejs.org/en/download/)
-- [inno setup](https://jrsoftware.org/isinfo.php)
+- [inno setup](https://jrsoftware.org/isinfo.php) (7.0以上、x64版を推奨)
 
 ### ビルド
 

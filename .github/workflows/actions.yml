@@ -51,6 +51,14 @@ jobs:
       LLAMA_CUDA_SHA256: 5307B89AAE1F076E031D6AAB95E63DF5CB96B8D3B1FA7828F412E283A0663019
       LLAMA_VULKAN_SHA256: ED1B7E6AA70CDB2A93EAAAD8586539DCE83F4FA8A44F4DDEE5A1AB09FFB1189B
       ZENZ_SHA256: 29C223D4C23327B80FD13EBB5AB2555057A46317997D5DA391584FFBEF0DB673
+      # The installer compiler. windows-latest ships an Inno Setup, but an
+      # unpinned one: the runner image can move it under us, which is exactly
+      # the floating dependency every other entry here exists to avoid. So we
+      # install our own and put it ahead on PATH. Checksum from the release
+      # asset digest GitHub publishes for the file (jrsoftware does not
+      # publish a hash list; the download page points at the same digest).
+      INNOSETUP_VERSION: 7.0.2
+      INNOSETUP_SHA256: 5AD54CA3DEF786F8F4212552E54CC6D8D61329E2D24A1CFEE0571D42C2684FF1
 
     # every `uses:` below is pinned to a full commit SHA rather than a tag,
     # because tags can be moved after the fact. The downloads further down are
@@ -105,6 +113,34 @@ jobs:
       uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
       with:
         tool: cargo-make,protoc
+
+    # ~16 MB and quick, so no cache: a cache here would only add a way for the
+    # verification below to be skipped. The x64 edition is the one jrsoftware
+    # recommends; it still builds the 32-bit Setup.exe we ship, because
+    # SetupArchitecture is left at its default.
+    - name: Install Inno Setup
+      run: |
+        $url = "https://github.com/jrsoftware/issrc/releases/download/is-$($env:INNOSETUP_VERSION -replace '\.','_')/innosetup-$env:INNOSETUP_VERSION-x64.exe"
+        $exe = Join-Path $env:TEMP "innosetup-x64.exe"
+        Invoke-WebRequest -Uri $url -OutFile $exe
+        $actual = (Get-FileHash $exe -Algorithm SHA256).Hash
+        if ($actual -ne $env:INNOSETUP_SHA256) {
+          throw "checksum mismatch for ${url}: expected $env:INNOSETUP_SHA256, got $actual"
+        }
+        Start-Process $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/ALLUSERS' -Wait
+        # ahead of the runner's own copy, which is what makes the pin mean
+        # anything — GITHUB_PATH entries are prepended
+        "C:\Program Files\Inno Setup 7" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    # A pin that silently resolved to the runner's compiler would look green
+    # while proving nothing, so check which iscc actually answers.
+    - name: Verify Inno Setup version
+      run: |
+        $banner = (iscc 2>&1 | Out-String)
+        Write-Host $banner
+        if ($banner -notmatch "Inno Setup 7") {
+          throw "iscc did not resolve to Inno Setup 7 (got: $($banner -split "`n" | Select-Object -First 1))"
+        }
 
     # ~600 MB of pinned artifacts (three llama zips + the zenz model). The
     # key carries every checksum the job verifies, so changing a pin — or
