@@ -46,10 +46,15 @@ fn run() -> Result<bool> {
     }
 
     stage(Stage::Profile);
-    // held to the end of the run: dropping it restores the previous default
-    let _profile = profile::DefaultProfile::set_to_azookey()?;
+    // held to the end of the run: dropping it restores the previous default.
+    // Also lent to the scenarios — the IME-cycle one switches through it.
+    let default_profile = profile::DefaultProfile::set_to_azookey()?;
 
     let uia = uia::Uia::new()?;
+    let ctx = scenarios::Ctx {
+        uia: &uia,
+        profile: &default_profile,
+    };
     let scenarios = scenarios::all();
     match scenarios::hang_after_secs() {
         Some(secs) => println!("\nハングフック armed ({secs}s): watchdog シナリオのみ実行します\n"),
@@ -59,7 +64,7 @@ fn run() -> Result<bool> {
     let mut results = Vec::new();
     for scenario in &scenarios {
         println!("── {} ──", scenario.name);
-        let result = (scenario.run)(&uia);
+        let result = (scenario.run)(&ctx);
         match &result {
             Ok(detail) => println!("   pass: {detail}"),
             Err(e) => println!("   FAIL: {e:#}"),

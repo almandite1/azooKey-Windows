@@ -150,7 +150,10 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     BOOL(1)
 }
 
-fn image_name_of(pid: u32) -> Option<String> {
+/// The lowercased executable name of a process, for telling one owner's
+/// windows from another's. Shared with `overlay`, which needs the same
+/// question asked about `ui.exe`.
+pub fn image_name_of(pid: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
 

@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyW,
-    SendInput, VIRTUAL_KEY, VK_BACK, VK_ESCAPE, VK_RETURN, VK_SPACE,
+    SendInput, VIRTUAL_KEY, VK_BACK, VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB,
 };
 
 /// `VK_DBE_DBCSCHAR` — one of the two virtual keys the 半角/全角 key produces.
@@ -55,6 +55,12 @@ pub fn escape() -> VIRTUAL_KEY {
 
 pub fn backspace() -> VIRTUAL_KEY {
     VK_BACK
+}
+
+/// Tab — how a person reaches the next field. Outside a composition the TIP
+/// leaves it unhandled, so it reaches the host and moves focus.
+pub fn tab() -> VIRTUAL_KEY {
+    VK_TAB
 }
 
 /// Types an ASCII string one key at a time — the romaji a user would type.

@@ -81,6 +81,37 @@ impl DefaultProfile {
     }
 }
 
+impl DefaultProfile {
+    /// Whether there was another input method to cycle through.
+    pub fn has_previous(&self) -> bool {
+        self.previous.is_some()
+    }
+
+    /// Switches the ja-JP default away to whatever was default before, then
+    /// back to azooKey — one round trip of the checklist's "MS-IME ↔ azooKey
+    /// を往復". Applications started afterwards pick azooKey up again; a TIP
+    /// that did not survive being deactivated would fail the conversion that
+    /// follows.
+    pub fn cycle(&self) -> Result<()> {
+        let Some((clsid, profile)) = self.previous else {
+            return Ok(());
+        };
+        unsafe {
+            self.profiles
+                .SetDefaultLanguageProfile(self.langid, &clsid, &profile)
+                .context("failed to switch the default away from azooKey")?;
+            // let the switch settle before switching back; a profile change is
+            // broadcast, not instantaneous
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            self.profiles
+                .SetDefaultLanguageProfile(self.langid, &GUID_TEXT_SERVICE, &GUID_PROFILE)
+                .context("failed to switch the default back to azooKey")?;
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        Ok(())
+    }
+}
+
 impl Drop for DefaultProfile {
     fn drop(&mut self) {
         let Some((clsid, profile)) = self.previous else {

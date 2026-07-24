@@ -20,24 +20,30 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW, GWLP_USERDATA,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, HMENU, IDC_ARROW, LoadCursorW, MSG, MoveWindow,
-    PostQuitMessage, RegisterClassW, SW_SHOW, SetWindowLongPtrW, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CREATE, WM_DESTROY, WM_SETFOCUS, WM_SIZE, WNDCLASSW,
-    WS_CHILD, WS_EX_LEFT, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, HMENU, IDC_ARROW, IsDialogMessageW, LoadCursorW,
+    MSG, MoveWindow, PostQuitMessage, RegisterClassW, SW_SHOW, SetWindowLongPtrW, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CREATE, WM_DESTROY, WM_SETFOCUS, WM_SIZE,
+    WNDCLASSW, WS_CHILD, WS_EX_LEFT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{Result, w};
 
-/// The edit control, kept so `WM_SIZE`/`WM_SETFOCUS` can reach it. Stashed in
-/// the window's `GWLP_USERDATA` rather than a global, so nothing is shared
+/// The edit controls, kept so `WM_SIZE`/`WM_SETFOCUS` can reach them. Stashed
+/// in the window's `GWLP_USERDATA` rather than a global, so nothing is shared
 /// across the (single) window this process owns.
 struct State {
+    /// The ordinary text field: where conversion is expected to work.
     edit: HWND,
+    /// An `ES_PASSWORD` field. A TSF host sets the disable-IME compartment on
+    /// a password control, and the TIP is supposed to fall back to direct
+    /// input there — the plan's scenario 4. Tab moves between the two.
+    password: HWND,
 }
 
 // Standard EDIT control window styles (windows 0.62 does not surface these as
 // named constants, so the values are inlined with the constant they mirror).
 const ES_MULTILINE: i32 = 0x0004;
 const ES_WANTRETURN: i32 = 0x1000;
+const ES_PASSWORD: i32 = 0x0020;
 
 fn main() -> Result<()> {
     unsafe {
@@ -76,6 +82,13 @@ fn main() -> Result<()> {
 
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
+            // Tab between the text field and the password field. A plain
+            // window gets no tab navigation for free — this is what a dialog
+            // does for its controls, and scenario 4 moves focus with Tab
+            // because that is how a person reaches a password box.
+            if IsDialogMessageW(window, &message).as_bool() {
+                continue;
+            }
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
@@ -96,6 +109,7 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
                     w!(""),
                     WS_CHILD
                         | WS_VISIBLE
+                        | WS_TABSTOP
                         | WS_VSCROLL
                         | WINDOW_STYLE((ES_MULTILINE | ES_WANTRETURN) as u32),
                     0,
@@ -109,7 +123,25 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
                 )
                 .expect("failed to create the EDIT control");
 
-                let state = Box::into_raw(Box::new(State { edit }));
+                // single-line and masked: what a real password box is, and
+                // what makes the host disable the IME on it
+                let password = CreateWindowExW(
+                    WS_EX_LEFT,
+                    w!("EDIT"),
+                    w!(""),
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_PASSWORD as u32),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(window),
+                    Some(HMENU::default()),
+                    Some(instance),
+                    None,
+                )
+                .expect("failed to create the password control");
+
+                let state = Box::into_raw(Box::new(State { edit, password }));
                 SetWindowLongPtrW(window, GWLP_USERDATA, state as isize);
 
                 let _ = SetFocus(Some(edit));
@@ -119,7 +151,19 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
                 if let Some(state) = state_of(window) {
                     let mut rect = RECT::default();
                     let _ = GetClientRect(window, &mut rect);
-                    let _ = MoveWindow(state.edit, 0, 0, rect.right, rect.bottom, true);
+                    // the text field takes everything above a fixed-height
+                    // password box at the bottom
+                    const PASSWORD_HEIGHT: i32 = 28;
+                    let text_height = (rect.bottom - PASSWORD_HEIGHT).max(0);
+                    let _ = MoveWindow(state.edit, 0, 0, rect.right, text_height, true);
+                    let _ = MoveWindow(
+                        state.password,
+                        0,
+                        text_height,
+                        rect.right,
+                        PASSWORD_HEIGHT,
+                        true,
+                    );
                 }
                 LRESULT(0)
             }
