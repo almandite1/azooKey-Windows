@@ -17,6 +17,10 @@ use crate::{engine, keyboard, logs, overlay, poll_until, uia::Uia, winevent};
 /// scenario failure is about the input path, not conversion quality.
 const READING: &str = "mizu";
 const EXPECTED: &str = "水";
+/// What the reading looks like while it is still composing — the preedit the
+/// host holds before Space converts it. Read straight out of the control, so
+/// it says "a composition started here" without depending on `ui.exe`.
+const READING_KANA: &str = "みず";
 
 /// How long conversion output has to appear once the keys are sent.
 const CONVERSION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -173,7 +177,7 @@ fn second_host_converts(ctx: &Ctx) -> Result<String> {
 /// it did — UI Automation refuses to hand out a password's value, by design —
 /// so the observable is the **candidate window**: composing opens it, and in a
 /// password field nothing should compose at all.
-fn password_field_disables_ime(_ctx: &Ctx) -> Result<String> {
+fn password_field_disables_ime(ctx: &Ctx) -> Result<String> {
     let host = HostApp::launch(&custom_host_path()?, CUSTOM_HOST_IMAGE)?;
     enter_kana(&host)?;
 
@@ -182,28 +186,58 @@ fn password_field_disables_ime(_ctx: &Ctx) -> Result<String> {
     keyboard::tap(keyboard::escape())?;
     wait_for_candidates(false, "開始時に候補ウィンドウが閉じている")?;
 
-    // the ordinary field: composing opens the candidate window
+    // The ordinary field first, to establish the baseline. The signal is the
+    // PREEDIT in the control, not the candidate window: this half must be able
+    // to fail for its own reason ("nothing composed") separately from
+    // "ui.exe never showed a window", which is a different defect entirely.
     keyboard::type_ascii(READING)?;
-    wait_for_candidates(true, "通常欄で候補ウィンドウが出る")
-        .context("通常欄ですら合成が始まっていない — Kana 切替を疑う")?;
+    let composed = poll_until(SETTLE_TIMEOUT, || {
+        let text = ctx.uia.text_of(host.window)?;
+        text.contains(READING_KANA).then_some(text)
+    });
+    let Some(composed) = composed else {
+        bail!(
+            "通常欄で合成が始まりませんでした（{READING_KANA} が現れない）。読み取れた本文: {:?}\n\
+             Kana 切替か、このホストへの TIP のアタッチを疑う。",
+            ctx.uia.text_of(host.window)
+        );
+    };
+
+    // Did the candidate window come up for it? That is what the password half
+    // has to compare against, so a "no" here means this scenario cannot decide
+    // anything — and says so rather than blaming the password field.
+    let candidates_shown = poll_until(SETTLE_TIMEOUT, || {
+        overlay::candidates_visible().then_some(())
+    })
+    .is_some();
 
     keyboard::tap(keyboard::escape())?;
-    wait_for_candidates(false, "Escape で候補ウィンドウが閉じる")?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    if !candidates_shown {
+        bail!(
+            "通常欄では合成が始まった（本文 {composed:?}）のに候補ウィンドウが出ませんでした。\n\
+             パスワード欄との比較材料が無いので判定できません。ui.exe の候補ウィンドウが\n\
+             このホストで出ない理由（UIElement 経路 / 位置未報告）を先に調べてください。"
+        );
+    }
 
     // Tab into the password field
     keyboard::tap(keyboard::tab())?;
     std::thread::sleep(Duration::from_millis(500));
 
-    // and there, the same keys must not start a composition
+    // and there, the same keys must not start a composition. The field itself
+    // cannot answer — UI Automation refuses to hand out a password's value, by
+    // design — so the candidate window is the observable.
     keyboard::type_ascii(READING)?;
     std::thread::sleep(SETTLE_TIMEOUT);
-    if overlay::candidates_visible() {
-        keyboard::tap(keyboard::escape())?;
+    let leaked = overlay::candidates_visible();
+    keyboard::tap(keyboard::escape())?;
+
+    if leaked {
         bail!("パスワード欄で候補ウィンドウが出ました = IME が無効化されていない");
     }
-
-    keyboard::tap(keyboard::escape())?;
-    Ok("password field stayed on direct input".to_string())
+    Ok("ordinary field composed, password field stayed on direct input".to_string())
 }
 
 /// Scenario 5: kill the engine, and conversion comes back once launcher has
