@@ -4,8 +4,8 @@
 //! changes shape between Windows releases; pinning "conversion works in a
 //! second application" to a control we own keeps that scenario stable.
 //!
-//! Three controls: an ordinary multiline EDIT, an `ES_PASSWORD` field Tab
-//! reaches, and a read-only mirror of the latter. Owning the host is what
+//! Three controls: an ordinary multiline EDIT, an `ES_PASSWORD` field, and
+//! a read-only mirror of the latter. Owning the host is what
 //! makes the password scenario decidable at all — see [`State::mirror`].
 //!
 //! Not a test by itself — it is launched BY the harness
@@ -19,11 +19,11 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW, GWLP_USERDATA,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowTextW, HMENU, IDC_ARROW,
-    IsDialogMessageW, LoadCursorW, MSG, MoveWindow, PostQuitMessage, RegisterClassW, SW_SHOW,
-    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_CHILD, WS_EX_LEFT,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowTextW, HMENU, IDC_ARROW, LoadCursorW,
+    MSG, MoveWindow, PostQuitMessage, RegisterClassW, SW_SHOW, SetWindowLongPtrW, SetWindowTextW,
+    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_CHILD, WS_EX_LEFT, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -35,7 +35,7 @@ struct State {
     edit: HWND,
     /// An `ES_PASSWORD` field. A TSF host sets the disable-IME compartment on
     /// a password control, and the TIP is supposed to fall back to direct
-    /// input there — the plan's scenario 4. Tab moves between the two.
+    /// input there — the plan's scenario 4.
     password: HWND,
     /// A read-only echo of what the password field currently holds.
     ///
@@ -103,15 +103,14 @@ fn main() -> Result<()> {
 
         let _ = ShowWindow(window, SW_SHOW);
 
+        // A plain loop on purpose. `IsDialogMessageW` was here to give Tab
+        // navigation between the fields, and it does not move focus out of a
+        // multiline EDIT — which cost the password scenario three rounds of
+        // blaming the IME for a caret that never moved. The harness places the
+        // caret through UI Automation instead, so nothing needs to sit between
+        // a keystroke and the control under test.
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
-            // Tab between the text field and the password field. A plain
-            // window gets no tab navigation for free — this is what a dialog
-            // does for its controls, and scenario 4 moves focus with Tab
-            // because that is how a person reaches a password box.
-            if IsDialogMessageW(window, &message).as_bool() {
-                continue;
-            }
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
@@ -164,7 +163,8 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
                 )
                 .expect("failed to create the password control");
 
-                // not a tab stop, so Tab cycles between the two real fields
+                // read-only and not a tab stop: it is an observation window,
+                // never something typed into
                 let mirror = CreateWindowExW(
                     WS_EX_LEFT,
                     w!("EDIT"),

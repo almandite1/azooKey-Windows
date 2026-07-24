@@ -200,17 +200,17 @@ fn password_field_disables_ime(ctx: &Ctx) -> Result<String> {
     wait_for_new_expected(ctx.uia, &host, before)
         .context("通常欄で変換できていないので、パスワード欄の判定材料がありません")?;
 
-    // Tab into the password field, and check it actually went there — "Tab did
-    // nothing" and "the IME misbehaved" look identical downstream otherwise
-    keyboard::tap(keyboard::tab())?;
+    // into the password field, and confirm the caret really went there —
+    // "focus never moved" and "the IME misbehaved" look identical downstream
+    ctx.uia.focus_by_automation_id(host.window, PASSWORD_ID)?;
     std::thread::sleep(Duration::from_millis(500));
     let focused = ctx.uia.focused_automation_id();
-    println!("   focus after Tab: {focused:?} (expecting {PASSWORD_ID:?})");
+    println!("   focus: {focused:?} (expecting {PASSWORD_ID:?})");
     if focused.as_deref() != Some(PASSWORD_ID) {
         for line in ctx.uia.describe(host.window) {
             println!("     {line}");
         }
-        bail!("Tab がパスワード欄へ移りませんでした（focus={focused:?}）");
+        bail!("パスワード欄へフォーカスが移りませんでした（focus={focused:?}）");
     }
 
     // the same keys again — this time they must land as plain latin

@@ -89,8 +89,27 @@ impl Uia {
             .collect()
     }
 
-    /// The AutomationId of whatever currently has focus, for telling "Tab
-    /// moved" from "Tab did nothing".
+    /// Moves the caret into one specific control.
+    ///
+    /// Tab was the obvious way — it is how a person reaches the next field —
+    /// but `IsDialogMessageW` does not move focus out of a multiline EDIT, so
+    /// the password scenario spent three rounds blaming the IME for a caret
+    /// that had never left the first control. What is under test is whether
+    /// the IME disengages on a password field, not whether tab navigation
+    /// works in a toy host, so the harness places the caret directly.
+    pub fn focus_by_automation_id(&self, window: HWND, id: &str) -> Result<()> {
+        let elements = self
+            .descendants(window)
+            .context("this window exposes no UIA tree")?;
+        let element = elements
+            .into_iter()
+            .find(|element| unsafe { element.CurrentAutomationId() }.is_ok_and(|found| found == id))
+            .with_context(|| format!("no control with AutomationId {id:?}"))?;
+        unsafe { element.SetFocus() }.with_context(|| format!("SetFocus on {id:?} failed"))
+    }
+
+    /// The AutomationId of whatever currently has focus, for telling "the
+    /// caret moved" from "it did not".
     pub fn focused_automation_id(&self) -> Option<String> {
         unsafe {
             let element = self.automation.GetFocusedElement().ok()?;
