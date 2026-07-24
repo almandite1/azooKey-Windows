@@ -16,7 +16,7 @@
 //! `vcomp140.dll`, which the installer supplies in a real deployment).
 
 use anyhow::Result;
-use azookey_e2e::{Stage, guard, profile, scenarios, stage, uia};
+use azookey_e2e::{Stage, engine, guard, profile, scenarios, stage, uia};
 
 fn main() -> std::process::ExitCode {
     match run() {
@@ -35,6 +35,9 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<bool> {
     stage(Stage::Guard);
     guard::require_vm()?;
+    // one launcher, one server — a duplicated supervisor is what exhausted a
+    // VM's session once, and it is cheap to refuse up front
+    engine::preflight()?;
 
     // STA: the TSF profile manager is an apartment-threaded in-proc server.
     unsafe {
