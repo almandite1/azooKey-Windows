@@ -11,9 +11,12 @@ pub mod engine;
 pub mod guard;
 pub mod host;
 pub mod keyboard;
+pub mod logs;
+pub mod overlay;
 pub mod profile;
 pub mod scenarios;
 pub mod uia;
+pub mod winevent;
 
 use std::time::{Duration, Instant};
 
