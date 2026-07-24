@@ -186,7 +186,8 @@ fn second_host_converts(ctx: &Ctx) -> Result<String> {
 /// `mizu` in the mirror means direct input; kana or kanji, or nothing at all
 /// (a composition still pending), means the IME did not disengage.
 fn password_field_disables_ime(ctx: &Ctx) -> Result<String> {
-    /// AutomationId of the mirror control, from the host's `ID_MIRROR`.
+    /// AutomationIds from the host's `ID_PASSWORD` / `ID_MIRROR`.
+    const PASSWORD_ID: &str = "2";
     const MIRROR_ID: &str = "3";
 
     let host = HostApp::launch(&custom_host_path()?, CUSTOM_HOST_IMAGE)?;
@@ -199,9 +200,18 @@ fn password_field_disables_ime(ctx: &Ctx) -> Result<String> {
     wait_for_new_expected(ctx.uia, &host, before)
         .context("通常欄で変換できていないので、パスワード欄の判定材料がありません")?;
 
-    // Tab into the password field
+    // Tab into the password field, and check it actually went there — "Tab did
+    // nothing" and "the IME misbehaved" look identical downstream otherwise
     keyboard::tap(keyboard::tab())?;
     std::thread::sleep(Duration::from_millis(500));
+    let focused = ctx.uia.focused_automation_id();
+    println!("   focus after Tab: {focused:?} (expecting {PASSWORD_ID:?})");
+    if focused.as_deref() != Some(PASSWORD_ID) {
+        for line in ctx.uia.describe(host.window) {
+            println!("     {line}");
+        }
+        bail!("Tab がパスワード欄へ移りませんでした（focus={focused:?}）");
+    }
 
     // the same keys again — this time they must land as plain latin
     keyboard::type_ascii(READING)?;
@@ -213,9 +223,17 @@ fn password_field_disables_ime(ctx: &Ctx) -> Result<String> {
     keyboard::tap(keyboard::escape())?;
 
     let Some(mirrored) = mirrored else {
+        // whatever went wrong, the tree says which: an empty mirror with an
+        // empty password field means nothing was committed there (a pending
+        // composition); an empty mirror with no mirror control at all means
+        // the readback is broken, not the IME
+        for line in ctx.uia.describe(host.window) {
+            println!("     {line}");
+        }
         bail!(
-            "パスワード欄に何も入りませんでした。IME が合成を抱えたまま確定していない\
-             （= 無効化されていない）疑いが濃厚です。"
+            "パスワード欄のミラーが空のままでした。上のツリー出力を確認してください\
+             （id={MIRROR_ID:?} が存在しないなら読み取り側の問題、存在して空なら\
+             IME が合成を抱えたまま確定していない）。"
         );
     };
     if mirrored != READING {

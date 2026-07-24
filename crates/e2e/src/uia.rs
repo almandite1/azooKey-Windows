@@ -58,6 +58,46 @@ impl Uia {
         })
     }
 
+    /// A one-line description of every control in the window: its
+    /// AutomationId, class, whether the tree marks it a password, and its
+    /// value.
+    ///
+    /// Diagnostics, not an assertion. The password scenario kept failing in
+    /// ways that could equally have meant "the IME did not disengage", "Tab
+    /// never moved", or "the readback is wrong", and no amount of rephrasing
+    /// the assertion separated them — the harness has to be able to say what
+    /// it is actually looking at.
+    pub fn describe(&self, window: HWND) -> Vec<String> {
+        let Some(elements) = self.descendants(window) else {
+            return vec!["<no UIA tree for this window>".to_string()];
+        };
+        elements
+            .into_iter()
+            .map(|element| {
+                let id = unsafe { element.CurrentAutomationId() }
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let class = unsafe { element.CurrentClassName() }
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let password = unsafe { element.CurrentIsPassword() }
+                    .map(|b| b.as_bool())
+                    .unwrap_or(false);
+                let value = value_of(&element).unwrap_or_else(|| "<no value pattern>".to_string());
+                format!("id={id:?} class={class:?} password={password} value={value:?}")
+            })
+            .collect()
+    }
+
+    /// The AutomationId of whatever currently has focus, for telling "Tab
+    /// moved" from "Tab did nothing".
+    pub fn focused_automation_id(&self) -> Option<String> {
+        unsafe {
+            let element = self.automation.GetFocusedElement().ok()?;
+            Some(element.CurrentAutomationId().ok()?.to_string())
+        }
+    }
+
     fn descendants(&self, window: HWND) -> Option<Vec<IUIAutomationElement>> {
         unsafe {
             let root = self.automation.ElementFromHandle(window).ok()?;
