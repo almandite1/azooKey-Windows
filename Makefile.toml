@@ -129,6 +129,9 @@ foreach ($d in 'Dictionary', 'EmojiDictionary', 'llama_cpu', 'x86') {
 }
 
 Copy-Item "target/$profileDir/azookey-e2e.exe" $stage
+# the second host for scenario 3 (bin/host.rs); the harness launches it by
+# name from beside itself
+Copy-Item "target/$profileDir/azookey-e2e-host.exe" $stage
 
 $zip = Join-Path $env:TEMP "azookey-e2e.zip"
 Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
