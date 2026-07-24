@@ -141,6 +141,11 @@ jobs:
         if ($banner -notmatch "Inno Setup 7") {
           throw "iscc did not resolve to Inno Setup 7 (got: $($banner -split "`n" | Select-Object -First 1))"
         }
+        # iscc with no script prints its usage and exits 1. The banner check
+        # above is this step's verdict; without an explicit success the shell
+        # would hand that usage exit code back to the runner and fail a step
+        # that just proved the pin holds.
+        exit 0
 
     # ~600 MB of pinned artifacts (three llama zips + the zenz model). The
     # key carries every checksum the job verifies, so changing a pin — or
