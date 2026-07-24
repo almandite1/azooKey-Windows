@@ -184,6 +184,15 @@ jobs:
     - name: Test
       run: cargo test --workspace --release
 
+    # Tier 1 of docs/e2e-automation-plan.md: a real ui.exe is started and its
+    # candidate window driven over the WindowService pipe, so this covers what
+    # only a person looking at a screen could check before. It needs a desktop
+    # and the WebView2 runtime (both present on windows-latest) but no TIP
+    # registration and no conversion engine, which is what keeps it CI-safe —
+    # Tier 2 (SendInput into real applications) stays out of CI by design.
+    - name: Test (candidate window display)
+      run: cargo make test_ui_display --release
+
     # the Swift package's own suite (swift-testing); `cargo test` above only
     # covers the Rust side. After Build so the package graph is already
     # fetched and the installer is already packaged — this build enables

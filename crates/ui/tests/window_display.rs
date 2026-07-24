@@ -1,0 +1,368 @@
+//! Tier 1 of `docs/e2e-automation-plan.md`: what the candidate window
+//! actually puts on screen, driven through the real `WindowService` pipe.
+//!
+//! `utils.rs` unit-tests every *decision* the window makes (where to clamp,
+//! how wide to be, how to escape a mode string). None of that proves the
+//! decision reaches a window — that the candidates are rendered, that the
+//! highlight moves, that the window appears where it was told to, that the
+//! shell is told the IME UI came and went. That is what these do, and they
+//! replace the manual checks in `docs/azookey-windows-manual-checklist.md`
+//! that used to need a person looking at a screen.
+//!
+//! They start a real ui.exe (WebView2 and all), so they are `#[ignore]`d like
+//! the server's `ipc_smoke`. Run them with:
+//!
+//!     cargo make test_ui_display
+//!
+//! or directly:
+//!
+//!     cargo test -p ui --test window_display -- --ignored --test-threads=1
+//!
+//! Unlike Tier 2 they need no TIP registration, no keystroke injection and no
+//! conversion engine, so they are safe on a working machine and can run in CI.
+
+mod support;
+
+use support::{ImeEvent, SETTLE_TIMEOUT, Ui, poll_until, wait_for};
+
+use std::time::Duration;
+use windows::Win32::Foundation::RECT;
+use windows::Win32::UI::WindowsAndMessaging::{
+    SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+};
+
+/// A caret rect well inside the primary work area, so the window lands where
+/// the placement rules put it with no clamping and the assertions stay exact.
+fn caret_with_room() -> RECT {
+    let mut work = RECT::default();
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut work as *mut RECT as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .expect("SPI_GETWORKAREA failed");
+
+    RECT {
+        left: work.left + 200,
+        top: work.top + 100,
+        right: work.left + 260,
+        bottom: work.top + 140,
+    }
+}
+
+/// The window goes up where it was told, comes down when asked, and the shell
+/// is told about each transition exactly once — the checklist's "候補窓が出る"
+/// and "WinEvent が遷移時のみ 1 回ずつ" in one pass.
+#[tokio::test]
+#[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]
+async fn showing_and_hiding_announces_one_transition_each() {
+    let mut ui = Ui::start().await;
+    let candidate = ui.candidate();
+
+    assert!(
+        !candidate.is_visible(),
+        "the candidate window must start hidden"
+    );
+
+    let mark = ui.events.mark();
+    ui.show_at(caret_with_room()).await;
+    ui.events.expect_exactly(mark, candidate, &[ImeEvent::Show]);
+
+    let mark = ui.events.mark();
+    ui.hide().await;
+    wait_for(SETTLE_TIMEOUT, "the candidate window to disappear", || {
+        !candidate.is_visible()
+    });
+    ui.events.expect_exactly(mark, candidate, &[ImeEvent::Hide]);
+
+    // a second Hide is not a transition and must announce nothing
+    let mark = ui.events.mark();
+    ui.hide().await;
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        ui.events.since(mark, candidate),
+        &[],
+        "hiding an already-hidden window must not announce anything"
+    );
+
+    ui.assert_no_errors();
+}
+
+/// A `Show` for a composition whose position never arrives still puts the
+/// candidates on screen once the grace period ends (issue #59): no candidates
+/// at all is worse than candidates in a stale spot.
+#[tokio::test]
+#[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]
+async fn a_show_without_a_position_still_appears() {
+    let mut ui = Ui::start().await;
+
+    ui.show().await;
+
+    wait_for(
+        SETTLE_TIMEOUT,
+        "the deferred show to be honoured by the deadline",
+        || ui.candidate().is_visible(),
+    );
+    ui.assert_no_errors();
+}
+
+/// The candidates reach the webview and arrive as a list a screen reader can
+/// read — the automatable half of the Narrator checklist item.
+#[tokio::test]
+#[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]
+async fn the_candidates_reach_the_window_as_an_accessible_list() {
+    let mut ui = Ui::start().await;
+    let candidate = ui.candidate();
+    ui.show_at(caret_with_room()).await;
+
+    ui.set_candidates(&["水", "みず", "ミズ", "瑞"]).await;
+
+    let rendered = ui.uia.wait_for(
+        "the candidates to be rendered",
+        |uia| uia.candidates(candidate),
+        |candidates| candidates.len() == 4,
+    );
+    assert_eq!(rendered, ["水", "みず", "ミズ", "瑞"]);
+
+    assert_eq!(
+        ui.uia.list_label(candidate).as_deref(),
+        Some("変換候補"),
+        "the list must carry the label Narrator announces"
+    );
+
+    ui.assert_no_errors();
+}
+
+/// A shorter list must not leave the previous composition's leftovers behind.
+#[tokio::test]
+#[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]
+async fn a_shorter_list_drops_the_leftover_candidates() {
+    let mut ui = Ui::start().await;
+    let candidate = ui.candidate();
+    ui.show_at(caret_with_room()).await;
+
+    ui.set_candidates(&["一", "二", "三", "四", "五"]).await;
+    ui.uia.wait_for(
+        "the first list to be rendered",
+        |uia| uia.candidates(candidate),
+        |candidates| candidates.len() == 5,
+    );
+
+    ui.set_candidates(&["壱", "弐"]).await;
+    let rendered = ui.uia.wait_for(
+        "the shorter list to replace it",
+        |uia| uia.candidates(candidate),
+        |candidates| candidates.len() == 2,
+    );
+    assert_eq!(rendered, ["壱", "弐"]);
+
+    ui.assert_no_errors();
+}
+
+/// The highlight follows `SetSelection`, and an index past the end clears it
+/// instead of throwing (which used to abort the script and freeze the
+/// highlight where it was).
+#[tokio::test]
+#[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]
+async fn the_highlight_follows_the_selection() {
+    let mut ui = Ui::start().await;
+    let candidate = ui.candidate();
+    ui.show_at(caret_with_room()).await;
+
+    ui.set_candidates(&["水", "みず", "ミズ"]).await;
+    ui.uia.wait_for(
+        "the candidates to be rendered",
+        |uia| uia.candidates(candidate),
+        |candidates| candidates.len() == 3,
+    );
+
+    for index in [0, 2, 1] {
+        ui.select(index).await;
+        ui.uia.wait_for(
+            "the highlight to move",
+            |uia| uia.selected_index(candidate),
+            |selected| *selected == Some(index as usize),
+        );
+    }
+
+    // past the end of the list: nothing selected, and the window survives
+    ui.select(99).await;
+    ui.uia.wait_for(
+        "the highlight to be cleared",
+        |uia| uia.selected_index(candidate),
+        |selected| selected.is_none(),
+    );
+    ui.select(1).await;
+    ui.uia.wait_for(
+        "the highlight to come back afterwards",
+        |uia| uia.selected_index(candidate),
+        |selected| *selected == Some(1),
+    );
+
+    ui.assert_no_errors();
+}
+
+/// The window follows the reported caret: 15px left of it, directly below.
+#[tokio::test]
+#[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]
+async fn the_window_moves_to_the_reported_caret() {
+    let mut ui = Ui::start().await;
+    let candidate = ui.candidate();
+    let caret = caret_with_room();
+    ui.sized().await;
+    ui.show_at(caret).await;
+
+    let expected = (caret.left - 15, caret.bottom);
+    wait_for(SETTLE_TIMEOUT, "the window to reach the caret", || {
+        let rect = candidate.rect();
+        (rect.left, rect.top) == expected
+    });
+
+    // and it follows a second caret (the composition moved along the line)
+    let moved = RECT {
+        left: caret.left + 300,
+        top: caret.top + 60,
+        right: caret.right + 300,
+        bottom: caret.bottom + 60,
+    };
+    ui.set_position(moved).await;
+    let expected = (moved.left - 15, moved.bottom);
+    wait_for(SETTLE_TIMEOUT, "the window to follow the caret", || {
+        let rect = candidate.rect();
+        (rect.left, rect.top) == expected
+    });
+
+    ui.assert_no_errors();
+}
+
+/// A visible window announces content changes; a hidden one must not — ending
+/// a composition sends `Hide` and then an empty `SetCandidate`, which used to
+/// announce a CHANGE on a window that had just gone away.
+#[tokio::test]
+#[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]
+async fn only_a_visible_window_announces_content_changes() {
+    let mut ui = Ui::start().await;
+    let candidate = ui.candidate();
+    ui.show_at(caret_with_room()).await;
+
+    let mark = ui.events.mark();
+    ui.set_candidates(&["水", "みず"]).await;
+    ui.events
+        .expect_exactly(mark, candidate, &[ImeEvent::Change]);
+
+    ui.hide_and_wait().await;
+
+    let mark = ui.events.mark();
+    ui.set_candidates(&[]).await;
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        ui.events.since(mark, candidate),
+        &[],
+        "a hidden window must not announce content changes"
+    );
+
+    ui.assert_no_errors();
+}
+
+/// A longer candidate widens the window, in the proportion
+/// `candidate_window_logical_width` decides. Asserted as a ratio so the test
+/// does not have to know the monitor's scale factor.
+#[tokio::test]
+#[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]
+async fn a_long_candidate_widens_the_window() {
+    let mut ui = Ui::start().await;
+    let candidate = ui.candidate();
+    ui.show_at(caret_with_room()).await;
+
+    // one short candidate: below the floor, so the window takes its minimum
+    ui.set_candidates(&["水"]).await;
+    let narrow = poll_until(SETTLE_TIMEOUT, || {
+        let width = candidate.logical_width();
+        ((width - 225.0).abs() < 2.0).then_some(width)
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "expected the 225px floor, got {:.0}px (at {} dpi)",
+            candidate.logical_width(),
+            candidate.dpi()
+        )
+    });
+
+    // 20 chars -> 120 + 20*18 = 480 logical px, well past the floor
+    ui.set_candidates(&["あいうえおかきくけこさしすせそたちつてと"])
+        .await;
+    poll_until(SETTLE_TIMEOUT, || {
+        let width = candidate.logical_width();
+        ((width - 480.0).abs() < 2.0).then_some(width)
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "expected the window to widen from {narrow:.0}px to 480px, got {:.0}px \
+             (at {} dpi)",
+            candidate.logical_width(),
+            candidate.dpi()
+        )
+    });
+
+    ui.assert_no_errors();
+}
+
+/// The mode indicator flashes on a mode change and takes itself back down,
+/// showing the mode it was given — the checklist's あ/A item, minus the
+/// looking.
+#[tokio::test]
+#[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]
+async fn the_mode_indicator_flashes_and_shows_the_mode() {
+    let mut ui = Ui::start().await;
+    let indicator = ui.indicator();
+
+    ui.set_position(caret_with_room()).await;
+    ui.set_input_mode("あ").await;
+
+    wait_for(SETTLE_TIMEOUT, "the mode indicator to appear", || {
+        indicator.is_visible()
+    });
+    ui.indicator_shows("あ").await;
+
+    // and it switches, rather than only ever showing the first mode it got
+    ui.indicator_shows("A").await;
+
+    // the flash is half a second: once nothing refreshes it, it goes away on
+    // its own — an indicator that stayed up would sit over the application
+    wait_for(SETTLE_TIMEOUT, "the mode indicator to hide itself", || {
+        !indicator.is_visible()
+    });
+
+    ui.assert_no_errors();
+}
+
+/// Both overlays must stay non-activating tool windows in the topmost band:
+/// an IME window that can take focus steals it from the application being
+/// typed into, and one that is not topmost hides behind it.
+#[tokio::test]
+#[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]
+async fn the_overlays_are_non_activating_topmost_tool_windows() {
+    let mut ui = Ui::start().await;
+    ui.show_at(caret_with_room()).await;
+
+    for (name, window) in [("candidate", ui.candidate()), ("indicator", ui.indicator())] {
+        let style = window.extended_style();
+        for (flag, label) in [
+            (WS_EX_NOACTIVATE.0, "WS_EX_NOACTIVATE"),
+            (WS_EX_TOOLWINDOW.0, "WS_EX_TOOLWINDOW"),
+            (WS_EX_TOPMOST.0, "WS_EX_TOPMOST"),
+        ] {
+            assert_ne!(
+                style & flag,
+                0,
+                "the {name} window lost {label} (style {style:#x})"
+            );
+        }
+    }
+
+    ui.assert_no_errors();
+}

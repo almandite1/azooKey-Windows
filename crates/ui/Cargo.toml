@@ -38,3 +38,23 @@ features = [
     # used to reach them only through feature unification with crates/client
     "Win32_UI_WindowsAndMessaging"
 ]
+
+# The display tests (tests/window_display.rs) drive a real ui.exe and read
+# back what it put on screen. Their extra bindings live here rather than in
+# [dependencies] so the shipped binary keeps the feature set above: dev
+# dependencies are not part of a plain `cargo build`.
+[dev-dependencies]
+tonic-health = { workspace = true }
+
+[dev-dependencies.windows]
+workspace = true
+features = [
+    # CoCreateInstance for the UI Automation client, which is how the tests
+    # read the rendered candidates back out of the webview
+    "Win32_System_Com",
+    # GetCurrentThreadId, for the thread that owns the WinEvent hook
+    "Win32_System_Threading",
+    # GetDpiForWindow: sizes are decided in CSS px and applied as LogicalSize,
+    # so the assertions have to convert the measured pixels back
+    "Win32_UI_HiDpi",
+]

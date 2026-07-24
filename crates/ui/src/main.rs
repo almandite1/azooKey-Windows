@@ -80,8 +80,12 @@ async fn main() -> anyhow::Result<()> {
     // nobody left to take it down; the connection ending is the only notice
     // we get, and tonic gives it to us by dropping the pipe (issue #67).
     let (disconnect_tx, mut disconnect_rx) = mpsc::unbounded_channel();
-    let incoming =
-        TonicNamedPipeServer::with_disconnect_notify(&shared::pipe::ui_pipe_base(), disconnect_tx)?;
+    // normally the session's own name; `--pipe-base` lets the display tests
+    // run a second ui.exe beside the installed one (see the function's note on
+    // why only this end honours an override)
+    let pipe_base = utils::pipe_base_from_args(std::env::args().skip(1))
+        .unwrap_or_else(shared::pipe::ui_pipe_base);
+    let incoming = TonicNamedPipeServer::with_disconnect_notify(&pipe_base, disconnect_tx)?;
     // health service for the launcher's watchdog. The reported status
     // follows the EVENT LOOP's liveness (via the heartbeat below), so a
     // stalled window loop turns the whole process NOT_SERVING even while
