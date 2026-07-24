@@ -12,6 +12,29 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, VIRTUAL_KEY, VK_BACK, VK_ESCAPE, VK_RETURN, VK_SPACE,
 };
 
+/// `VK_DBE_DBCSCHAR` — one of the two virtual keys the 半角/全角 key produces.
+/// The TIP reserves it (and its `VK_DBE_SBCSCHAR` sibling) with no modifiers
+/// and routes both through `OnPreservedKey`, which flips the input mode
+/// (`crates/client/src/tsf/preserved_key.rs`). A freshly activated azooKey
+/// defaults to Latin (`InputMode`'s `#[default]`), so a scenario that expects
+/// conversion has to send this once to reach Kana — the manual spike worked
+/// only because a human had already switched it.
+const VK_ZENKAKU_HANKAKU: u16 = 0xF4;
+/// The physical scan code of the 半角/全角 key (shared with `` ` `` on JIS).
+/// `MapVirtualKeyW` does not resolve the DBE virtual keys to a scan code, so
+/// it is supplied explicitly.
+const SCAN_ZENKAKU_HANKAKU: u16 = 0x29;
+
+/// Toggles the input mode via the 半角/全角 key. From the default Latin this
+/// reaches Kana; call it once before a scenario that expects conversion.
+pub fn toggle_input_mode() -> Result<()> {
+    send_with_scan(VIRTUAL_KEY(VK_ZENKAKU_HANKAKU), SCAN_ZENKAKU_HANKAKU, false)?;
+    std::thread::sleep(Duration::from_millis(15));
+    send_with_scan(VIRTUAL_KEY(VK_ZENKAKU_HANKAKU), SCAN_ZENKAKU_HANKAKU, true)?;
+    std::thread::sleep(KEY_INTERVAL);
+    Ok(())
+}
+
 /// Gap between keystrokes. Real typing is not instantaneous and neither is
 /// the conversion round trip; a burst with no gap has repeatedly been the
 /// difference between "the IME is broken" and "the test types faster than
@@ -68,7 +91,10 @@ fn send(vk: VIRTUAL_KEY, up: bool) -> Result<()> {
     // read the scan code, while the keystroke sink matches on the virtual
     // key. Sending only one of the two leaves the other reading zero.
     let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) } as u16;
+    send_with_scan(vk, scan, up)
+}
 
+fn send_with_scan(vk: VIRTUAL_KEY, scan: u16, up: bool) -> Result<()> {
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {

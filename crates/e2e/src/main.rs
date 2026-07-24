@@ -68,6 +68,14 @@ fn run() -> Result<()> {
     std::thread::sleep(Duration::from_millis(750));
 
     stage(Stage::Inject);
+    // A freshly activated azooKey defaults to Latin (A) mode — its InputMode
+    // #[default]. The manual spike only converted because a human had already
+    // switched to Kana; the harness has to do it itself. The 半角/全角 key
+    // toggles it (preserved_key.rs).
+    println!("switching to Kana with the 半角/全角 key");
+    keyboard::toggle_input_mode()?;
+    std::thread::sleep(Duration::from_millis(250));
+
     println!("typing {ROMAJI:?} + Space + Enter");
     keyboard::type_ascii(ROMAJI)?;
     keyboard::tap(keyboard::space())?;
