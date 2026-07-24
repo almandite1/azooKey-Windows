@@ -7,10 +7,12 @@
 //! machine. Running it on a development machine would retype the plan into
 //! whatever window happened to be in front.
 
+pub mod engine;
 pub mod guard;
 pub mod host;
 pub mod keyboard;
 pub mod profile;
+pub mod scenarios;
 pub mod uia;
 
 use std::time::{Duration, Instant};
