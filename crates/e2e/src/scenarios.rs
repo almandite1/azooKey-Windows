@@ -1,9 +1,10 @@
 //! The Tier 2 scenarios, and the shared gestures they are built from.
 //!
-//! Numbered against `docs/e2e-automation-plan.md`. This first cut covers the
-//! conversion basics (1–3); the fault-injection and IME-cycle scenarios come
-//! later. Each is independent — its own fresh host, killed on the way out —
-//! so a failure in one does not poison the next (the plan's "失敗時は続行").
+//! Numbered against `docs/e2e-automation-plan.md`: the conversion basics
+//! (1–3) and the fault-injection trio (5–7). The IME-cycle and log-scan
+//! scenarios come later. Each is independent — its own fresh host, killed on
+//! the way out — so a failure in one does not poison the next (the plan's
+//! "失敗時は続行").
 
 use std::time::Duration;
 
@@ -22,6 +23,10 @@ const CONVERSION_TIMEOUT: Duration = Duration::from_secs(15);
 /// After a fresh host is focused, the moment the TIP needs to be activated
 /// into it before the first keystroke lands.
 const ACTIVATION_GRACE: Duration = Duration::from_millis(750);
+/// How long the engine gets to come back after a kill or a watchdog restart.
+/// Generous: launcher restarts with backoff and the fresh server reloads its
+/// dictionary before it can answer (its own startup grace is 120s).
+const RESTART_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// One scenario: a name for the report and the work that either succeeds or
 /// explains where it stopped. The returned string is a human-readable detail
@@ -31,8 +36,22 @@ pub struct Scenario {
     pub run: fn(&Uia) -> Result<String>,
 }
 
-/// The scenarios this build knows how to run, in order.
+/// The scenarios this build runs, chosen by whether the hang hook is armed.
+///
+/// `watchdog_restarts_hung_server` needs `azookey-server.exe` started with
+/// `AZOOKEY_TEST_HANG_AFTER_SECS`, which launcher only passes if it inherited
+/// it — so that scenario is run in a **separate** invocation where launcher
+/// (and this harness) both see the variable. Mixing it with the others is
+/// impossible anyway: an armed server hangs partway through the suite. So:
+/// variable set → only the watchdog scenario; unset → everything else.
 pub fn all() -> Vec<Scenario> {
+    if hang_after_secs().is_some() {
+        return vec![Scenario {
+            name: "watchdog_restarts_hung_server",
+            run: watchdog_restarts_hung_server,
+        }];
+    }
+
     vec![
         Scenario {
             name: "basic_conversion",
@@ -46,7 +65,22 @@ pub fn all() -> Vec<Scenario> {
             name: "second_host_converts",
             run: second_host_converts,
         },
+        Scenario {
+            name: "server_kill_recovers",
+            run: server_kill_recovers,
+        },
+        Scenario {
+            name: "mid_composition_kill_resets",
+            run: mid_composition_kill_resets,
+        },
     ]
+}
+
+/// The armed hang delay, if `AZOOKEY_TEST_HANG_AFTER_SECS` is set to a number.
+pub fn hang_after_secs() -> Option<u64> {
+    std::env::var("AZOOKEY_TEST_HANG_AFTER_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
 }
 
 /// Scenario 1: `mizu` + Space + Enter in Notepad commits 水.
@@ -101,6 +135,89 @@ fn second_host_converts(uia: &Uia) -> Result<String> {
     Ok(text)
 }
 
+/// Scenario 5: kill the engine, and conversion comes back once launcher has
+/// respawned it. The automatable half of "the IME recovers when the engine
+/// dies" — a kill this test can cause, unlike a real crash.
+fn server_kill_recovers(uia: &Uia) -> Result<String> {
+    let host = HostApp::launch("notepad.exe", "notepad.exe")?;
+    enter_kana(&host)?;
+
+    let pid = engine::server_pid().context("engine を起動してから実行してください")?;
+    println!("   killing {} (pid {pid})", engine::SERVER_IMAGE);
+    engine::kill_pid(pid)?;
+
+    let new_pid = engine::wait_for_restart(pid, RESTART_TIMEOUT)?;
+    println!("   respawned as pid {new_pid}");
+
+    // the first keystrokes after a restart can be spent reconnecting (the
+    // client resets its composition on the stale connection and swallows the
+    // key), so drive the conversion with retries
+    let text = convert_with_recovery(uia, &host)?;
+    Ok(format!("recovered under pid {new_pid}; {text:?}"))
+}
+
+/// Scenario 6: killing the engine WHILE a reading is composing must not splice
+/// the next keystroke onto a reading the fresh server never had.
+///
+/// The client detects the dead connection on the next key, tears the
+/// composition down (`reset_composition_after_server_loss`: it commits what
+/// was there and swallows the key), and opens a clean one against the new
+/// server. The proof it did not splice is that a fresh `mizu` afterwards still
+/// converts to 水 — a spliced reading (にほん + みず) would not.
+fn mid_composition_kill_resets(uia: &Uia) -> Result<String> {
+    let host = HostApp::launch("notepad.exe", "notepad.exe")?;
+    enter_kana(&host)?;
+
+    // a reading left composing, uncommitted
+    keyboard::type_ascii("nihon")?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    let pid = engine::server_pid().context("engine を起動してから実行してください")?;
+    println!(
+        "   killing {} mid-composition (pid {pid})",
+        engine::SERVER_IMAGE
+    );
+    engine::kill_pid(pid)?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    // the keystroke that meets the dead server and triggers the reset
+    keyboard::type_ascii("k")?;
+
+    let new_pid = engine::wait_for_restart(pid, RESTART_TIMEOUT)?;
+    println!("   respawned as pid {new_pid}");
+
+    // a clean composition against the fresh server still converts — proof the
+    // reading was reset, not carried over
+    let text = convert_with_recovery(uia, &host)?;
+    Ok(format!("clean conversion after reset; {text:?}"))
+}
+
+/// Scenario 7: an engine that hangs (stops answering without dying) is
+/// detected by launcher's watchdog, killed and restarted, and conversion
+/// recovers. Requires the server to have been started with
+/// `AZOOKEY_TEST_HANG_AFTER_SECS` (see `all`).
+fn watchdog_restarts_hung_server(uia: &Uia) -> Result<String> {
+    let secs = hang_after_secs().expect("only selected when the hang hook is armed");
+    println!("   hang hook armed for {secs}s after each server start");
+
+    let host = HostApp::launch("notepad.exe", "notepad.exe")?;
+    enter_kana(&host)?;
+
+    let pid = engine::server_pid().context("engine を起動してから実行してください")?;
+    println!("   waiting for the watchdog to catch the hang and restart pid {pid}");
+
+    // the hang fires `secs` after the server started; the watchdog then needs
+    // a few ping cycles (10s each, 3 failures) to declare it hung. RESTART_
+    // TIMEOUT covers the hang plus that detection.
+    let new_pid = engine::wait_for_restart(pid, RESTART_TIMEOUT + Duration::from_secs(secs))?;
+    println!("   watchdog restarted the engine as pid {new_pid}");
+
+    let text = convert_with_recovery(uia, &host)?;
+    Ok(format!(
+        "recovered after watchdog restart under pid {new_pid}; {text:?}"
+    ))
+}
+
 // --- shared gestures ---
 
 /// Focuses a freshly launched host and switches it to Kana. A new azooKey
@@ -122,6 +239,41 @@ fn convert_reading(reading: &str) -> Result<()> {
     keyboard::tap(keyboard::space())?;
     keyboard::tap(keyboard::enter())?;
     Ok(())
+}
+
+/// Converts `mizu` and waits for 水, retrying the whole gesture until it lands.
+///
+/// After a restart the client's channel is stale, so the first key (sometimes
+/// the first few) is spent reconnecting: the client sees the dead connection,
+/// resets, and swallows that key, so a single attempt can compose the wrong
+/// reading. Retrying absorbs that — and the fresh server may still be loading
+/// its dictionary, which the overall [`RESTART_TIMEOUT`] budget covers.
+fn convert_with_recovery(uia: &Uia, host: &HostApp) -> Result<String> {
+    let deadline = std::time::Instant::now() + RESTART_TIMEOUT;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        // clear anything a previous attempt left composing
+        keyboard::tap(keyboard::escape())?;
+        convert_reading(READING)?;
+
+        let found = poll_until(CONVERSION_TIMEOUT, || {
+            let text = uia.text_of(host.window)?;
+            text.contains(EXPECTED).then_some(text)
+        });
+        if let Some(text) = found {
+            println!("   converted on attempt {attempt}");
+            return Ok(text);
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "{EXPECTED} が {RESTART_TIMEOUT:?} 以内に復帰しませんでした（{attempt} 回試行）。\
+                 最後の本文: {:?}",
+                uia.text_of(host.window)
+            );
+        }
+        println!("   attempt {attempt} did not convert yet; retrying");
+    }
 }
 
 /// Waits for [`EXPECTED`] to appear in the host's text.
