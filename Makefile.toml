@@ -34,6 +34,33 @@ if ($LASTEXITCODE -ne 0) { throw "swift test failed with exit code $LASTEXITCODE
 # pipeline, and `swift test` builds the dependency graph again with
 # testability enabled — output post_build must never pick up.
 
+# Tier 1 of docs/e2e-automation-plan.md. Excluded from `cargo test` by
+# #[ignore] because it starts a real ui.exe: it needs an interactive desktop
+# and the WebView2 runtime, but no TIP registration, no keystroke injection
+# and no conversion engine — so unlike Tier 2 it is safe to run on a working
+# machine, alongside the installed IME.
+#
+# Serial by choice, not by need: the tests are isolated from each other (own
+# pipe, own WebView2 profile, hwnd-filtered event log) and pass in parallel
+# too, but ten simultaneous WebView2 stacks make the timing assertions a
+# measure of the machine's load rather than of the window's behaviour.
+[tasks.test_ui_display]
+description = "Run the candidate-window display tests against a real ui.exe"
+script_runner = "powershell"
+script_extension = "ps1"
+script = """
+$ErrorActionPreference = "Stop"
+$flags = @($args | Where-Object { $_ -and $_ -ne '--debug' })
+# ui.exe must exist next to the test binary; the harness runs the build it
+# was compiled alongside (override with AZOOKEY_UI_EXE)
+cargo build -p ui @flags
+if ($LASTEXITCODE -ne 0) { throw "cargo build -p ui failed with exit code $LASTEXITCODE" }
+
+cargo test -p ui --test window_display @flags -- --ignored --test-threads=1
+if ($LASTEXITCODE -ne 0) { throw "the display tests failed with exit code $LASTEXITCODE" }
+"""
+args = ["${@}"]
+
 # `cargo make build --debug` is documented (README) and the rest of the flow
 # accepts it — post_build maps `--debug`/`--release`/nothing onto the target
 # subdirectory. cargo itself has no `--debug` flag though (debug IS its
