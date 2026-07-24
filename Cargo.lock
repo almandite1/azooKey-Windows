@@ -279,6 +279,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "azookey-e2e"
+version = "0.1.0-alpha.2"
+dependencies = [
+ "anyhow",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "azookey-server"
 version = "0.1.0-alpha.2"
 dependencies = [
