@@ -311,6 +311,72 @@ async fn a_long_candidate_widens_the_window() {
     ui.assert_no_errors();
 }
 
+/// The window is as tall as the list it is showing, not a fixed five rows
+/// (issue #81).
+///
+/// The wasted space was the lesser half of that bug. `clamp_candidate_position`
+/// flips the window above the caret whenever it would overrun the work area,
+/// and it flips by the window's HEIGHT — so near the bottom of the screen a
+/// two-item list jumped five rows' worth upward and landed over the host
+/// application's title bar, far from the text it belonged to.
+///
+/// The assertions are relative: row height comes from the CSS and changes with
+/// the theme, but "five rows is taller than two" and "eight is not taller than
+/// five" hold whatever it is.
+#[tokio::test]
+#[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]
+async fn the_window_is_as_tall_as_the_list() {
+    const FIVE: [&str; 5] = ["水", "見ず", "みず", "ミズ", "瑞"];
+    const EIGHT: [&str; 8] = ["水", "見ず", "みず", "ミズ", "瑞", "水面", "水位", "淡水"];
+
+    let mut ui = Ui::start().await;
+    let candidate = ui.candidate();
+    ui.show_at(caret_with_room()).await;
+
+    // the startup measurement sizes for a full list, so a short one must
+    // SHRINK the window
+    let full = candidate.logical_height();
+    ui.set_candidates(&["水", "見ず"]).await;
+    let two = poll_until(SETTLE_TIMEOUT, || {
+        let height = candidate.logical_height();
+        (height < full - 1.0).then_some(height)
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "a two-item list must not keep the full-height window: still {:.0}px \
+             (at {} dpi)",
+            candidate.logical_height(),
+            candidate.dpi()
+        )
+    });
+
+    ui.set_candidates(&FIVE).await;
+    let five = poll_until(SETTLE_TIMEOUT, || {
+        let height = candidate.logical_height();
+        (height > two + 1.0).then_some(height)
+    })
+    .unwrap_or_else(|| {
+        panic!("a five-item list must grow the window back from {two:.0}px")
+    });
+    assert!(
+        (five - full).abs() < 2.0,
+        "five candidates is what the startup measurement sized for, so the two \
+         must agree: {five:.0}px vs {full:.0}px"
+    );
+
+    // past five the list scrolls instead of growing — updateSelection pages
+    // through it in groups of five, which only works if five is what fits
+    ui.set_candidates(&EIGHT).await;
+    if let Some(grown) = poll_until(Duration::from_millis(750), || {
+        let height = candidate.logical_height();
+        ((height - five).abs() > 2.0).then_some(height)
+    }) {
+        panic!("eight candidates must scroll, not grow: {five:.0}px -> {grown:.0}px");
+    }
+
+    ui.assert_no_errors();
+}
+
 /// The mode indicator flashes on a mode change and takes itself back down,
 /// showing the mode it was given — the checklist's あ/A item, minus the
 /// looking.

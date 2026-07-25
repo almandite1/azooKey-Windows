@@ -144,6 +144,13 @@ impl Hwnd {
         f64::from(self.width()) * 96.0 / f64::from(self.dpi())
     }
 
+    /// The window's height in CSS px, for the same reason as
+    /// [`Self::logical_width`] — the height the webview reports is a count of
+    /// rows plus chrome, all in CSS px.
+    pub fn logical_height(self) -> f64 {
+        f64::from(self.height()) * 96.0 / f64::from(self.dpi())
+    }
+
     pub fn dpi(self) -> u32 {
         match unsafe { GetDpiForWindow(self.raw()) } {
             0 => 96, // an invalid window; the caller's assertion will say so
