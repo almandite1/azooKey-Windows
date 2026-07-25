@@ -86,7 +86,7 @@ enum LoadOutcome {
 }
 
 /// Field names are mirrored by the Swift engine's `SettingsFile` decoder
-/// (server-swift/Sources/azookey-server/azookey_server.swift) — keep them
+/// (server-swift/Sources/azookey-server/EngineConfig.swift) — keep them
 /// in sync when adding settings the engine reads.
 /// `#[serde(default)]` here and on `AppConfig` makes a settings file written
 /// by an older build degrade per-field instead of failing the whole parse and

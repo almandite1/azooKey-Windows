@@ -25,8 +25,9 @@ use super::factory::TextServiceFactory_Impl;
 /// Outcome of one `update_pos` attempt. `PendingLayout` and `Clipped` are
 /// normal transient states, not errors: the candidate window keeps its current
 /// position and a later `OnLayoutChange` retries. We deliberately do *not*
-/// hide the window on either — `show_window` is only ever sent from
-/// `ClientAction::StartComposition` (engine/composition.rs), so hiding
+/// hide the window on either — the visibility transitions live only in
+/// `open_candidate_ui`/`close_candidate_ui` (engine/composition.rs) and in
+/// the host-driven `ITfUIElement::Show` (tsf/ui_element.rs), so hiding
 /// mid-composition would leave the candidates invisible for the rest of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PositionUpdate {

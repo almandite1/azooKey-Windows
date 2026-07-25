@@ -13,8 +13,8 @@
 //! **The gate is `pbShow`, not a flag.** `TF_TMAE_UIELEMENTENABLED` does not
 //! exist in windows-rs (only `TF_TMAE_UIELEMENTENABLEDONLY`), and activation
 //! flags are the wrong signal anyway: every host answers `BeginUIElement`
-//! with a `pbShow` regardless of how it activated us. `activate_flags` is
-//! kept for diagnostics only.
+//! with a `pbShow` regardless of how it activated us. `ActivateEx` therefore
+//! only logs its `dwflags` and drops them.
 //!
 //! **A live element pins the TIP.** `BeginUIElement` makes the host AddRef
 //! this object and hold it until `EndUIElement`. Deactivating with an

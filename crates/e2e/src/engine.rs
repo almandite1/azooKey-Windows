@@ -86,7 +86,8 @@ pub fn preflight() -> Result<()> {
     match launchers.len() {
         0 => bail!(
             "{LAUNCHER_IMAGE} が動いていません。先に管理者で起動してください:\n\
-             \x20   Start-Process C:\\e2e\\build\\launcher.exe"
+             \x20   Start-Process C:\\azookey-e2e\\payload-<timestamp>\\launcher.exe\n\
+             (payload ディレクトリは実行ごとに作られます。scripts/e2e-vm-run.ps1 参照)"
         ),
         1 => {}
         n => bail!(

@@ -53,7 +53,7 @@ fn open_current_process_token() -> Result<HANDLE> {
 }
 
 /// check for ui access
-pub fn check_for_ui_access() -> Result<bool> {
+fn check_for_ui_access() -> Result<bool> {
     let mut token_ui_access: BOOL = false.into();
     let mut token_len: u32 = 0;
 
@@ -75,7 +75,7 @@ pub fn check_for_ui_access() -> Result<bool> {
     }
 }
 
-pub fn duplicate_winlogon_token(
+fn duplicate_winlogon_token(
     session_id: u32,
     desired_access: TOKEN_ACCESS_MASK,
     h_token: &mut HANDLE,
@@ -212,7 +212,7 @@ unsafe fn try_duplicate_token(
     }
 }
 
-pub fn create_uiaccess_token(token_handle: &mut HANDLE) -> Result<()> {
+fn create_uiaccess_token(token_handle: &mut HANDLE) -> Result<()> {
     let mut token_self = HANDLE::default();
 
     unsafe {
