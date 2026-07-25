@@ -8,7 +8,7 @@ use shared::proto::Suggestion;
 
 use crate::ffi::{
     AppendText, ClearText, FFICandidate, FreeComposedText, FreeString, GetComposedText, Initialize,
-    LoadConfig, MoveCursor, RemoveText, SetContext, ShrinkText,
+    LoadConfig, MoveCursor, RemoveSession, RemoveText, SetContext, ShrinkText,
 };
 
 pub(crate) struct RawComposingText {
@@ -27,6 +27,12 @@ pub(crate) struct RawComposingText {
 /// be represented in a C string, so they are stripped instead of panicking —
 /// requests arrive over a pipe any local process can open.
 fn to_cstring(s: &str) -> CString {
+    // `CString::new` can only fail on an interior NUL, and the replace above
+    // has just removed every one of them — so the fallback is unreachable.
+    // It is spelled as a default rather than an unwrap because an empty
+    // string is exactly what the engine should be handed if the impossible
+    // ever happens: a server panicking here takes conversion down for every
+    // application at once.
     CString::new(s.replace('\0', "")).unwrap_or_default()
 }
 
@@ -102,6 +108,14 @@ pub(crate) fn load_config() {
     unsafe { LoadConfig() };
 }
 
+/// Drops the engine's composing state for a session whose connection went
+/// away (see session.rs). Here rather than at the call site so the "every
+/// `unsafe` FFI call lives in wrappers.rs" rule this module opens with has no
+/// exception — session.rs used to call `RemoveSession` raw.
+pub(crate) fn remove_session(session: i64) {
+    unsafe { RemoveSession(session) };
+}
+
 /// Owns the candidate list returned by GetComposedText and hands it back
 /// to FreeComposedText on drop, so every return path — including future
 /// early returns and panics unwinding through here — frees it exactly once.
@@ -143,6 +157,12 @@ pub(crate) fn get_composed_text(session: i64) -> Vec<Suggestion> {
     let list = ComposedTextList::fetch(session);
 
     let mut suggestions: Vec<Suggestion> = Vec::with_capacity(list.length as usize);
+    // The engine can propose the same surface text more than once and only
+    // the first (highest-ranked) occurrence is kept. A HashSet of what has
+    // been seen rather than a scan of `suggestions` per candidate: the list
+    // is rebuilt on every keystroke, and the scan made that quadratic in a
+    // long candidate list for no reason.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for candidate in list.candidates() {
         let suggestion = Suggestion {
             text: unsafe { cstr_or_empty(candidate.text) },
@@ -151,9 +171,7 @@ pub(crate) fn get_composed_text(session: i64) -> Vec<Suggestion> {
             surface_count: candidate.surface_count,
         };
 
-        // the engine can propose the same surface text more than once;
-        // keep the first (highest-ranked) occurrence
-        if suggestions.iter().any(|s| s.text == suggestion.text) {
+        if !seen.insert(suggestion.text.clone()) {
             continue;
         }
         suggestions.push(suggestion);

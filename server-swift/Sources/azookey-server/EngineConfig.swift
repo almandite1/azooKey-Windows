@@ -37,7 +37,7 @@ func loadSettingsFile(appDataPath: String? = nil) -> SettingsFile? {
         let data = try Data(contentsOf: settingsPath)
         return try JSONDecoder().decode(SettingsFile.self, from: data)
     } catch {
-        print("Failed to read settings: \(error)")
+        enginePrint(level: .error, "failed to read settings: \(error)")
         return nil
     }
 }

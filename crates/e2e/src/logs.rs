@@ -7,8 +7,6 @@
 //! answered from files at all; what remains is the server, ui and launcher
 //! logs, which is still where an engine-side panic would land.
 
-use std::path::PathBuf;
-
 use anyhow::{Context as _, Result};
 
 /// Markers that always mean a defect. Deliberately short: the fault scenarios
@@ -16,10 +14,9 @@ use anyhow::{Context as _, Result};
 /// are expected and must NOT be flagged — only an actual panic is unambiguous.
 const MARKERS: [&str; 2] = ["panicked at", "Activate failed"];
 
-/// Where the engine keeps its logs.
-pub fn log_dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("Azookey").join("logs"))
-}
+/// Where the engine keeps its logs — the same directory the components write
+/// to, so this cannot drift away from them.
+pub use shared::logs::log_dir;
 
 /// A marker found in a log.
 #[derive(Debug)]

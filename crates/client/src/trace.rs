@@ -8,14 +8,6 @@ use crate::extension::StringExt as _;
 #[cfg(not(debug_assertions))]
 use windows::{Win32::System::Diagnostics::Debug::OutputDebugStringW, core::PCWSTR};
 
-// debug-only: file logging (and its folder) exist only in debug builds
-#[cfg(debug_assertions)]
-fn log_folder() -> Option<std::path::PathBuf> {
-    // %LOCALAPPDATA%\Azookey\logs — never a hardcoded dev-machine path
-    let base = std::env::var_os("LOCALAPPDATA")?;
-    Some(std::path::Path::new(&base).join("Azookey").join("logs"))
-}
-
 /// Forwards formatted tracing output to OutputDebugStringW. Used in release
 /// builds: the DLL runs inside every application, so writing log FILES from
 /// here would contend across processes — debugger output is side-effect-free
@@ -62,7 +54,13 @@ pub fn setup_logger() -> anyhow::Result<()> {
 #[cfg(debug_assertions)]
 pub fn setup_logger() -> anyhow::Result<()> {
     {
-        let Some(folder) = log_folder() else {
+        // %LOCALAPPDATA%\Azookey\logs — never a hardcoded dev-machine path,
+        // and the same directory the other components use (shared::logs).
+        // Deliberately NOT rotated: unlike server/launcher, one process here
+        // is one file and the DLL lives in every application at once, so
+        // pruning from inside every host would have them deleting each
+        // other's live logs.
+        let Some(folder) = shared::logs::log_dir() else {
             return Ok(());
         };
         if std::fs::create_dir_all(&folder).is_err() {

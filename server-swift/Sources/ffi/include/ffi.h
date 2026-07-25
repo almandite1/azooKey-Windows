@@ -25,6 +25,11 @@
  *   via RemoveSession. It is 64-bit so the monotonic per-connection
  *   counter that produces it cannot realistically wrap onto a live
  *   session and cross-wire two applications' composing state
+ * - every `const char *` INPUT must be non-null and NUL-terminated; the
+ *   Swift side dereferences it without checking. Every returned pointer,
+ *   by contrast, MAY be null (an empty reading, an allocation the engine
+ *   declined), so the Rust side treats null as the empty result rather
+ *   than as an error
  * - the char* members below and every returned string/list are owned by
  *   the Swift side; the caller copies them and hands them back to
  *   FreeString / FreeComposedText

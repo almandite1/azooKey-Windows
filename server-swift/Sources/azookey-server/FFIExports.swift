@@ -14,6 +14,27 @@ import ffi
 // mirror in crates/server/src/ffi.rs) in sync with it. ffi_surface.rs in
 // crates/server/tests checks that the three sets of function names agree.
 
+/// The state's reading, allocated for the caller to hand back to
+/// `FreeString`. Every composing-text export returns exactly this.
+@MainActor private func reading(_ state: SessionState) -> UnsafeMutablePointer<CChar>? {
+    _strdup(kanaReading(state.composingText.convertTarget))
+}
+
+/// [`reading`] plus the cursor out-parameter: the epilogue of every export
+/// that has one, in one place.
+///
+/// `cursorPtr` always receives the ABSOLUTE cursor position in kana from the
+/// start of the reading — never a delta, MoveCursor included (#82). That
+/// contract now has a single enforcement point instead of being restated at
+/// three separate returns.
+@MainActor private func readingResult(
+    _ state: SessionState,
+    _ cursorPtr: UnsafeMutablePointer<Int32>
+) -> UnsafeMutablePointer<CChar>? {
+    cursorPtr.pointee = Int32(state.composingText.convertTargetCursorPosition)
+    return reading(state)
+}
+
 @_cdecl("LoadConfig")
 @MainActor public func load_config() {
     // only the keys that are present are overridden, so a partial file keeps
@@ -47,7 +68,7 @@ import ffi
     // a missing/corrupt zenz.gguf degrades silently to non-neural
     // conversion inside the converter; surface its status in the log
     if !engine.zenzStatus.isEmpty {
-        print("zenzai status: \(engine.zenzStatus)")
+        enginePrint(level: .info, "zenzai status: \(engine.zenzStatus)")
     }
 }
 
@@ -60,9 +81,7 @@ import ffi
     let inputString = String(cString: input)
     return withSession(session) { state in
         state.composingText.insertAtCursorPosition(inputString, inputStyle: .roman2kana)
-
-        cursorPtr.pointee = Int32(state.composingText.convertTargetCursorPosition)
-        return _strdup(kanaReading(state.composingText.convertTarget))
+        return readingResult(state, cursorPtr)
     }
 }
 
@@ -73,9 +92,7 @@ import ffi
 ) -> UnsafeMutablePointer<CChar>? {
     withSession(session) { state in
         state.composingText.deleteBackwardFromCursorPosition(count: 1)
-
-        cursorPtr.pointee = Int32(state.composingText.convertTargetCursorPosition)
-        return _strdup(kanaReading(state.composingText.convertTarget))
+        return readingResult(state, cursorPtr)
     }
 }
 
@@ -87,14 +104,12 @@ import ffi
 ) -> UnsafeMutablePointer<CChar>? {
     withSession(session) { state in
         // moveCursorFromCursorPosition returns the clamped DISTANCE it
-        // moved, not the position it arrived at. Every other export writes
-        // an absolute position through this out-parameter, so discard the
-        // distance and report the position, or the same argument would mean
-        // two different things depending on which call filled it in.
+        // moved, not the position it arrived at. Discard it: readingResult
+        // reports the absolute position, the same as for every other export,
+        // so the out-parameter cannot mean two different things depending on
+        // which call filled it in.
         _ = state.composingText.moveCursorFromCursorPosition(count: Int(offset))
-
-        cursorPtr.pointee = Int32(state.composingText.convertTargetCursorPosition)
-        return _strdup(kanaReading(state.composingText.convertTarget))
+        return readingResult(state, cursorPtr)
     }
 }
 
@@ -206,7 +221,9 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         spend(.surfaceCount(Int(surfaceOffset)), from: &afterComposingText)
         state.composingText = afterComposingText
 
-        return _strdup(kanaReading(state.composingText.convertTarget))
+        // no cursor out-parameter on this one (see ffi.h), so the reading
+        // alone — the cursor half of the epilogue has nothing to write to
+        return reading(state)
     }
 }
 
