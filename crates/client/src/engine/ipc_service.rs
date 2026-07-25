@@ -73,15 +73,23 @@ impl std::error::Error for ServerUnavailable {}
 /// Wraps the whole call, not just the wire, so the attempt policy is part of
 /// the RPC's contract rather than an implementation detail of the transport.
 fn retry_idempotent<T>(mut call: impl FnMut() -> Result<T>) -> Result<T> {
-    for attempt in 1..IDEMPOTENT_ATTEMPTS {
-        match call() {
-            Err(error) if is_server_unavailable(&error) => {
-                tracing::warn!("idempotent IPC attempt {attempt} failed, retrying: {error:#}");
+    // Counted attempts rather than "loop N-1 times, then call once more":
+    // the old shape spent the same budget but made the count off by one to
+    // read, and the number of attempts is the whole contract here.
+    let mut attempt = 1;
+    loop {
+        let result = call();
+        match &result {
+            Err(error) if is_server_unavailable(error) && attempt < IDEMPOTENT_ATTEMPTS => {
+                tracing::warn!(
+                    "idempotent IPC attempt {attempt}/{IDEMPOTENT_ATTEMPTS} failed, \
+                     retrying: {error:#}"
+                );
             }
-            other => return other,
+            _ => return result,
         }
+        attempt += 1;
     }
-    call()
 }
 
 /// True when `error` (or any of its causes) carries the [`ServerUnavailable`]
@@ -283,9 +291,7 @@ impl IPCService {
     /// The wire tail shared by every candidate-window RPC: clone the window
     /// client, run one call through `exec`, and swallow any failure with a
     /// warning. Window RPCs are cosmetic — a dead or slow UI process must not
-    /// break text input — so unlike the engine RPCs they never propagate. The
-    /// `#[cfg(test)]` recording stays in each method because the `IpcCall`
-    /// variants differ; this is only the production path.
+    /// break text input — so unlike the engine RPCs they never propagate.
     fn window_rpc<T, Fut>(&self, name: &str, call: impl FnOnce(WindowServiceClient<Channel>) -> Fut)
     where
         Fut: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
@@ -366,12 +372,17 @@ impl FakeIpc {
 }
 
 // implement methods to interact with kkc server
+//
+// Every RPC takes `&self`: the clients are cloned per call (that is how tonic
+// is meant to be used) and nothing about the service itself changes, so a
+// `&mut` would only have forced the callers — the eight act_* arms and every
+// advisory path — to thread a mutable borrow they never needed.
 impl IPCService {
     // skip(self) on every RPC below: IPCService's Debug is the two tonic
     // channels plus the tokio runtime, ~3 KB of boilerplate per span that
     // says nothing about the call. The arguments are the interesting part.
     #[tracing::instrument(skip(self))]
-    pub fn append_text(&mut self, text: String) -> anyhow::Result<Candidates> {
+    pub fn append_text(&self, text: String) -> anyhow::Result<Candidates> {
         #[cfg(test)]
         if let Some(result) =
             self.fake_call(|fake| fake.engine_answer(IpcCall::AppendText(text.clone())))
@@ -392,7 +403,7 @@ impl IPCService {
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn remove_text(&mut self) -> anyhow::Result<Candidates> {
+    pub fn remove_text(&self) -> anyhow::Result<Candidates> {
         #[cfg(test)]
         if let Some(result) = self.fake_call(|fake| fake.engine_answer(IpcCall::RemoveText)) {
             return result;
@@ -412,7 +423,7 @@ impl IPCService {
     /// state, so it may be retried — and it is the first half of the
     /// whole-composition rebuild, which is worth the extra attempt.
     #[tracing::instrument(skip(self))]
-    pub fn clear_text(&mut self) -> anyhow::Result<()> {
+    pub fn clear_text(&self) -> anyhow::Result<()> {
         retry_idempotent(|| self.clear_text_once())
     }
 
@@ -439,7 +450,7 @@ impl IPCService {
     /// `surface_offset` is a count of kana in the reading, not of keystrokes:
     /// a candidate can end inside a romaji cluster and only the kana
     /// boundary can say where.
-    pub fn shrink_text(&mut self, surface_offset: i32) -> anyhow::Result<Candidates> {
+    pub fn shrink_text(&self, surface_offset: i32) -> anyhow::Result<Candidates> {
         #[cfg(test)]
         if let Some(result) =
             self.fake_call(|fake| fake.engine_answer(IpcCall::ShrinkText(surface_offset)))
@@ -461,7 +472,7 @@ impl IPCService {
 
     /// Idempotent: the context is overwritten wholesale, so a resend that the
     /// first attempt already delivered changes nothing.
-    pub fn set_context(&mut self, context: String) -> anyhow::Result<()> {
+    pub fn set_context(&self, context: String) -> anyhow::Result<()> {
         retry_idempotent(|| self.set_context_once(context.clone()))
     }
 
@@ -487,124 +498,75 @@ impl IPCService {
     }
 }
 
-// implement methods to interact with the candidate window server.
-// window RPCs are cosmetic: a dead or slow UI process must not break text
-// input, so failures are logged and swallowed instead of propagated.
-impl IPCService {
-    #[tracing::instrument(skip(self))]
-    pub fn show_window(&mut self) {
-        #[cfg(test)]
-        if self
-            .fake_call(|fake| fake.calls.push(IpcCall::ShowWindow))
-            .is_some()
-        {
-            return;
+/// Generates the candidate-window RPCs, which are structurally identical:
+/// record the call against the test fake if one is installed and stop there,
+/// otherwise send one request through [`IPCService::window_rpc`]. Only the
+/// arguments, the recorded [`IpcCall`] and the request differ; written out by
+/// hand, the six methods were ~115 lines of which ~90 were the same six lines
+/// repeated.
+///
+/// The `record:` expression runs BEFORE the request is built, so it may clone
+/// out of an argument the request then moves.
+macro_rules! window_rpcs {
+    ($(
+        $(#[$meta:meta])*
+        fn $name:ident($($arg:ident: $ty:ty),* $(,)?) {
+            record: $record:expr,
+            $rpc:ident: $request:expr $(,)?
         }
+    )*) => {
+        // window RPCs are cosmetic: a dead or slow UI process must not break
+        // text input, so failures are logged and swallowed, never propagated.
+        impl IPCService {$(
+            $(#[$meta])*
+            #[tracing::instrument(skip(self))]
+            pub fn $name(&self, $($arg: $ty),*) {
+                #[cfg(test)]
+                if self.fake_call(|fake| fake.calls.push($record)).is_some() {
+                    return;
+                }
 
-        self.window_rpc("show_window", |mut client| async move {
-            client
-                .show_window(tonic::Request::new(shared::proto::EmptyResponse {}))
-                .await
-        });
+                self.window_rpc(stringify!($name), |mut client| async move {
+                    client.$rpc(tonic::Request::new($request)).await
+                });
+            }
+        )*}
+    };
+}
+
+window_rpcs! {
+    fn show_window() {
+        record: IpcCall::ShowWindow,
+        show_window: shared::proto::EmptyResponse {},
     }
 
-    #[tracing::instrument(skip(self))]
-    pub fn hide_window(&mut self) {
-        #[cfg(test)]
-        if self
-            .fake_call(|fake| fake.calls.push(IpcCall::HideWindow))
-            .is_some()
-        {
-            return;
-        }
-
-        self.window_rpc("hide_window", |mut client| async move {
-            client
-                .hide_window(tonic::Request::new(shared::proto::EmptyResponse {}))
-                .await
-        });
+    fn hide_window() {
+        record: IpcCall::HideWindow,
+        hide_window: shared::proto::EmptyResponse {},
     }
 
-    #[tracing::instrument(skip(self))]
-    pub fn set_window_position(&mut self, top: i32, left: i32, bottom: i32, right: i32) {
-        #[cfg(test)]
-        if self
-            .fake_call(|fake| fake.calls.push(IpcCall::SetWindowPosition))
-            .is_some()
-        {
-            return;
-        }
-
-        self.window_rpc("set_window_position", |mut client| async move {
-            client
-                .set_window_position(tonic::Request::new(shared::proto::SetPositionRequest {
-                    position: Some(shared::proto::WindowPosition {
-                        top,
-                        left,
-                        bottom,
-                        right,
-                    }),
-                }))
-                .await
-        });
+    fn set_window_position(top: i32, left: i32, bottom: i32, right: i32) {
+        record: IpcCall::SetWindowPosition,
+        set_window_position: shared::proto::SetPositionRequest {
+            position: Some(shared::proto::WindowPosition { top, left, bottom, right }),
+        },
     }
 
-    #[tracing::instrument(skip(self))]
-    pub fn set_candidates(&mut self, candidates: Vec<String>) {
-        #[cfg(test)]
-        if self
-            .fake_call(|fake| fake.calls.push(IpcCall::SetCandidates(candidates.clone())))
-            .is_some()
-        {
-            return;
-        }
-
-        self.window_rpc("set_candidates", |mut client| async move {
-            client
-                .set_candidate(tonic::Request::new(shared::proto::SetCandidateRequest {
-                    candidates,
-                }))
-                .await
-        });
+    fn set_candidates(candidates: Vec<String>) {
+        record: IpcCall::SetCandidates(candidates.clone()),
+        set_candidate: shared::proto::SetCandidateRequest { candidates },
     }
 
-    #[tracing::instrument(skip(self))]
-    pub fn set_selection(&mut self, index: i32) {
-        #[cfg(test)]
-        if self
-            .fake_call(|fake| fake.calls.push(IpcCall::SetSelection(index)))
-            .is_some()
-        {
-            return;
-        }
-
-        self.window_rpc("set_selection", |mut client| async move {
-            client
-                .set_selection(tonic::Request::new(shared::proto::SetSelectionRequest {
-                    index,
-                }))
-                .await
-        });
+    fn set_selection(index: i32) {
+        record: IpcCall::SetSelection(index),
+        set_selection: shared::proto::SetSelectionRequest { index },
     }
 
-    #[tracing::instrument(skip(self))]
-    pub fn set_input_mode(&mut self, mode: &str) {
-        #[cfg(test)]
-        if self
-            .fake_call(|fake| fake.calls.push(IpcCall::SetInputMode(mode.to_string())))
-            .is_some()
-        {
-            return;
-        }
-
-        let mode = mode.to_string();
-        self.window_rpc("set_input_mode", |mut client| async move {
-            client
-                .set_input_mode(tonic::Request::new(shared::proto::SetInputModeRequest {
-                    mode,
-                }))
-                .await
-        });
+    /// `String`, not `&str`: the request is built inside an `async move`
+    /// block, which cannot borrow the caller's stack.
+    fn set_input_mode(mode: String) {
+        record: IpcCall::SetInputMode(mode.clone()),
+        set_input_mode: shared::proto::SetInputModeRequest { mode },
     }
 }
 
@@ -696,7 +658,7 @@ mod tests {
     /// host thread is charged the deadline for each.
     #[test]
     fn an_idempotent_rpc_is_retried_exactly_once() {
-        let (mut service, fake) = IPCService::new_fake().unwrap();
+        let (service, fake) = IPCService::new_fake().unwrap();
         // the whole outage lasts one call, so the retry is what succeeds
         fake.lock().unwrap().engine_unavailable_for = 1;
         service
@@ -704,7 +666,7 @@ mod tests {
             .expect("the retry must carry the call through a one-call outage");
 
         // ...and an outage that outlives both attempts still surfaces
-        let (mut service, fake) = IPCService::new_fake().unwrap();
+        let (service, fake) = IPCService::new_fake().unwrap();
         fake.lock().unwrap().engine_unavailable_for = IDEMPOTENT_ATTEMPTS;
         let error = service
             .clear_text()

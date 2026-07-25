@@ -50,9 +50,9 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
             return Ok(());
         }
 
-        if let Err(error) = self.update_pos() {
-            tracing::warn!("Failed to update position from OnLayoutChange: {error:?}");
-        }
+        // advisory, and infallible by construction: update_pos logs and
+        // swallows everything itself (CLAUDE.md)
+        self.update_pos();
 
         Ok(())
     }

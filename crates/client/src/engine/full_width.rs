@@ -43,15 +43,20 @@ static HALF_FULL_AZOOKEY: LazyLock<HashMap<&'static str, &'static str>> = LazyLo
     ])
 });
 
+/// [`HALF_FULL_AZOOKEY`] the other way round. Built once instead of scanning
+/// the 32-entry map per character, which is what `to_halfwidth` used to do —
+/// it runs over the whole reading on every F10.
+///
+/// The map is injective (no two half-width symbols produce the same
+/// full-width one), so inverting it loses nothing.
+static FULL_HALF_AZOOKEY: LazyLock<HashMap<&'static str, &'static str>> =
+    LazyLock::new(|| HALF_FULL_AZOOKEY.iter().map(|(&k, &v)| (v, k)).collect());
+
 pub fn to_halfwidth(s: &str) -> String {
     s.chars()
-        .map(|c| {
-            let key = c.to_string();
-            if let Some((&k, _)) = HALF_FULL_AZOOKEY.iter().find(|&(_, &v)| v == key) {
-                k.to_string()
-            } else {
-                c.to_string()
-            }
+        .map(|c| match FULL_HALF_AZOOKEY.get(c.to_string().as_str()) {
+            Some(&half) => half.to_string(),
+            None => c.to_string(),
         })
         .collect()
 }

@@ -26,6 +26,7 @@
 //!    Keep the discipline anyway: it stops being harmless the moment
 //!    `OnChange` has real work to do.
 
+use crate::best_effort::BestEffort;
 use anyhow::Result;
 use windows::{
     Win32::System::Variant::VARIANT,
@@ -189,23 +190,16 @@ impl TextServiceFactory_Impl {
     /// Does **not** clear the compartments themselves: open/close is
     /// thread-scoped and both the host and the next TIP read it.
     pub fn unadvise_compartment_sinks(&self, text_service: &mut TextService) -> Result<()> {
-        let mut first_error: Result<()> = Ok(());
+        let mut steps = BestEffort::new("UnadviseSink(compartment)");
 
         for (compartment, cookie) in std::mem::take(&mut text_service.compartment_sinks) {
-            let result = (|| -> Result<()> {
+            steps.step((|| -> Result<()> {
                 unsafe { compartment.cast::<ITfSource>()?.UnadviseSink(cookie)? };
                 Ok(())
-            })();
-
-            if let Err(error) = result {
-                tracing::warn!("UnadviseSink(compartment) failed: {error:?}");
-                if first_error.is_ok() {
-                    first_error = Err(error);
-                }
-            }
+            })());
         }
 
-        first_error
+        steps.finish()
     }
 
     /// Publishes `mode` to the OS compartments.

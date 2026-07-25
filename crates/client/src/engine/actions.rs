@@ -44,22 +44,22 @@ impl TextServiceFactory_Impl {
         // was tearing the composition down" after the arms have run
         let target_state = transition.clone();
         let mut edit = CompositionEdit::from_composition(&composition, transition);
-        let mut ipc_service = IMEState::get()?
-            .ipc_service
-            .clone()
-            .context("ipc_service is None")?;
+        // The one call site that cannot degrade: without a service there is
+        // no engine to convert with and no window to show, so a batch would
+        // silently do nothing. Every other caller of `ipc()` skips instead.
+        let ipc_service = IMEState::ipc()?.context("ipc_service is None")?;
 
         // preview AND suffix: the caret sits after both, so a window that
         // only steps back over the preview feeds the suffix to the engine as
         // if it were text the user had already committed
         if needs_context_update(actions) {
-            self.update_context(&format!("{}{}", edit.preview, edit.suffix))?;
+            self.update_context(&format!("{}{}", edit.preview, edit.suffix));
         }
 
         // Deliberately captured, not `?`: the write-back below must ALWAYS
         // run. An early return on a failed action used to skip it, desyncing
         // the client composition from the server (stuck input).
-        let result = self.dispatch_batch(actions, &mut edit, &mut ipc_service, &mode);
+        let result = self.dispatch_batch(actions, &mut edit, &ipc_service, &mode);
 
         // If the batch failed because the conversion server became
         // unreachable (crash/restart/hang), the client composition can no
@@ -78,13 +78,13 @@ impl TextServiceFactory_Impl {
         if recovered
             && !self.rebuild_server_composition(
                 &mut edit,
-                &mut ipc_service,
+                &ipc_service,
                 &composition,
                 &target_state,
                 &mode,
             )
         {
-            self.reset_composition_after_server_loss(&mut edit, &mut ipc_service);
+            self.reset_composition_after_server_loss(&mut edit, &ipc_service);
         }
 
         // write back the state of the last successful action even when a
@@ -108,7 +108,7 @@ impl TextServiceFactory_Impl {
         &self,
         actions: &[ClientAction],
         edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
+        ipc_service: &IPCService,
         mode: &InputMode,
     ) -> Result<()> {
         for action in actions {
@@ -124,13 +124,8 @@ impl TextServiceFactory_Impl {
                     self.act_append_text(edit, ipc_service, mode, text)?
                 }
                 ClientAction::RemoveText => self.act_remove_text(edit, ipc_service)?,
-                ClientAction::MoveCursor(_offset) => {
-                    // Deliberate no-op for now: the MoveCursor RPC and the
-                    // Swift engine's cursor handling are live (kept green by
-                    // the move_cursor smoke test in crates/server), but the
-                    // client-side wiring is deferred to the predictive-
-                    // conversion feature, which needs cursor movement anyway.
-                }
+                // deliberate no-op; see ClientAction::MoveCursor
+                ClientAction::MoveCursor(_offset) => {}
                 ClientAction::SetIMEMode(mode) => self.act_set_ime_mode(edit, ipc_service, mode)?,
                 ClientAction::SetSelection(selection) => {
                     self.act_set_selection(edit, ipc_service, selection)?
@@ -149,9 +144,9 @@ impl TextServiceFactory_Impl {
     /// Begins a TSF composition and opens the candidate UI. `open_candidate_ui`
     /// runs after `update_pos` so a UILess host knows where the caret is
     /// before deciding whether it draws the candidates itself.
-    fn act_start_composition(&self, ipc_service: &mut IPCService) -> Result<()> {
+    fn act_start_composition(&self, ipc_service: &IPCService) -> Result<()> {
         self.start_composition()?;
-        self.update_pos()?;
+        self.update_pos();
         self.open_candidate_ui(ipc_service);
         Ok(())
     }
@@ -169,7 +164,7 @@ impl TextServiceFactory_Impl {
     fn act_end_composition(
         &self,
         edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
+        ipc_service: &IPCService,
         cancel: bool,
     ) -> Result<()> {
         let mut edit_result = Ok(());
@@ -195,7 +190,7 @@ impl TextServiceFactory_Impl {
     fn act_append_text(
         &self,
         edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
+        ipc_service: &IPCService,
         mode: &InputMode,
         text: &str,
     ) -> Result<()> {
@@ -220,11 +215,7 @@ impl TextServiceFactory_Impl {
     /// carried over from Previewing would point past the new list (blanking
     /// the preview via the `entry()` fallback) or at the wrong candidate, so
     /// reset to the top and shrink `raw_input` to what the new top covers.
-    fn act_remove_text(
-        &self,
-        edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
-    ) -> Result<()> {
+    fn act_remove_text(&self, edit: &mut CompositionEdit, ipc_service: &IPCService) -> Result<()> {
         let candidates = ipc_service.remove_text()?;
         edit.adopt_fresh(candidates);
 
@@ -240,7 +231,7 @@ impl TextServiceFactory_Impl {
     fn act_set_ime_mode(
         &self,
         edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
+        ipc_service: &IPCService,
         mode: &InputMode,
     ) -> Result<()> {
         // Stamped here, where the mode actually changes, so every path that
@@ -251,7 +242,7 @@ impl TextServiceFactory_Impl {
         }
 
         self.start_composition()?;
-        self.update_pos()?;
+        self.update_pos();
         self.end_composition()?;
 
         self.close_candidate_ui(ipc_service);
@@ -278,7 +269,7 @@ impl TextServiceFactory_Impl {
     fn act_set_selection(
         &self,
         edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
+        ipc_service: &IPCService,
         selection: &SetSelectionType,
     ) -> Result<()> {
         // The WORKING COPY's list, not the live composition's. They are the
@@ -304,7 +295,7 @@ impl TextServiceFactory_Impl {
             &candidates,
             edit.selection_index,
             SELECTION_CHANGED,
-        )?;
+        );
         edit.adopt_candidate(&candidates, edit.selection_index);
 
         self.set_text(&edit.preview, &edit.suffix)
@@ -316,7 +307,7 @@ impl TextServiceFactory_Impl {
     fn act_shrink_text(
         &self,
         edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
+        ipc_service: &IPCService,
         mode: &InputMode,
         text: &str,
     ) -> Result<()> {
@@ -353,8 +344,8 @@ impl TextServiceFactory_Impl {
             &edit.candidates,
             edit.selection_index,
             CANDIDATES_CHANGED,
-        )?;
-        self.update_pos()?;
+        );
+        self.update_pos();
 
         edit.state = CompositionState::Composing;
         Ok(())

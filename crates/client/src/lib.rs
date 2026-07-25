@@ -1,3 +1,4 @@
+mod best_effort;
 mod engine;
 mod extension;
 mod globals;
@@ -8,6 +9,8 @@ mod tsf;
 
 use std::ffi::c_void;
 
+use anyhow::Context as _;
+use best_effort::BestEffort;
 use globals::{DllModule, GUID_TEXT_SERVICE};
 use register::{CLSIDMgr, CategoryMgr, ProfileMgr};
 use tsf::factory::TextServiceFactory;
@@ -149,22 +152,11 @@ pub extern "system" fn DllUnregisterServer() -> HRESULT {
     // Best-effort: attempt all three unregistrations even if one fails, so a
     // single failure (e.g. a key already gone) doesn't leave the others
     // behind — the old short-circuit skipped CategoryMgr cleanup entirely.
-    let mut errors: Vec<String> = Vec::new();
-    if let Err(e) = ProfileMgr::unregister() {
-        errors.push(format!("profile: {e:#}"));
-    }
-    if let Err(e) = CLSIDMgr::unregister() {
-        errors.push(format!("clsid: {e:#}"));
-    }
-    if let Err(e) = CategoryMgr::unregister() {
-        errors.push(format!("category: {e:#}"));
-    }
-
-    let result: anyhow::Result<()> = if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(errors.join("; ")))
-    };
+    let mut steps = BestEffort::new("DllUnregisterServer");
+    steps.step(ProfileMgr::unregister().context("profile"));
+    steps.step(CLSIDMgr::unregister().context("clsid"));
+    steps.step(CategoryMgr::unregister().context("category"));
+    let result = steps.finish();
 
     check_err!(result, SELFREG_E_CLASS)
 }

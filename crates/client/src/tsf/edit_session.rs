@@ -72,7 +72,9 @@ fn send_range_position(
     cookie: u32,
     range: &ITfRange,
 ) -> Result<PositionUpdate> {
-    let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() else {
+    // advisory: with no service there is nowhere to publish the rect, which
+    // the NoIpc outcome says explicitly rather than failing the measurement
+    let Some(ipc_service) = IMEState::ipc()? else {
         return Ok(PositionUpdate::NoIpc);
     };
 
@@ -422,14 +424,68 @@ impl TextServiceFactory_Impl {
         })
     }
 
+    /// The shell both position updates share: open one edit session on
+    /// `context`, hand `range_of` the cookie so it can produce the anchor to
+    /// measure, and publish the resulting rect.
+    ///
+    /// `range_of` answers `None` when there is nothing to anchor to, which is
+    /// reported as `NoIpc` rather than as a failure.
+    ///
+    /// Returns nothing on purpose. Both callers are advisory (CLAUDE.md): a
+    /// position we could not measure leaves the candidate window where it is
+    /// until the next `OnLayoutChange`, and neither may break typing. `what`
+    /// names the caller in the log lines.
+    fn publish_measured_position(
+        &self,
+        what: &str,
+        tid: u32,
+        context: ITfContext,
+        range_of: impl Fn(&ITfContext, u32) -> Result<Option<ITfRange>> + 'static,
+    ) {
+        let result: Result<()> = (|| {
+            let outcome = edit_session(
+                tid,
+                context.clone(),
+                Rc::new({
+                    let context = context.clone();
+
+                    move |cookie| {
+                        let Some(range) = range_of(&context, cookie)? else {
+                            return Ok(PositionUpdate::NoIpc);
+                        };
+                        send_range_position(&context, cookie, &range)
+                    }
+                }),
+            )?;
+
+            match outcome {
+                Some(PositionUpdate::PendingLayout) => {
+                    tracing::debug!("{what}: layout not ready yet; waiting for OnLayoutChange")
+                }
+                Some(PositionUpdate::Clipped) => {
+                    tracing::debug!("{what}: the rect is clipped; keeping the current position")
+                }
+                _ => {}
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            tracing::warn!("{what} failed: {error:?}");
+        }
+    }
+
+    /// Publishes the position of the COMPOSITION range. Advisory: every
+    /// failure is logged and swallowed, so nothing here can break typing.
     #[tracing::instrument]
-    pub fn update_pos(&self) -> Result<()> {
+    pub fn update_pos(&self) {
         {
             let mut text_service = match self.borrow_mut() {
                 Ok(text_service) => text_service,
                 Err(error) => {
                     tracing::warn!("Skip update_pos due to borrow conflict: {error:?}");
-                    return Ok(());
+                    return;
                 }
             };
 
@@ -438,49 +494,39 @@ impl TextServiceFactory_Impl {
                 .try_begin_update(Instant::now())
             {
                 tracing::debug!("Skip re-entrant update_pos call");
-                return Ok(());
+                return;
             }
         }
 
-        let result: Result<()> = (|| {
-            let (tid, context, tip_composition) = {
-                let text_service = self.borrow()?;
-                let composition = text_service.borrow_composition()?;
-                (
-                    text_service.tid,
-                    text_service.context::<ITfContext>()?,
-                    composition.tip_composition.clone(),
-                )
+        let anchor: Result<Option<(u32, ITfContext, ITfComposition)>> = (|| {
+            let text_service = self.borrow()?;
+            let composition = text_service.borrow_composition()?;
+            let Some(tip_composition) = composition.tip_composition.clone() else {
+                return Ok(None);
             };
-
-            if let Some(tip_composition) = tip_composition {
-                let outcome = edit_session(
-                    tid,
-                    context.clone(),
-                    Rc::new({
-                        let context = context.clone();
-
-                        move |cookie| {
-                            let range = unsafe { tip_composition.GetRange()? };
-                            send_range_position(&context, cookie, &range)
-                        }
-                    }),
-                )?;
-
-                match outcome {
-                    Some(PositionUpdate::PendingLayout) => {
-                        tracing::debug!("Layout not ready yet; waiting for OnLayoutChange")
-                    }
-                    Some(PositionUpdate::Clipped) => {
-                        tracing::debug!("Composition rect is clipped; keeping the current position")
-                    }
-                    _ => {}
-                }
-            }
-
-            Ok(())
+            Ok(Some((
+                text_service.tid,
+                text_service.context::<ITfContext>()?,
+                tip_composition,
+            )))
         })();
 
+        match anchor {
+            Ok(Some((tid, context, tip_composition))) => self.publish_measured_position(
+                "update the composition window position",
+                tid,
+                context,
+                move |_context, _cookie| Ok(Some(unsafe { tip_composition.GetRange()? })),
+            ),
+            // no composition in flight: nothing to measure
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!("Failed to update composition window position: {error:?}")
+            }
+        }
+
+        // the guard is released whatever the measurement did, including on
+        // the paths that never opened a session
         match self.borrow_mut() {
             Ok(mut text_service) => {
                 text_service.update_pos_state.finish_update(Instant::now());
@@ -489,12 +535,6 @@ impl TextServiceFactory_Impl {
                 tracing::warn!("Failed to reset update_pos guard: {error:?}");
             }
         }
-
-        if let Err(error) = result {
-            tracing::warn!("Failed to update composition window position: {error:?}");
-        }
-
-        Ok(())
     }
 
     /// Publishes the CARET position measured from the current selection.
@@ -509,61 +549,38 @@ impl TextServiceFactory_Impl {
     /// Advisory, like `update_pos`: every failure is logged and swallowed.
     /// Nothing here may break typing.
     #[tracing::instrument]
-    pub fn update_pos_from_selection(&self) -> Result<()> {
-        let result: Result<()> = (|| {
-            let (tid, context, composing) = {
-                let text_service = self.borrow()?;
-                let composition = text_service.borrow_composition()?;
-                // No focused document yet — Activate adopts the OS mode
-                // before any context exists. Normal, not a failure, so it
-                // must not reach the warn below.
-                let Ok(context) = text_service.context::<ITfContext>() else {
-                    tracing::debug!("No context yet; skipping the caret position update");
-                    return Ok(());
-                };
-                (
-                    text_service.tid,
-                    context,
-                    composition.tip_composition.is_some(),
-                )
+    pub fn update_pos_from_selection(&self) {
+        let anchor: Result<Option<(u32, ITfContext)>> = (|| {
+            let text_service = self.borrow()?;
+            let composition = text_service.borrow_composition()?;
+            // No focused document yet — Activate adopts the OS mode before
+            // any context exists. Normal, not a failure, so it must not reach
+            // the warn below.
+            let Ok(context) = text_service.context::<ITfContext>() else {
+                tracing::debug!("No context yet; skipping the caret position update");
+                return Ok(None);
             };
-
             // While composing, the composition range is the better anchor and
             // update_pos already keeps it current — measuring the selection
             // instead would fight it.
-            if composing {
-                return Ok(());
+            if composition.tip_composition.is_some() {
+                return Ok(None);
             }
-
-            let outcome = edit_session(
-                tid,
-                context.clone(),
-                Rc::new({
-                    let context = context.clone();
-
-                    move |cookie| {
-                        let Some(range) = selected_range(&context, cookie)? else {
-                            // no selection to anchor to (an empty document
-                            // view, or a host that reports none)
-                            return Ok(PositionUpdate::NoIpc);
-                        };
-                        send_range_position(&context, cookie, &range)
-                    }
-                }),
-            )?;
-
-            if let Some(PositionUpdate::PendingLayout) = outcome {
-                tracing::debug!("Caret layout not ready yet; keeping the current position");
-            }
-
-            Ok(())
+            Ok(Some((text_service.tid, context)))
         })();
 
-        if let Err(error) = result {
-            tracing::warn!("Failed to update the caret position: {error:?}");
+        match anchor {
+            Ok(Some((tid, context))) => self.publish_measured_position(
+                "update the caret position",
+                tid,
+                context,
+                // None when there is no selection to anchor to: an empty
+                // document view, or a host that reports none
+                |context, cookie| Ok(selected_range(context, cookie)?),
+            ),
+            Ok(None) => {}
+            Err(error) => tracing::warn!("Failed to update the caret position: {error:?}"),
         }
-
-        Ok(())
     }
 }
 
@@ -644,7 +661,7 @@ mod tests {
         // it to; the send itself may fail (no UI process) and is logged only
         IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
 
-        factory.update_pos().unwrap();
+        factory.update_pos();
 
         let view = unsafe { fake_context_of(&context) }.view_log();
         assert_eq!(
@@ -670,7 +687,7 @@ mod tests {
         // deliberately NO tip_composition: this is the non-composing case
         IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
 
-        factory.update_pos_from_selection().unwrap();
+        factory.update_pos_from_selection();
 
         let view = unsafe { fake_context_of(&context) }.view_log();
         assert_eq!(
@@ -704,7 +721,7 @@ mod tests {
             .tip_composition = Some(FakeComposition::with_log(log.clone()));
         IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
 
-        factory.update_pos_from_selection().unwrap();
+        factory.update_pos_from_selection();
 
         let view = unsafe { fake_context_of(&context) }.view_log();
         assert_eq!(
@@ -717,17 +734,25 @@ mod tests {
 
     /// Activate adopts the OS compartment mode before any document has
     /// focus, so this path runs with no context on every activation. That is
-    /// normal: it must no-op quietly rather than warn.
+    /// normal: it must no-op quietly rather than warn, and above all it must
+    /// not open an edit session on a context it does not have.
     #[test]
     fn no_context_is_not_a_failure_for_the_caret_position() {
         let _guard = global_state_lock();
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let (tip, context) = factory_with_fake_context(EditSessionBehavior::RunSync);
         let factory = factory_of(&tip);
         factory.borrow_mut().unwrap().context = None;
 
-        factory
-            .update_pos_from_selection()
-            .expect("a missing context is a skip, not an error");
+        factory.update_pos_from_selection();
+
+        assert_eq!(
+            unsafe { fake_context_of(&context) }
+                .view_log()
+                .get_text_ext_calls
+                .get(),
+            0,
+            "with no context there is nothing to measure"
+        );
     }
 
     /// C-1: `TS_E_NOLAYOUT` means "layout is not ready yet, wait for
@@ -790,7 +815,7 @@ mod tests {
         let view = unsafe { fake_context_of(&context) }.view_log();
         view.text_ext_behavior.set(TextExtBehavior::NoLayout);
 
-        factory.update_pos().unwrap();
+        factory.update_pos();
 
         assert_eq!(
             view.get_text_ext_calls.get(),

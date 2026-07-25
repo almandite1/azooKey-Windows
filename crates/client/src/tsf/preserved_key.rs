@@ -26,31 +26,19 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use windows::{
     Win32::UI::TextServices::{ITfKeystrokeMgr, ITfThreadMgr, TF_MOD_ALT, TF_PRESERVEDKEY},
     core::{GUID, Interface},
 };
 
+use crate::best_effort::BestEffort;
 use crate::globals::{
     GUID_PRESERVEDKEY_TOGGLE_ALT_GRAVE, GUID_PRESERVEDKEY_TOGGLE_KANJI,
-    GUID_PRESERVEDKEY_TOGGLE_ZENHAN,
+    GUID_PRESERVEDKEY_TOGGLE_ZENHAN, VK_KANJI, VK_OEM_3, VK_ZENKAKU_HANKAKU,
 };
 
 use super::factory::TextServiceFactory_Impl;
-
-/// `VK_DBE_SBCSCHAR` / `VK_DBE_DBCSCHAR` — the two virtual keys the
-/// Zenkaku/Hankaku key produces depending on the current mode.
-const VK_ZENKAKU_HANKAKU: [u32; 2] = [0xF3, 0xF4];
-/// `VK_KANJI`. The 漢字 key of a JIS keyboard — and, with Alt held, what
-/// Windows translates **Alt+`** into on a 101-key Japanese layout. Measured
-/// on hardware: the key arrives as `OnKeyDown(wparam=0x19)` with the Alt
-/// flag set in lparam and the scan code of the `` ` `` key (0x29). It does
-/// NOT arrive as `VK_OEM_3`, so that reservation alone never fires.
-const VK_KANJI: u32 = 0x19;
-/// `VK_OEM_3` — `` ` `` on a US layout. Reserved with Alt as well, for
-/// layouts and hosts where the translation above does not happen.
-const VK_OEM_3: u32 = 0xC0;
 
 /// Every key this TIP asks TSF to route through `OnPreservedKey`, with the
 /// description TSF shows in the keyboard-shortcut UI.
@@ -160,18 +148,16 @@ impl TextServiceFactory_Impl {
         }
 
         let keystroke_mgr = thread_mgr.cast::<ITfKeystrokeMgr>()?;
-        let mut first_error: Result<()> = Ok(());
+        let mut steps = BestEffort::new("UnpreserveKey");
 
         for (guid, key) in keys {
-            if let Err(error) = unsafe { keystroke_mgr.UnpreserveKey(guid, key) } {
-                tracing::warn!("UnpreserveKey(vk={:#04x}) failed: {error:?}", key.uVKey);
-                if first_error.is_ok() {
-                    first_error = Err(error.into());
-                }
-            }
+            steps.step(
+                unsafe { keystroke_mgr.UnpreserveKey(guid, key) }
+                    .with_context(|| format!("vk={:#04x}", key.uVKey)),
+            );
         }
 
-        first_error
+        steps.finish()
     }
 
     /// Whether `guid` names a key *this activation* reserved. `OnPreservedKey`

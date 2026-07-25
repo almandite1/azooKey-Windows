@@ -228,8 +228,9 @@ impl ITfUIElement_Impl for TextServiceFactory_Impl {
             text_service.ui_element.show = show;
         }
 
-        // honour a host that flips visibility mid-composition
-        if let Some(mut ipc_service) = crate::engine::state::IMEState::get()?.ipc_service.clone() {
+        // honour a host that flips visibility mid-composition. Advisory: with
+        // no service there is no window of ours to flip.
+        if let Some(ipc_service) = crate::engine::state::IMEState::ipc()? {
             if show {
                 ipc_service.show_window();
             } else {

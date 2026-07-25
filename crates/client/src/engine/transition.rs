@@ -8,10 +8,10 @@
 //! `process_key` (guards, key decoding) and `handle_action` (execution).
 
 use super::{
-    client_action::{ClientAction, SetSelectionType, SetTextType},
+    client_action::{ClientAction, SetSelectionType},
     composition::CompositionState,
     input_mode::InputMode,
-    user_action::{Function, Navigation, UserAction},
+    user_action::{Navigation, UserAction},
 };
 
 /// The state read by the transition table — a snapshot of the fields the
@@ -181,28 +181,13 @@ pub fn transition(
                 // editing behaviors (forward delete, in-reading cursor jumps,
                 // candidate paging) can take these over later
                 UserAction::EditingKey => (state.clone(), vec![]),
-                UserAction::Function(key) => match key {
-                    Function::Six => (
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::Hiragana)],
-                    ),
-                    Function::Seven => (
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::Katakana)],
-                    ),
-                    Function::Eight => (
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::HalfKatakana)],
-                    ),
-                    Function::Nine => (
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::FullLatin)],
-                    ),
-                    Function::Ten => (
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::HalfLatin)],
-                    ),
-                },
+                // F6–F10. `UserAction::Function` already carries the target
+                // form, so there is nothing to map here: the five keys are
+                // listed once, where SetTextType is declared.
+                UserAction::Function(set_type) => (
+                    CompositionState::Previewing,
+                    vec![ClientAction::SetTextWithType(set_type)],
+                ),
                 _ => return None,
             }
         }
@@ -215,6 +200,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::engine::client_action::SetTextType;
 
     fn ctx(state: CompositionState, mode: InputMode) -> KeystrokeContext {
         KeystrokeContext {
@@ -289,7 +275,7 @@ mod tests {
             UserAction::Tab,
             UserAction::Unknown,
             UserAction::Navigation(Navigation::Up),
-            UserAction::Function(Function::Six),
+            UserAction::Function(SetTextType::Hiragana),
             UserAction::EditingKey,
         ] {
             assert!(
@@ -458,19 +444,21 @@ mod tests {
         );
     }
 
+    /// F6–F10 leave Composing for Previewing and convert the whole reading.
+    /// Which key means which form is decided in `user_action` now; what this
+    /// pins is that the table passes it through untouched, for every form.
     #[test]
     fn function_keys_convert_the_reading() {
-        let cases = [
-            (Function::Six, SetTextType::Hiragana),
-            (Function::Seven, SetTextType::Katakana),
-            (Function::Eight, SetTextType::HalfKatakana),
-            (Function::Nine, SetTextType::FullLatin),
-            (Function::Ten, SetTextType::HalfLatin),
-        ];
-        for (key, expected) in cases {
+        for expected in [
+            SetTextType::Hiragana,
+            SetTextType::Katakana,
+            SetTextType::HalfKatakana,
+            SetTextType::FullLatin,
+            SetTextType::HalfLatin,
+        ] {
             let (next, actions) = transition(
                 &kana(CompositionState::Composing),
-                UserAction::Function(key),
+                UserAction::Function(expected.clone()),
             )
             .unwrap();
             assert_eq!(next, CompositionState::Previewing);

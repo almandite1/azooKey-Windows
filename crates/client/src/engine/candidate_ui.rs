@@ -34,13 +34,17 @@ impl TextServiceFactory_Impl {
     ///
     /// Every candidate update goes through here so the two can never
     /// disagree about what is displayed.
+    ///
+    /// Infallible by construction, and typed that way: the UILess half is
+    /// advisory and the window RPCs swallow their own failures, so there was
+    /// never an `Err` for a caller's `?` to carry.
     pub(super) fn publish_candidates(
         &self,
-        ipc_service: &mut IPCService,
+        ipc_service: &IPCService,
         candidates: &Candidates,
         selection_index: i32,
         updated_flags: u32,
-    ) -> Result<()> {
+    ) {
         // Advisory (CLAUDE.md): UILess bookkeeping must never break typing.
         // Propagating here would mean a host-side element problem also
         // stopped the candidates reaching our own window.
@@ -54,17 +58,18 @@ impl TextServiceFactory_Impl {
             }
             ipc_service.set_selection(selection_index);
         }
-
-        Ok(())
     }
 
     /// Renders the adopted preview into the document and republishes the whole
     /// candidate list. The tail shared by append and remove; shrink commits
     /// with `shift_start` instead of `set_text`, so it publishes on its own.
+    ///
+    /// Fallible only through `set_text`, which edits the document — the
+    /// publishing half cannot fail.
     pub(super) fn render_and_publish_full(
         &self,
         edit: &CompositionEdit,
-        ipc_service: &mut IPCService,
+        ipc_service: &IPCService,
     ) -> Result<()> {
         self.set_text(&edit.preview, &edit.suffix)?;
         self.publish_candidates(
@@ -72,7 +77,8 @@ impl TextServiceFactory_Impl {
             &edit.candidates,
             edit.selection_index,
             CANDIDATES_CHANGED,
-        )
+        );
+        Ok(())
     }
 
     /// Opens the candidate UI for a new composition: asks the host first
@@ -84,7 +90,7 @@ impl TextServiceFactory_Impl {
     /// Counterpart of `close_candidate_ui`; the visibility transitions live
     /// in this pair (and host-driven `ITfUIElement::Show`) only, so an arm
     /// cannot forget one half of the teardown again (issue #21).
-    pub(super) fn open_candidate_ui(&self, ipc_service: &mut IPCService) {
+    pub(super) fn open_candidate_ui(&self, ipc_service: &IPCService) {
         let show = self.ui_begin().unwrap_or_else(|error| {
             tracing::warn!("ui_begin failed (non-fatal): {error:?}");
             true
@@ -98,7 +104,7 @@ impl TextServiceFactory_Impl {
     /// hides our own window, blanking the now-stale list. Everything here is
     /// unconditional and advisory: hiding is safe even if we never showed,
     /// and ui_end is a no-op with no live element.
-    pub(super) fn close_candidate_ui(&self, ipc_service: &mut IPCService) {
+    pub(super) fn close_candidate_ui(&self, ipc_service: &IPCService) {
         if let Err(error) = self.ui_end() {
             tracing::warn!("ui_end failed (non-fatal): {error:?}");
         }

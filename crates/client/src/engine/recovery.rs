@@ -43,7 +43,7 @@ impl TextServiceFactory_Impl {
     pub(super) fn rebuild_server_composition(
         &self,
         edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
+        ipc_service: &IPCService,
         snapshot: &Composition,
         target_state: &CompositionState,
         mode: &InputMode,
@@ -93,7 +93,7 @@ impl TextServiceFactory_Impl {
     pub(super) fn reset_composition_after_server_loss(
         &self,
         edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
+        ipc_service: &IPCService,
     ) {
         if let Err(error) = self.end_composition() {
             tracing::warn!("end_composition during server-loss reset failed: {error:?}");

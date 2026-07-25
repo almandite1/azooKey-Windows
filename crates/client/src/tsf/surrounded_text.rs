@@ -100,7 +100,11 @@ impl TextServiceFactory {
     /// is everything the composition currently puts on screen (preview and
     /// suffix): the window has to end before it, or the composition's own
     /// text would come back as its context.
-    pub fn update_context(&self, shown_text: &str) -> Result<()> {
+    ///
+    /// Advisory (CLAUDE.md), and typed that way: better context makes for a
+    /// better conversion, but a host that will not hand its text over must
+    /// still be typeable in. Every failure is logged and swallowed here.
+    pub fn update_context(&self, shown_text: &str) {
         let result: Result<()> = (|| unsafe {
             let text_service = self.borrow()?;
 
@@ -168,7 +172,10 @@ impl TextServiceFactory {
                 return Ok(());
             };
 
-            let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() else {
+            // advisory: with no service there is no engine to give the
+            // context to, and the conversion it would have informed is not
+            // happening either
+            let Some(ipc_service) = IMEState::ipc()? else {
                 return Ok(());
             };
 
@@ -180,8 +187,6 @@ impl TextServiceFactory {
         if let Err(error) = result {
             tracing::warn!("Failed to update surrounded text context: {error:?}");
         }
-
-        Ok(())
     }
 }
 
@@ -210,7 +215,7 @@ mod tests {
         let factory = factory_of(&tip);
 
         // 𠮷 is one char but two UTF-16 units — the difference that matters
-        factory.update_context("みず𠮷").unwrap();
+        factory.update_context("みず𠮷");
 
         assert_eq!(
             log.shift_start_reqs.borrow().last(),
@@ -243,7 +248,7 @@ mod tests {
         let factory = factory_of(&tip);
 
         let long = "あ".repeat(35);
-        factory.update_context(&long).unwrap();
+        factory.update_context(&long);
 
         let start = *log.shift_start_reqs.borrow().last().unwrap();
         let end = *log.shift_end_reqs.borrow().last().unwrap();
