@@ -63,12 +63,11 @@ function updateSelection(index) {
     // visual state, this drives the announced one
     candidateList.setAttribute('aria-activedescendant', candidateList.children[index].id);
 
-    const itemHeight = candidateList.children[0].offsetHeight;
-    const visibleItems = Math.floor(candidateList.clientHeight / itemHeight);
-
-    const groupSize = 5;
-    const groupIndex = Math.floor(index / groupSize);
-    const scrollToIndex = groupIndex * groupSize;
+    // Paged, not continuous: the list scrolls a screenful at a time, and a
+    // screenful is MAX_VISIBLE_CANDIDATES because that is what the window is
+    // sized to hold.
+    const groupIndex = Math.floor(index / MAX_VISIBLE_CANDIDATES);
+    const scrollToIndex = groupIndex * MAX_VISIBLE_CANDIDATES;
 
     if (index === scrollToIndex || !isElementInView(candidateList.children[index], candidateList)) {
         candidateList.children[scrollToIndex].scrollIntoView({ behavior: "instant", block: "start", inline: "start" });
