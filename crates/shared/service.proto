@@ -39,7 +39,11 @@ message RemoveTextResponse {
 
 // Request message for MoveCursor.
 message MoveCursorRequest {
-  int32 offset = 1; // The new cursor position.
+  // How far to move, in kana, relative to where the cursor is now — not the
+  // position to move to. It is clamped to the ends of the reading. The reply
+  // carries no cursor field yet; when one is added it must be the absolute
+  // position, matching the FFI out-parameter (#82).
+  int32 offset = 1;
 }
 
 // Request message for ShrinkText.

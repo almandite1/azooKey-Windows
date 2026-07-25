@@ -44,7 +44,14 @@ struct FFICandidate {
 void Initialize(const char *path);
 void LoadConfig(void);
 
-/* per-session composing text */
+/*
+ * per-session composing text
+ *
+ * `cursorPtr` always receives the ABSOLUTE cursor position in the reading
+ * after the call, counted in kana from its start — never a delta. MoveCursor
+ * takes a relative `offset` but reports where the cursor ended up, clamped to
+ * the reading, exactly as AppendText and RemoveText do (#82).
+ */
 void SetContext(int64_t session, const char *context);
 char *AppendText(int64_t session, const char *input, int32_t *cursorPtr);
 char *RemoveText(int64_t session, int32_t *cursorPtr);

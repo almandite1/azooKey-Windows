@@ -13,8 +13,11 @@ use crate::ffi::{
 
 pub(crate) struct RawComposingText {
     pub(crate) text: String,
-    // provided by the engine but not yet exposed over gRPC (the client's
-    // MoveCursor handling is still a TODO)
+    // Absolute cursor position in the reading, in kana from its start — the
+    // same meaning for every call that fills it, MoveCursor included (#82).
+    // Provided by the engine but not yet exposed over gRPC (the client's
+    // MoveCursor handling is still a TODO), so there is no proto field to
+    // carry the contract yet; it lives here and in ffi.h.
     #[allow(dead_code)]
     pub(crate) cursor: i32,
 }
