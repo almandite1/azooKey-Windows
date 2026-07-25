@@ -26,6 +26,17 @@
 .PARAMETER Credential
     An account in the VM. Prompted for when omitted.
 
+.PARAMETER CredentialPath
+    A credential saved with Export-Clixml, used instead of prompting. Windows
+    encrypts it with DPAPI under the account that saved it, so the file is
+    useless to anyone else and the password never appears in it in the clear.
+    Create it once with:
+
+        Get-Credential | Export-Clixml $env:USERPROFILE\azookey-e2e.cred
+
+    This is what makes an unattended run possible (a scheduled release check,
+    or an agent driving the script), since Get-Credential needs a console.
+
 .PARAMETER Release
     Stage and run the release build instead of debug.
 
@@ -58,6 +69,7 @@
 param(
     [string]$VMName = 'azookey-e2e',
     [pscredential]$Credential,
+    [string]$CredentialPath,
     [switch]$Release,
     [switch]$SkipPayload,
     [switch]$Watchdog,
@@ -112,7 +124,17 @@ $vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
 if ($null -eq $vm) { Fail "no Hyper-V guest named $VMName on this host" }
 if ($vm.State -ne 'Running') { Fail "$VMName is $($vm.State); start it and log on at its console first" }
 
-if ($null -eq $Credential) { $Credential = Get-Credential -Message "Account inside $VMName" }
+if ($null -eq $Credential) {
+    if ($CredentialPath) {
+        if (-not (Test-Path $CredentialPath)) { Fail "no credential file at $CredentialPath" }
+        $Credential = Import-Clixml $CredentialPath
+        Write-Host "credential: $CredentialPath ($($Credential.UserName))"
+    }
+    else {
+        # needs a console; pass -CredentialPath for an unattended run
+        $Credential = Get-Credential -Message "Account inside $VMName"
+    }
+}
 $session = New-PSSession -VMName $VMName -Credential $Credential
 
 try {
