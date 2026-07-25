@@ -154,10 +154,15 @@ function resizeToCandidates(count) {
     postHeight(Math.min(count, MAX_VISIBLE_CANDIDATES));
 }
 
+// Long enough for the stylesheet to have been applied — measuring before it
+// is returns the unstyled row height — and far inside ui.exe's 120 ms
+// POSITION_GRACE, which is what this measurement has to beat.
+const FIRST_MEASUREMENT_DELAY_MS = 50;
+
 window.addEventListener('DOMContentLoaded', () => {
     // A first measurement before any candidates arrive: ui.exe holds back the
     // very first Show until the webview has reported a height (issue #59), so
     // this is what releases it. Full height, since the list it will hold is
     // not known yet; the first updateCandidates corrects it.
-    setTimeout(() => postHeight(MAX_VISIBLE_CANDIDATES), 50);
+    setTimeout(() => postHeight(MAX_VISIBLE_CANDIDATES), FIRST_MEASUREMENT_DELAY_MS);
 });

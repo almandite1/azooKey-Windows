@@ -5,12 +5,17 @@ use wry::{WebContext, WebView, WebViewBuilder};
 use crate::UserEvent;
 use crate::window::create_overlay_window;
 
+/// Side of the (square) mode indicator, in CSS px: big enough for the あ/A
+/// glyph and its badge, small enough to sit beside the caret without
+/// covering the text.
+const INDICATOR_SIDE: f64 = 90.0;
+
 pub fn create_indicator_window(event_loop: &EventLoop<UserEvent>) -> Result<Window> {
     let window = create_overlay_window(event_loop, "Indicator", true)?;
 
     // logical px: the webview lays out in CSS px, so a physical 90x90 was
     // too small at high DPI and the mode glyph overflowed (B20)
-    window.set_inner_size(LogicalSize::new(90.0, 90.0));
+    window.set_inner_size(LogicalSize::new(INDICATOR_SIDE, INDICATOR_SIDE));
 
     Ok(window)
 }

@@ -421,6 +421,8 @@ impl Ui {
     /// the TIP does (it sends the candidates before it shows anything).
     pub async fn sized(&mut self) {
         self.set_candidates(&["水"]).await;
+        // 225 is MIN_CANDIDATE_WINDOW_WIDTH in src/geometry.rs, spelled out
+        // because `ui` is a bin crate and a test cannot import from it
         wait_for(SETTLE_TIMEOUT, "the window to take its list width", || {
             (self.candidate().logical_width() - 225.0).abs() < 2.0
         });

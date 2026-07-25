@@ -58,7 +58,7 @@ pub struct WindowService {
     /// Which connection the visible window belongs to, so its death can take
     /// the window with it (issue #67). Shared with the task that watches for
     /// disconnects; a std Mutex because nothing awaits while it is held.
-    pub show_owner: Arc<Mutex<crate::utils::ShowOwner>>,
+    pub show_owner: Arc<Mutex<crate::placement::ShowOwner>>,
 }
 
 #[tonic::async_trait]
