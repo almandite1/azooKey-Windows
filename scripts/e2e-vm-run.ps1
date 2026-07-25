@@ -472,7 +472,10 @@ finally {
         $freed = Invoke-Command -Session $session -ScriptBlock {
             param($root, $keep)
             $removed = 0
-            foreach ($dir in Get-ChildItem $root -Directory -Filter 'payload-*' -ErrorAction SilentlyContinue) {
+            # 'payload*', not 'payload-*': the pre-versioning runs left a
+            # plain 'payload' directory behind, and it goes the same way once
+            # whatever pinned its DLL has exited.
+            foreach ($dir in Get-ChildItem $root -Directory -Filter 'payload*' -ErrorAction SilentlyContinue) {
                 if ($dir.FullName -eq $keep) { continue }
                 Remove-Item $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
                 if (-not (Test-Path $dir.FullName)) { $removed++ }
