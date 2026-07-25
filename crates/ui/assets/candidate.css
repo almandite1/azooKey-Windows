@@ -35,6 +35,18 @@ li {
     scroll-snap-align: start;
     color: var(--text);
 
+    /* The window is capped (MAX_CANDIDATE_WINDOW_WIDTH), so a long candidate
+       now has to give somewhere. The text lives in its own span because
+       text-overflow does not apply to the anonymous flex item bare text would
+       become, and min-width:0 because a flex item refuses to shrink below its
+       content width without it. */
+    & > span {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
     &::before {
         content: counter(number);
         counter-increment: number 1;

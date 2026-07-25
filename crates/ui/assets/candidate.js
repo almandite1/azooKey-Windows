@@ -17,6 +17,19 @@ function describeCandidate(li, index, total) {
 // numbers have to stay the same one.
 const MAX_VISIBLE_CANDIDATES = 5;
 
+// The candidate text goes in a span of its own, not straight into the li:
+// bare text inside a flex container is an anonymous flex item, and
+// text-overflow cannot reach one. The span is what gets ellipsized when a
+// candidate is wider than the capped window.
+function setCandidateText(li, text) {
+    let label = li.firstElementChild;
+    if (!label) {
+        label = document.createElement('span');
+        li.appendChild(label);
+    }
+    label.textContent = text;
+}
+
 function updateCandidates(candidates) {
     const candidateList = document.getElementById('candidate-list');
 
@@ -24,11 +37,11 @@ function updateCandidates(candidates) {
 
     candidates.forEach((candidate, index) => {
         if (existingItems[index]) {
-            existingItems[index].textContent = candidate;
+            setCandidateText(existingItems[index], candidate);
             describeCandidate(existingItems[index], index, candidates.length);
         } else {
             const li = document.createElement('li');
-            li.textContent = candidate;
+            setCandidateText(li, candidate);
             describeCandidate(li, index, candidates.length);
             candidateList.appendChild(li);
         }
@@ -108,7 +121,7 @@ function itemHeight() {
     }
 
     const sample = document.createElement('li');
-    sample.textContent = 'x';
+    setCandidateText(sample, 'x');
     candidateList.appendChild(sample);
     const height = sample.offsetHeight;
     candidateList.removeChild(sample);
