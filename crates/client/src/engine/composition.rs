@@ -1,32 +1,17 @@
-use std::cmp::max;
-
-use crate::{
-    engine::user_action::{UserAction, is_ime_toggle_key},
-    extension::VKeyExt as _,
-    tsf::factory::TextServiceFactory_Impl,
-};
+//! The composition state the TIP keeps for one document, and the pure
+//! helpers that operate on it.
+//!
+//! Everything that *does* something with a composition lives beside this
+//! file: [`super::key_dispatch`] turns keystrokes into action batches,
+//! [`super::actions`] runs them, [`super::candidate_ui`] publishes the
+//! candidate list, and [`super::recovery`] puts the pieces back together
+//! after the conversion server drops out.
 
 use super::{
-    client_action::{ClientAction, SetSelectionType, SetTextType},
-    full_width::{to_fullwidth, to_fullwidth_ascii, to_halfwidth},
-    input_mode::InputMode,
-    ipc_service::{Candidates, IPCService, is_server_unavailable},
-    state::IMEState,
-    text_util::{to_half_katakana, to_katakana},
-    transition::{KeystrokeContext, is_modifier_key, shortcut_transition, transition},
+    client_action::ClientAction, full_width::to_fullwidth, input_mode::InputMode,
+    ipc_service::Candidates,
 };
-use windows::Win32::{
-    Foundation::WPARAM,
-    UI::{
-        Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU},
-        TextServices::{
-            ITfComposition, ITfCompositionSink_Impl, ITfContext, TF_CLUIE_COUNT,
-            TF_CLUIE_CURRENTPAGE, TF_CLUIE_PAGEINDEX, TF_CLUIE_SELECTION, TF_CLUIE_STRING,
-        },
-    },
-};
-
-use anyhow::{Context, Result};
+use windows::Win32::UI::TextServices::ITfComposition;
 
 #[derive(Default, Clone, PartialEq, Debug)]
 pub enum CompositionState {
@@ -55,40 +40,34 @@ pub struct Composition {
     pub tip_composition: Option<ITfComposition>,
 }
 
-/// Mirrors candidate entry `index` into the client-side composition
-/// fields. This is the single point where a selected candidate becomes
-/// the visible preview — the future hook for conversion-history learning
-/// to observe what the user actually picked.
-fn apply_selected_candidate(
-    candidates: &Candidates,
-    index: i32,
-    preview: &mut String,
-    suffix: &mut String,
-    raw_hiragana: &mut String,
-    corresponding_count: &mut i32,
-    surface_count: &mut i32,
-) {
-    let (text, sub_text, count, surface) = candidates.entry(index as usize);
-    *corresponding_count = count;
-    *surface_count = surface;
-    *preview = text;
-    *suffix = sub_text;
-    *raw_hiragana = candidates.hiragana.clone();
-}
-
 /// Backspace shortened the reading: keep only the leading keystrokes the new
 /// top candidate covers. `count` is `corresponding_count`, already clamped to
 /// the list by the engine.
-fn raw_input_kept_for_count(raw_input: &str, count: i32) -> String {
+pub(super) fn raw_input_kept_for_count(raw_input: &str, count: i32) -> String {
     raw_input.chars().take(count as usize).collect()
 }
 
 /// A candidate was committed (shrink): append the freshly typed keystrokes,
 /// then drop from the front the keystrokes that candidate consumed.
-fn raw_input_after_commit(raw_input: &str, appended: &str, count: i32) -> String {
+pub(super) fn raw_input_after_commit(raw_input: &str, appended: &str, count: i32) -> String {
     let mut combined = raw_input.to_string();
     combined.push_str(appended);
     combined.chars().skip(count as usize).collect()
+}
+
+/// The bytes the engine is given for `text` typed in `mode`.
+///
+/// The one place this transform is decided.
+/// [`super::recovery::rebuild_server_composition`] replays a whole
+/// `raw_input` through it while the append and shrink arms push one keystroke
+/// at a time, and the rebuild is only idempotent if the two produce the same
+/// bytes — which holds because the transform is per-character. One function
+/// rather than three copies of the same `match` is what makes that testable.
+pub(super) fn keystrokes(mode: &InputMode, text: &str) -> String {
+    match mode {
+        InputMode::Kana => to_fullwidth(text),
+        InputMode::Latin => text.to_string(),
+    }
 }
 
 /// The mutable working copy `handle_action` edits while dispatching a batch
@@ -99,23 +78,23 @@ fn raw_input_after_commit(raw_input: &str, appended: &str, count: i32) -> String
 /// `match`. The write-back runs regardless of whether the batch succeeded,
 /// so a failed action still leaves the client consistent with the server
 /// (a mid-batch `?` used to skip the write-back and wedge input).
-struct CompositionEdit {
-    preview: String,
-    suffix: String,
-    raw_input: String,
-    raw_hiragana: String,
-    corresponding_count: i32,
-    surface_count: i32,
-    candidates: Candidates,
-    selection_index: i32,
+pub(super) struct CompositionEdit {
+    pub(super) preview: String,
+    pub(super) suffix: String,
+    pub(super) raw_input: String,
+    pub(super) raw_hiragana: String,
+    pub(super) corresponding_count: i32,
+    pub(super) surface_count: i32,
+    pub(super) candidates: Candidates,
+    pub(super) selection_index: i32,
     /// the state the composition moves to once the batch finishes
-    state: CompositionState,
+    pub(super) state: CompositionState,
 }
 
 impl CompositionEdit {
     /// Snapshots the live composition into a working copy that transitions
     /// to `state` on write-back.
-    fn from_composition(composition: &Composition, state: CompositionState) -> Self {
+    pub(super) fn from_composition(composition: &Composition, state: CompositionState) -> Self {
         Self {
             preview: composition.preview.clone(),
             suffix: composition.suffix.clone(),
@@ -129,19 +108,17 @@ impl CompositionEdit {
         }
     }
 
-    /// Mirrors candidate `index` of `candidates` into the preview fields.
-    /// Method form of [`apply_selected_candidate`] operating on this working
-    /// copy — the learning hook still lives in that function.
-    fn adopt_candidate(&mut self, candidates: &Candidates, index: i32) {
-        apply_selected_candidate(
-            candidates,
-            index,
-            &mut self.preview,
-            &mut self.suffix,
-            &mut self.raw_hiragana,
-            &mut self.corresponding_count,
-            &mut self.surface_count,
-        );
+    /// Mirrors candidate entry `index` into the preview fields of this
+    /// working copy. This is the single point where a selected candidate
+    /// becomes the visible preview — the future hook for conversion-history
+    /// learning to observe what the user actually picked.
+    pub(super) fn adopt_candidate(&mut self, candidates: &Candidates, index: i32) {
+        let (text, sub_text, count, surface) = candidates.entry(index as usize);
+        self.corresponding_count = count;
+        self.surface_count = surface;
+        self.preview = text;
+        self.suffix = sub_text;
+        self.raw_hiragana = candidates.hiragana.clone();
     }
 
     /// Adopts the top of a freshly returned candidate list: resets the
@@ -150,7 +127,7 @@ impl CompositionEdit {
     /// new, differently sized list from the engine, so a selection index left
     /// over from the previous list would adopt the wrong candidate or blank
     /// the preview via the `entry()` fallback.
-    fn adopt_fresh(&mut self, candidates: Candidates) {
+    pub(super) fn adopt_fresh(&mut self, candidates: Candidates) {
         self.selection_index = 0;
         self.adopt_candidate(&candidates, self.selection_index);
         self.candidates = candidates;
@@ -161,7 +138,7 @@ impl CompositionEdit {
     /// spent counts, and the preview/suffix/reading strings. Leaves `state`
     /// and `candidates` to the caller — server-loss also drops the list and
     /// forces `None`, while end/mode-switch take the state from the write-back.
-    fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         self.selection_index = 0;
         self.corresponding_count = 0;
         self.surface_count = 0;
@@ -173,7 +150,7 @@ impl CompositionEdit {
 
     /// Writes the working copy back onto the live composition. Leaves
     /// `tip_composition` alone — that handle is owned by start/end_composition.
-    fn write_back(self, composition: &mut Composition) {
+    pub(super) fn write_back(self, composition: &mut Composition) {
         composition.preview = self.preview;
         composition.state = self.state;
         composition.selection_index = self.selection_index;
@@ -183,23 +160,6 @@ impl CompositionEdit {
         composition.suffix = self.suffix;
         composition.corresponding_count = self.corresponding_count;
         composition.surface_count = self.surface_count;
-    }
-}
-
-impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
-    #[macros::anyhow]
-    fn OnCompositionTerminated(
-        &self,
-        _ecwrite: u32,
-        _pcomposition: windows_core::Ref<'_, ITfComposition>,
-    ) -> Result<()> {
-        // if user clicked outside the composition, the composition will be terminated
-        tracing::debug!("OnCompositionTerminated");
-
-        let actions = vec![ClientAction::EndComposition];
-        self.handle_action(&actions, CompositionState::None)?;
-
-        Ok(())
     }
 }
 
@@ -217,7 +177,7 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
 /// one. `StartComposition` is not in the list because it never arrives alone:
 /// the transition table always pairs it with the keystroke that opened the
 /// composition (`transition.rs`), and that keystroke is an `AppendText`.
-fn needs_context_update(actions: &[ClientAction]) -> bool {
+pub(super) fn needs_context_update(actions: &[ClientAction]) -> bool {
     actions.iter().any(|action| {
         matches!(
             action,
@@ -229,699 +189,11 @@ fn needs_context_update(actions: &[ClientAction]) -> bool {
     })
 }
 
-/// Flags for `ui_update` when the whole candidate list was replaced.
-const CANDIDATES_CHANGED: u32 = TF_CLUIE_COUNT
-    | TF_CLUIE_STRING
-    | TF_CLUIE_SELECTION
-    | TF_CLUIE_CURRENTPAGE
-    | TF_CLUIE_PAGEINDEX;
-
-/// Flags for `ui_update` when only the highlighted candidate moved.
-const SELECTION_CHANGED: u32 = TF_CLUIE_SELECTION | TF_CLUIE_CURRENTPAGE;
-
-impl TextServiceFactory_Impl {
-    /// Hands the candidate list to the host (UILess mode) and, unless the
-    /// host said it draws them itself, to our own window.
-    ///
-    /// Every candidate update goes through here so the two can never
-    /// disagree about what is displayed.
-    fn publish_candidates(
-        &self,
-        ipc_service: &mut crate::engine::ipc_service::IPCService,
-        candidates: &Candidates,
-        selection_index: i32,
-        updated_flags: u32,
-    ) -> Result<()> {
-        // Advisory (CLAUDE.md): UILess bookkeeping must never break typing.
-        // Propagating here would mean a host-side element problem also
-        // stopped the candidates reaching our own window.
-        if let Err(error) = self.ui_update(candidates, selection_index, updated_flags) {
-            tracing::warn!("ui_update failed (non-fatal): {error:?}");
-        }
-
-        if self.ui_should_show() {
-            if updated_flags & TF_CLUIE_STRING != 0 {
-                ipc_service.set_candidates(candidates.texts.clone());
-            }
-            ipc_service.set_selection(selection_index);
-        }
-
-        Ok(())
-    }
-
-    /// Renders the adopted preview into the document and republishes the whole
-    /// candidate list. The tail shared by append and remove; shrink commits
-    /// with `shift_start` instead of `set_text`, so it publishes on its own.
-    fn render_and_publish_full(
-        &self,
-        edit: &CompositionEdit,
-        ipc_service: &mut crate::engine::ipc_service::IPCService,
-    ) -> Result<()> {
-        self.set_text(&edit.preview, &edit.suffix)?;
-        self.publish_candidates(
-            ipc_service,
-            &edit.candidates,
-            edit.selection_index,
-            CANDIDATES_CHANGED,
-        )
-    }
-
-    /// Opens the candidate UI for a new composition: asks the host first
-    /// (UILess), and shows our own window only when the host does not draw
-    /// the candidates itself. Advisory throughout — a host-side element
-    /// problem must not break typing, so on failure we fall back to our own
-    /// window (the pre-UILess behaviour).
-    ///
-    /// Counterpart of `close_candidate_ui`; the visibility transitions live
-    /// in this pair (and host-driven `ITfUIElement::Show`) only, so an arm
-    /// cannot forget one half of the teardown again (issue #21).
-    fn open_candidate_ui(&self, ipc_service: &mut crate::engine::ipc_service::IPCService) {
-        let show = self.ui_begin().unwrap_or_else(|error| {
-            tracing::warn!("ui_begin failed (non-fatal): {error:?}");
-            true
-        });
-        if show {
-            ipc_service.show_window();
-        }
-    }
-
-    /// Closes the candidate UI: releases the host's UI element (UILess) and
-    /// hides our own window, blanking the now-stale list. Everything here is
-    /// unconditional and advisory: hiding is safe even if we never showed,
-    /// and ui_end is a no-op with no live element.
-    fn close_candidate_ui(&self, ipc_service: &mut crate::engine::ipc_service::IPCService) {
-        if let Err(error) = self.ui_end() {
-            tracing::warn!("ui_end failed (non-fatal): {error:?}");
-        }
-        ipc_service.hide_window();
-        ipc_service.set_candidates(vec![]);
-    }
-
-    /// Impure shell around the pure decision functions
-    /// (engine::transition): reads the OS/COM state they need, decodes the
-    /// key, and adapts the result. New key bindings belong in the
-    /// transition table, not here.
-    ///
-    /// `Some` means the TIP eats the key and `handle_key` runs the attached
-    /// actions; `None` hands the key to the host untouched.
-    // skip(self, context): self's Debug is the entire composition including
-    // the candidate list — hundreds of entries per span, which buried the
-    // logs it was meant to illuminate
-    #[tracing::instrument(skip(self, context))]
-    pub fn process_key(
-        &self,
-        context: Option<&ITfContext>,
-        wparam: WPARAM,
-    ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
-        if context.is_none() {
-            return Ok(None);
-        };
-
-        // The host can switch input off for this context — a password field
-        // is the case that matters. Answering None hands the raw key back,
-        // which is the whole point: we must not compose here.
-        if self.is_input_disabled(context) {
-            return Ok(None);
-        }
-
-        // A key TSF reserved for us has already arrived through
-        // OnPreservedKey. Some hosts deliver the raw VK as well, and acting
-        // on both toggles the mode twice. Keyed off the per-activation
-        // registry rather than a fixed VK list, so a host where the
-        // reservation FAILED keeps the raw-VK toggle as its safety net
-        // (issue #19).
-        // The IME on/off keys outrank the chord branch below. Windows
-        // translates Alt+` on a 101-key Japanese layout into VK_KANJI with
-        // Alt STILL HELD (measured on hardware), so the chord branch would
-        // throw the user's only on/off key away as a host shortcut.
-        //
-        // Reaching this at all means TSF did NOT route the key through
-        // OnPreservedKey — a reserved key is not also delivered raw — so the
-        // press is ours to handle. The recency check below is a precaution
-        // against one press being delivered twice, which no host tested so
-        // far does; two flips would cancel and the key would look dead.
-        if is_ime_toggle_key(wparam.0) {
-            if self.toggle_is_duplicate()? {
-                tracing::debug!("ignoring a second delivery of one on/off press");
-                return Ok(None);
-            }
-            let ctx = self.keystroke_context()?;
-            return Ok(transition(&ctx, UserAction::ToggleInputMode)
-                .map(|(next_state, actions)| (actions, next_state)));
-        }
-
-        // A Ctrl or Alt chord is the host's shortcut. During a composition
-        // the TIP owns the keyboard (MS-IME convention): the chord is eaten
-        // and cancels the composition, and the next press — or the chord's
-        // own autorepeat, since the state is None by then — passes through
-        // and fires the shortcut (issue #5). Without the Alt check,
-        // Alt+letter fell through to the ToUnicode decoder, which translates
-        // it like a WM_SYSCHAR — the TIP ate the host's menu accelerator and
-        // turned it into composition input. (AltGr arrives as Ctrl+Alt, so
-        // it took this branch already.)
-        if VK_CONTROL.is_pressed() || VK_MENU.is_pressed() {
-            let state = {
-                let text_service = self.borrow()?;
-                text_service.borrow_composition()?.state.clone()
-            };
-            return Ok(shortcut_transition(&state, is_modifier_key(wparam.0))
-                .map(|(next_state, actions)| (actions, next_state)));
-        }
-
-        let ctx = self.keystroke_context()?;
-        let action = UserAction::try_from(wparam.0)?;
-
-        Ok(transition(&ctx, action).map(|(next_state, actions)| (actions, next_state)))
-    }
-
-    /// The state the pure transition table decides against.
-    fn keystroke_context(&self) -> Result<KeystrokeContext> {
-        let text_service = self.borrow()?;
-        let composition = text_service.borrow_composition()?;
-        Ok(KeystrokeContext {
-            state: composition.state.clone(),
-            mode: text_service.input_mode.clone(),
-            reading_chars: composition.raw_hiragana.chars().count(),
-            suffix_is_empty: composition.suffix.is_empty(),
-        })
-    }
-
-    /// Flips あ/A from somewhere other than a raw key event — today that is
-    /// `OnPreservedKey`, where TSF delivers the reserved on/off keys.
-    ///
-    /// Runs the *same* transition the raw VK would, so a composition in
-    /// flight is ended exactly the way Zenkaku/Hankaku has always ended it
-    /// rather than being abandoned open.
-    #[tracing::instrument(skip(self, context))]
-    pub fn toggle_input_mode(&self, context: Option<&ITfContext>) -> Result<()> {
-        // The preserved-key callback carries the context, and the edit
-        // sessions below need it; without one there is nothing to compose in.
-        if let Some(context) = context {
-            self.borrow_mut()?.context = Some(context.clone());
-        }
-
-        let ctx = self.keystroke_context()?;
-        let Some((next_state, actions)) = transition(&ctx, UserAction::ToggleInputMode) else {
-            return Ok(());
-        };
-
-        self.handle_action(&actions, next_state)
-    }
-
-    /// Answers OnTestKeyDown. A pure query, as the ITfKeyEventSink contract
-    /// requires (issue #26): it decides but never acts, so a host that
-    /// probes speculatively — without a following OnKeyDown — cannot
-    /// disturb the composition. The actions run in `handle_key` when the
-    /// host delivers the key for real.
-    #[tracing::instrument(skip(self, context))]
-    pub fn test_key(&self, context: Option<&ITfContext>, wparam: WPARAM) -> Result<bool> {
-        Ok(self.process_key(context, wparam)?.is_some())
-    }
-
-    #[tracing::instrument(skip(self, context))]
-    pub fn handle_key(&self, context: Option<&ITfContext>, wparam: WPARAM) -> Result<bool> {
-        if let Some(context) = context {
-            self.borrow_mut()?.context = Some(context.clone());
-        } else {
-            return Ok(false);
-        };
-
-        if let Some((actions, transition)) = self.process_key(context, wparam)? {
-            self.handle_action(&actions, transition)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub fn handle_action(
-        &self,
-        actions: &[ClientAction],
-        transition: CompositionState,
-    ) -> Result<()> {
-        let (composition, mode) = {
-            let text_service = self.borrow()?;
-            let composition = text_service.borrow_composition()?.clone();
-            (composition, text_service.input_mode.clone())
-        };
-
-        // where the batch is headed, kept out of `edit` because the recovery
-        // below has to tell "this batch was still composing" from "this batch
-        // was tearing the composition down" after the arms have run
-        let target_state = transition.clone();
-        let mut edit = CompositionEdit::from_composition(&composition, transition);
-        let mut ipc_service = IMEState::get()?
-            .ipc_service
-            .clone()
-            .context("ipc_service is None")?;
-
-        // preview AND suffix: the caret sits after both, so a window that
-        // only steps back over the preview feeds the suffix to the engine as
-        // if it were text the user had already committed
-        if needs_context_update(actions) {
-            self.update_context(&format!("{}{}", edit.preview, edit.suffix))?;
-        }
-
-        // wrapped so the write-back below ALWAYS runs: an early return on a
-        // failed action used to skip it, desyncing the client composition
-        // from the server (stuck input)
-        let result = (|| -> Result<()> {
-            for action in actions {
-                match action {
-                    ClientAction::StartComposition => {
-                        self.act_start_composition(&mut ipc_service)?
-                    }
-                    ClientAction::EndComposition => {
-                        self.act_end_composition(&mut edit, &mut ipc_service, false)?
-                    }
-                    ClientAction::CancelComposition => {
-                        self.act_end_composition(&mut edit, &mut ipc_service, true)?
-                    }
-                    ClientAction::AppendText(text) => {
-                        self.act_append_text(&mut edit, &mut ipc_service, &mode, text)?
-                    }
-                    ClientAction::RemoveText => {
-                        self.act_remove_text(&mut edit, &mut ipc_service)?
-                    }
-                    ClientAction::MoveCursor(_offset) => {
-                        // Deliberate no-op for now: the MoveCursor RPC and the
-                        // Swift engine's cursor handling are live (kept green by
-                        // the move_cursor smoke test in crates/server), but the
-                        // client-side wiring is deferred to the predictive-
-                        // conversion feature, which needs cursor movement anyway.
-                    }
-                    ClientAction::SetIMEMode(mode) => {
-                        self.act_set_ime_mode(&mut edit, &mut ipc_service, mode)?
-                    }
-                    ClientAction::SetSelection(selection) => {
-                        self.act_set_selection(&mut edit, &mut ipc_service, selection)?
-                    }
-                    ClientAction::ShrinkText(text) => {
-                        self.act_shrink_text(&mut edit, &mut ipc_service, &mode, text)?
-                    }
-                    ClientAction::SetTextWithType(set_type) => {
-                        self.act_set_text_with_type(&mut edit, set_type)?
-                    }
-                }
-            }
-            Ok(())
-        })();
-
-        // If the batch failed because the conversion server became
-        // unreachable (crash/restart/hang), the client composition can no
-        // longer be trusted to mirror the server: the server's per-connection
-        // reading is gone or half-applied, but the client still holds the old
-        // preview/reading. Continuing would append the next keystroke onto a
-        // reading the fresh server never had (raw_input and the server state
-        // silently diverge).
-        //
-        // Recover in two steps, cheapest and least destructive first (#35):
-        // rebuild the server's reading from the composition this batch started
-        // with, and only if that also fails throw the composition away (#33).
-        // Either way swallow this keystroke's error — we handled it, so the
-        // host must not also process the key.
-        let recovered = matches!(&result, Err(err) if is_server_unavailable(err));
-        if recovered
-            && !self.rebuild_server_composition(
-                &mut edit,
-                &mut ipc_service,
-                &composition,
-                &target_state,
-                &mode,
-            )
-        {
-            self.reset_composition_after_server_loss(&mut edit, &mut ipc_service);
-        }
-
-        // write back the state of the last successful action even when a
-        // later action failed, keeping the client consistent with the server
-        let text_service = self.borrow()?;
-        let mut composition = text_service.borrow_mut_composition()?;
-        edit.write_back(&mut composition);
-        drop(composition);
-        drop(text_service);
-
-        if recovered { Ok(()) } else { result }
-    }
-
-    /// Puts the server's reading back to what it was when this batch started,
-    /// so a server that merely stalled costs the user one keystroke instead of
-    /// the whole composition (#35). Returns whether the composition survived.
-    ///
-    /// The rebuild is `ClearText` then the batch-start `raw_input` replayed as
-    /// one `AppendText`. Both halves matter: neither the client nor the server
-    /// knows whether a timed-out call was applied before the deadline (the
-    /// reply was dropped, not refused), so the reading is re-established from
-    /// scratch rather than patched, which makes the rebuild idempotent even
-    /// though `AppendText` alone is not.
-    ///
-    /// `raw_input` is the right source because it is exactly the keystrokes
-    /// the server has consumed for the reading it currently holds: every arm
-    /// that sends keystrokes appends to it, and every arm that commits part of
-    /// the reading drops the same prefix from it. Replaying it through the
-    /// mode transform `act_append_text` uses reproduces the byte sequence the
-    /// server was originally given (`to_fullwidth` is per-character, so
-    /// replaying the whole string equals replaying it a keystroke at a time).
-    ///
-    /// Nothing is drawn: the failing arms all call the engine BEFORE they
-    /// touch the document, so the screen still shows the batch-start
-    /// composition and restoring the working copy to match it leaves client,
-    /// server and document agreeing again.
-    fn rebuild_server_composition(
-        &self,
-        edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
-        snapshot: &Composition,
-        target_state: &CompositionState,
-        mode: &InputMode,
-    ) -> bool {
-        // A batch that was ending the composition (Enter, Escape, a mode
-        // switch) has already committed or discarded the text on screen.
-        // Rebuilding the reading would resurrect a composition the user
-        // finished, so those go straight to the teardown, which is what they
-        // were doing anyway.
-        if *target_state == CompositionState::None
-            || snapshot.state == CompositionState::None
-            || snapshot.raw_input.is_empty()
-        {
-            return false;
-        }
-
-        let replay = match mode {
-            InputMode::Kana => to_fullwidth(&snapshot.raw_input),
-            InputMode::Latin => snapshot.raw_input.clone(),
-        };
-
-        if let Err(error) = ipc_service.clear_text() {
-            tracing::warn!("could not clear the server before rebuilding: {error:#}");
-            return false;
-        }
-        if let Err(error) = ipc_service.append_text(replay) {
-            tracing::warn!("could not replay the reading onto the server: {error:#}");
-            return false;
-        }
-
-        // The engine answered, so it is back. Discard its fresh candidate list
-        // and keep the one already on screen: the reading is the same, the
-        // document was never touched, and redrawing would make a recovered
-        // stall look like a candidate list that jumped on its own.
-        *edit = CompositionEdit::from_composition(snapshot, snapshot.state.clone());
-        tracing::info!(
-            "rebuilt the server composition after a stall; kept {} keystrokes",
-            snapshot.raw_input.chars().count()
-        );
-        true
-    }
-
-    /// Locally tears down the composition after the server became unreachable
-    /// mid-batch. Releases the TSF composition handle and hides the candidate
-    /// window, then blanks the working copy so the write-back leaves the client
-    /// in the `None` state. Deliberately issues NO conversion-server RPC (that
-    /// pipe is the one that just failed — another call would only time out
-    /// again); the candidate-window RPCs go to the separate, still-live ui
-    /// process. Best-effort: we are already on an error path.
-    fn reset_composition_after_server_loss(
-        &self,
-        edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
-    ) {
-        if let Err(error) = self.end_composition() {
-            tracing::warn!("end_composition during server-loss reset failed: {error:?}");
-        }
-        self.close_candidate_ui(ipc_service);
-
-        edit.clear();
-        edit.state = CompositionState::None;
-        edit.candidates = Candidates::default();
-    }
-
-    /// Begins a TSF composition and opens the candidate UI. `open_candidate_ui`
-    /// runs after `update_pos` so a UILess host knows where the caret is
-    /// before deciding whether it draws the candidates itself.
-    fn act_start_composition(&self, ipc_service: &mut IPCService) -> Result<()> {
-        self.start_composition()?;
-        self.update_pos()?;
-        self.open_candidate_ui(ipc_service);
-        Ok(())
-    }
-
-    /// Ends the composition (committing the range) or, when `cancel`, empties
-    /// it first — Escape used to leave the leftover reading committed (issue
-    /// #35 family).
-    ///
-    /// Every teardown step runs even when an edit session fails: the old code
-    /// bailed at the first `?`, so a host that rejected the edit session
-    /// skipped `clear_text` and left the server's reading alive; the next
-    /// keystroke appended to it and the previous composition's text
-    /// reappeared. Clear the client state and the server unconditionally,
-    /// then surface the first failure.
-    fn act_end_composition(
-        &self,
-        edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
-        cancel: bool,
-    ) -> Result<()> {
-        let mut edit_result = Ok(());
-        if cancel {
-            edit_result = self.set_text("", "");
-        }
-        // tear down the TSF composition regardless; even on a failed session
-        // end_composition releases the client-side handle
-        edit_result = edit_result.and(self.end_composition());
-
-        edit.clear();
-        self.close_candidate_ui(ipc_service);
-        let clear_result = ipc_service.clear_text();
-
-        // surface the first failure only after both the client state and the
-        // server reading were cleared
-        edit_result?;
-        clear_result?;
-        Ok(())
-    }
-
-    /// Feeds a keystroke to the engine and shows the fresh candidate list.
-    fn act_append_text(
-        &self,
-        edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
-        mode: &InputMode,
-        text: &str,
-    ) -> Result<()> {
-        let keystrokes = match mode {
-            InputMode::Kana => to_fullwidth(text),
-            InputMode::Latin => text.to_string(),
-        };
-
-        let candidates = ipc_service.append_text(keystrokes)?;
-
-        // Only now, with the engine's answer in hand. raw_input is the
-        // keystrokes the SERVER has consumed, and the write-back runs even
-        // when an action fails, so recording the keystroke before the call
-        // meant a failed call still spent it: F9/F10 would then render input
-        // the engine never saw (#85).
-        edit.raw_input.push_str(text);
-        // The engine returned a fresh list; an index carried over from
-        // Previewing (the arrow keys transition to Composing but map to the
-        // MoveCursor no-op, which keeps the index) would adopt the wrong
-        // candidate or blank the preview via the entry() fallback.
-        edit.adopt_fresh(candidates);
-
-        self.render_and_publish_full(edit, ipc_service)
-    }
-
-    /// Backspace: the engine returns a fresh, shorter list. A selection index
-    /// carried over from Previewing would point past the new list (blanking
-    /// the preview via the `entry()` fallback) or at the wrong candidate, so
-    /// reset to the top and shrink `raw_input` to what the new top covers.
-    fn act_remove_text(
-        &self,
-        edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
-    ) -> Result<()> {
-        let candidates = ipc_service.remove_text()?;
-        edit.adopt_fresh(candidates);
-
-        edit.raw_input = raw_input_kept_for_count(&edit.raw_input, edit.corresponding_count);
-
-        self.render_and_publish_full(edit, ipc_service)
-    }
-
-    /// Switches the IME mode. Clears the composition and hides the candidate
-    /// window with it (issue #21). The clearing is unconditional: a failure
-    /// publishing the mode used to abort the arm before it, leaving the
-    /// reading alive on both sides.
-    fn act_set_ime_mode(
-        &self,
-        edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
-        mode: &InputMode,
-    ) -> Result<()> {
-        // Stamped here, where the mode actually changes, so every path that
-        // toggles feeds the double-delivery guard — the raw VK, the
-        // preserved key, and the langbar alike (issue #19).
-        if let Err(error) = self.note_mode_toggle() {
-            tracing::warn!("could not record the mode toggle time: {error:?}");
-        }
-
-        self.start_composition()?;
-        self.update_pos()?;
-        self.end_composition()?;
-
-        self.close_candidate_ui(ipc_service);
-
-        // publishes the mode to the langbar, the indicator, and the OS
-        // compartments (so the touch keyboard, IMM32 apps and the shell see
-        // it too). Captured rather than `?`: a langbar or compartment failure
-        // must not skip the teardown below, or the write-back keeps the stale
-        // preview/reading and the next keystroke resurrects the old reading
-        // (same pattern as act_end_composition).
-        let apply_result = self.apply_input_mode(mode.clone(), true);
-
-        edit.clear();
-        let clear_result = ipc_service.clear_text();
-
-        // surface the first failure only after both the client state and the
-        // server reading were cleared
-        apply_result?;
-        clear_result?;
-        Ok(())
-    }
-
-    /// Moves the highlighted candidate up or down, clamped to the list.
-    fn act_set_selection(
-        &self,
-        edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
-        selection: &SetSelectionType,
-    ) -> Result<()> {
-        // The WORKING COPY's list, not the live composition's. They are the
-        // same today, because the transition table only ever emits
-        // SetSelection on its own — but the moment a batch pairs it with an
-        // action that fetches candidates (predictive conversion is the
-        // obvious one), the live composition still holds the previous list:
-        // the write-back does not happen until the batch ends. Reading it
-        // here would silently highlight an entry of a list that is already
-        // gone.
-        let candidates = edit.candidates.clone();
-
-        // clamp lower bound first: on an empty list len() - 1 is -1 and the
-        // later `as usize` cast would go out of bounds
-        edit.selection_index = match selection {
-            SetSelectionType::Up => edit.selection_index - 1,
-            SetSelectionType::Down => edit.selection_index + 1,
-        }
-        .clamp(0, max(0, candidates.texts.len() as i32 - 1));
-
-        self.publish_candidates(
-            ipc_service,
-            &candidates,
-            edit.selection_index,
-            SELECTION_CHANGED,
-        )?;
-        edit.adopt_candidate(&candidates, edit.selection_index);
-
-        self.set_text(&edit.preview, &edit.suffix)
-    }
-
-    /// Confirms the selected candidate and keeps composing the remainder:
-    /// commits it with `shift_start`, drops the committed input elements, and
-    /// forces the state back to Composing for the fresh reading.
-    fn act_shrink_text(
-        &self,
-        edit: &mut CompositionEdit,
-        ipc_service: &mut IPCService,
-        mode: &InputMode,
-        text: &str,
-    ) -> Result<()> {
-        // Both values are computed up front because they read
-        // `corresponding_count`, which `adopt_fresh` below overwrites — but
-        // each is APPLIED only once the call it describes has landed. The
-        // write-back runs even when an action fails, so assigning either one
-        // early spent keystrokes on a call that might not happen (#85).
-        //
-        // Two of them because this arm makes two calls and can stop between
-        // them: after the commit the server has dropped the prefix but has
-        // not seen the new keystroke yet.
-        let spent = edit.corresponding_count;
-        let after_commit = raw_input_after_commit(&edit.raw_input, "", spent);
-        let after_append = raw_input_after_commit(&edit.raw_input, text, spent);
-
-        // kana, not keystrokes: only the reading can express a candidate
-        // that ends inside a romaji cluster
-        ipc_service.shrink_text(edit.surface_count)?;
-        edit.raw_input = after_commit;
-
-        let keystrokes = match mode {
-            InputMode::Kana => to_fullwidth(text),
-            InputMode::Latin => text.to_string(),
-        };
-        let candidates = ipc_service.append_text(keystrokes)?;
-        edit.raw_input = after_append;
-
-        // shift_start needs the preview being replaced, captured before
-        // adopt_fresh overwrites it (it does not read edit.candidates, so
-        // storing the new list first is harmless)
-        let previous_preview = edit.preview.clone();
-        edit.adopt_fresh(candidates);
-        self.shift_start(&previous_preview, &edit.preview)?;
-
-        self.publish_candidates(
-            ipc_service,
-            &edit.candidates,
-            edit.selection_index,
-            CANDIDATES_CHANGED,
-        )?;
-        self.update_pos()?;
-
-        edit.state = CompositionState::Composing;
-        Ok(())
-    }
-
-    /// F6–F10: rewrites the whole reading as hiragana/katakana/half-katakana/
-    /// full- or half-width latin, then syncs the written-back state with what
-    /// is now on screen — the whole reading converted, no suffix left. A stale
-    /// preview made the next ShrinkText's shift_start commit only the first
-    /// `old_preview.len()` units, and a stale suffix sent Enter down the
-    /// pending-suffix path instead of ending.
-    fn act_set_text_with_type(
-        &self,
-        edit: &mut CompositionEdit,
-        set_type: &SetTextType,
-    ) -> Result<()> {
-        let text = match set_type {
-            SetTextType::Hiragana => edit.raw_hiragana.clone(),
-            SetTextType::Katakana => to_katakana(&edit.raw_hiragana),
-            SetTextType::HalfKatakana => to_half_katakana(&edit.raw_hiragana),
-            SetTextType::FullLatin => to_fullwidth_ascii(&edit.raw_input),
-            SetTextType::HalfLatin => to_halfwidth(&edit.raw_input),
-        };
-
-        self.set_text(&text, "")?;
-
-        edit.preview = text;
-        edit.suffix.clear();
-        // the conversion covers everything typed so far, so a following
-        // ShrinkText must drop it all — each count in its own unit
-        edit.corresponding_count = edit.raw_input.chars().count() as i32;
-        edit.surface_count = edit.raw_hiragana.chars().count() as i32;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::engine::client_action::SetTextType;
-    use crate::engine::ipc_service::{FakeIpc, IPCService, IpcCall};
-    use crate::tsf::test_support::{
-        EditSessionBehavior, FakeComposition, FakeContext, RangeLog, factory_of,
-        factory_with_context, factory_with_fake_context, global_state_lock,
-    };
-    use std::rc::Rc;
-    use std::sync::{Arc, Mutex};
+    use crate::engine::client_action::{SetSelectionType, SetTextType};
 
     #[test]
     fn raw_input_kept_for_count_keeps_the_leading_keystrokes() {
@@ -948,998 +220,51 @@ mod tests {
         assert_eq!(raw_input_after_commit("ki", "u", 0), "kiu");
     }
 
-    /// Installs a recording IPC service into the global state and scripts
-    /// the candidates the engine RPCs answer with. Callers must hold
-    /// `global_state_lock` and reset `ipc_service` to `None` when done.
-    fn install_fake_ipc(scripted: Candidates) -> Arc<Mutex<FakeIpc>> {
-        let (service, fake) = IPCService::new_fake().unwrap();
-        fake.lock().unwrap().scripted_candidates = scripted;
-        IMEState::get().unwrap().ipc_service = Some(service);
-        fake
-    }
-
-    /// `counts` are keystrokes (what raw_input is measured in), `surfaces`
-    /// are kana of the reading (what ShrinkText spends) — the engine reports
-    /// both because they disagree whenever a candidate ends inside a romaji
-    /// cluster.
-    fn scripted(texts: &[&str], hiragana: &str, counts: &[i32], surfaces: &[i32]) -> Candidates {
-        Candidates {
-            texts: texts.iter().map(|s| s.to_string()).collect(),
-            sub_texts: texts.iter().map(|_| String::new()).collect(),
-            hiragana: hiragana.to_string(),
-            corresponding_count: counts.to_vec(),
-            surface_count: surfaces.to_vec(),
-        }
-    }
-
-    fn recorded_calls(fake: &Arc<Mutex<FakeIpc>>) -> Vec<IpcCall> {
-        fake.lock().unwrap().calls.clone()
-    }
-
-    /// AppendText is the main typing path: the engine's answer must become
-    /// the written-back preview state, and the candidate list must be
-    /// published to the window (full CANDIDATES_CHANGED: list AND selection).
+    /// The invariant the rebuild depends on: replaying a whole reading in one
+    /// call must produce exactly the bytes the keystroke-at-a-time path sent,
+    /// or the rebuild stops being idempotent and the server is left holding a
+    /// different reading than the client thinks it does.
     #[test]
-    fn append_text_applies_the_engine_answer_and_publishes_the_list() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["水", "未"], "みず", &[4, 4], &[2, 2]));
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
-            composition.tip_composition = Some(FakeComposition::new());
+    fn replaying_a_reading_whole_equals_replaying_it_per_keystroke() {
+        for mode in [InputMode::Kana, InputMode::Latin] {
+            // "-" and "," are in the kana punctuation map, so this exercises
+            // the branch that actually transforms
+            let reading = "ka-nyu,shi";
+            let per_keystroke: String = reading
+                .chars()
+                .map(|c| keystrokes(&mode, &c.to_string()))
+                .collect();
+            assert_eq!(keystrokes(&mode, reading), per_keystroke, "mode {mode:?}");
         }
-
-        factory
-            .handle_action(
-                &[ClientAction::AppendText("mi".to_string())],
-                CompositionState::Composing,
-            )
-            .unwrap();
-
-        let text_service = factory.borrow().unwrap();
-        let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(composition.preview, "水");
-        assert_eq!(composition.raw_input, "mi");
-        assert_eq!(composition.raw_hiragana, "みず");
-        assert_eq!(composition.corresponding_count, 4);
-        assert_eq!(composition.candidates.texts, vec!["水", "未"]);
-        drop(composition);
-        drop(text_service);
-
-        let calls = recorded_calls(&fake);
-        assert!(calls.contains(&IpcCall::AppendText("mi".to_string())));
-        assert!(
-            calls.contains(&IpcCall::SetCandidates(vec![
-                "水".to_string(),
-                "未".to_string()
-            ])),
-            "a CANDIDATES_CHANGED update must push the new list to the window: {calls:?}"
-        );
-        assert!(calls.contains(&IpcCall::SetSelection(0)));
-
-        IMEState::get().unwrap().ipc_service = None;
     }
 
-    /// The arrow keys leave Previewing for Composing but map to the
-    /// MoveCursor no-op, so a non-zero selection index survives into the
-    /// next keystroke. AppendText must not apply it to the fresh list: it
-    /// would adopt the wrong candidate, or blank the preview when the index
-    /// points past the shorter list.
+    /// The allowlist in prose form: only the actions whose engine call can
+    /// USE the surrounding text pay for measuring it (issue #36). The
+    /// end-to-end counterpart lives in `actions.rs`.
     #[test]
-    fn append_text_resets_a_selection_carried_over_from_previewing() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["水", "未"], "みず", &[4, 4], &[2, 2]));
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
-            composition.selection_index = 3;
-            composition.preview = "水".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        // the left arrow: Previewing + MoveCursor transitions to Composing,
-        // and the no-op arm leaves the selection index behind
-        factory
-            .handle_action(&[ClientAction::MoveCursor(-1)], CompositionState::Composing)
-            .unwrap();
-        {
-            let text_service = factory.borrow().unwrap();
-            let composition = text_service.borrow_composition().unwrap();
-            assert_eq!(
-                composition.selection_index, 3,
-                "precondition: the no-op arm must leave the stale index in Composing"
-            );
-        }
-
-        factory
-            .handle_action(
-                &[ClientAction::AppendText("mi".to_string())],
-                CompositionState::Composing,
-            )
-            .unwrap();
-
-        let text_service = factory.borrow().unwrap();
-        let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(
-            composition.selection_index, 0,
-            "a stale Previewing selection must not survive the next keystroke"
-        );
-        assert_eq!(
-            composition.preview, "水",
-            "the top of the fresh list must be adopted, not the stale index"
-        );
-        drop(composition);
-        drop(text_service);
-
-        assert!(
-            recorded_calls(&fake).contains(&IpcCall::SetSelection(0)),
-            "the window must be told the selection went back to the top"
-        );
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// Backspace returns to Composing with a fresh, shorter list: a
-    /// selection index carried over from Previewing pointed past the new
-    /// list (or at the wrong candidate), so it must reset to the top, and
-    /// raw_input must shrink to what the new top candidate covers.
-    #[test]
-    fn remove_text_resets_the_selection_and_truncates_raw_input() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["水"], "みず", &[4], &[2]));
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
-            composition.selection_index = 3;
-            composition.raw_input = "mizuu".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        factory
-            .handle_action(&[ClientAction::RemoveText], CompositionState::Composing)
-            .unwrap();
-
-        let text_service = factory.borrow().unwrap();
-        let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(
-            composition.selection_index, 0,
-            "a stale Previewing selection must not survive Backspace"
-        );
-        assert_eq!(
-            composition.raw_input, "mizu",
-            "raw_input must shrink to the new top candidate's corresponding count"
-        );
-        drop(composition);
-        drop(text_service);
-
-        assert!(recorded_calls(&fake).contains(&IpcCall::RemoveText));
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// Confirm-and-continue: ShrinkText commits the selected candidate
-    /// (shift_start with the OLD preview), drops the committed input
-    /// elements from raw_input, and forces the state back to Composing
-    /// regardless of what the caller passed.
-    #[test]
-    fn shrink_text_commits_and_returns_to_composing() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["ん"], "ん", &[1], &[1]));
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
-            composition.preview = "水".to_string();
-            composition.raw_input = "mizu".to_string();
-            composition.corresponding_count = 4;
-            composition.surface_count = 2; // みず — two kana, four keystrokes
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        factory
-            .handle_action(
-                &[ClientAction::ShrinkText("n".to_string())],
-                CompositionState::Previewing,
-            )
-            .unwrap();
-
-        let text_service = factory.borrow().unwrap();
-        let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(
-            composition.state,
-            CompositionState::Composing,
-            "the arm must force Composing for the fresh reading"
-        );
-        assert_eq!(
-            composition.raw_input, "n",
-            "the committed input elements must be dropped"
-        );
-        assert_eq!(composition.selection_index, 0);
-        drop(composition);
-        drop(text_service);
-
-        let calls = recorded_calls(&fake);
-        let shrink = calls
-            .iter()
-            .position(|c| *c == IpcCall::ShrinkText(2))
-            .expect("shrink_text must be sent the committed KANA count, not the keystrokes");
-        let append = calls
-            .iter()
-            .position(|c| *c == IpcCall::AppendText("n".to_string()))
-            .expect("the new keystroke must be appended");
-        assert!(
-            shrink < append,
-            "the server must commit BEFORE the new reading starts: {calls:?}"
-        );
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// Candidate navigation clamps at both ends (an empty list included —
-    /// the lower clamp guards the later `as usize` cast) and publishes a
-    /// SELECTION_CHANGED update: selection only, never the list itself.
-    #[test]
-    fn set_selection_clamps_and_publishes_only_the_selection() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(Candidates::default());
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
-            composition.candidates = scripted(&["a", "b", "c"], "あ", &[1, 1, 1], &[1, 1, 1]);
-            composition.selection_index = 2;
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        // Down at the last candidate must stay clamped there
-        factory
-            .handle_action(
-                &[ClientAction::SetSelection(SetSelectionType::Down)],
-                CompositionState::Previewing,
-            )
-            .unwrap();
-        {
-            let text_service = factory.borrow().unwrap();
-            let composition = text_service.borrow_composition().unwrap();
-            assert_eq!(composition.selection_index, 2, "Down must clamp at len-1");
-        }
-
-        // Up three times from index 2 must clamp at 0, not go negative
-        for _ in 0..3 {
-            factory
-                .handle_action(
-                    &[ClientAction::SetSelection(SetSelectionType::Up)],
-                    CompositionState::Previewing,
-                )
-                .unwrap();
-        }
-        {
-            let text_service = factory.borrow().unwrap();
-            let composition = text_service.borrow_composition().unwrap();
-            assert_eq!(composition.selection_index, 0, "Up must clamp at 0");
-        }
-
-        let calls = recorded_calls(&fake);
-        assert!(calls.contains(&IpcCall::SetSelection(2)));
-        assert!(
-            !calls.iter().any(|c| matches!(c, IpcCall::SetCandidates(_))),
-            "SELECTION_CHANGED must not re-send the candidate list: {calls:?}"
-        );
-
-        // an empty list must not panic and must stay at 0
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.candidates = Candidates::default();
-            composition.selection_index = 0;
-        }
-        factory
-            .handle_action(
-                &[ClientAction::SetSelection(SetSelectionType::Down)],
-                CompositionState::Previewing,
-            )
-            .unwrap();
-        {
-            let text_service = factory.borrow().unwrap();
-            let composition = text_service.borrow_composition().unwrap();
-            assert_eq!(composition.selection_index, 0);
-        }
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// Ending a composition must tear the candidate UI down over IPC:
-    /// hide the window, blank the stale list, and clear the server reading.
-    #[test]
-    fn end_composition_tears_down_the_candidate_ui() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(Candidates::default());
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
-            composition.preview = "水".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        factory
-            .handle_action(&[ClientAction::EndComposition], CompositionState::None)
-            .unwrap();
-
-        let calls = recorded_calls(&fake);
-        assert!(calls.contains(&IpcCall::HideWindow), "{calls:?}");
-        assert!(
-            calls.contains(&IpcCall::SetCandidates(vec![])),
-            "the stale list must be blanked: {calls:?}"
-        );
-        assert!(
-            calls.contains(&IpcCall::ClearText),
-            "the server reading must be cleared: {calls:?}"
-        );
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// Switching the IME mode clears the composition, so the candidate
-    /// window must hide with it. This arm used to call ui_end alone and
-    /// skip hide_window (issue #21), leaving our window floating over a
-    /// composition that no longer existed.
-    ///
-    /// The teardown runs before apply_input_mode, whose langbar update
-    /// needs a thread manager this fake environment does not provide — the
-    /// arm therefore errors afterwards, which is exactly why the teardown
-    /// must already have happened by then.
-    #[test]
-    fn set_ime_mode_hides_the_candidate_window() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(Candidates::default());
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
-            composition.preview = "わたし".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        let _ = factory.handle_action(
-            &[ClientAction::SetIMEMode(InputMode::Kana)],
-            CompositionState::None,
-        );
-
-        let calls = recorded_calls(&fake);
-        assert!(
-            calls.contains(&IpcCall::HideWindow),
-            "a mode switch must hide the candidate window (issue #21): {calls:?}"
-        );
-        assert!(
-            calls.contains(&IpcCall::SetCandidates(vec![])),
-            "the stale list must be blanked on a mode switch: {calls:?}"
-        );
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// A mode switch can arrive mid-composition straight from the language
-    /// bar, which never sends EndComposition first. Publishing the mode is
-    /// fallible (langbar item swap, compartments, indicator placement), and
-    /// bailing there used to skip the clearing below: the write-back then
-    /// restored the old preview and reading, and the next keystroke appended
-    /// to a reading the user thought was gone.
-    #[test]
-    fn set_ime_mode_clears_the_reading_even_when_apply_input_mode_fails() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(Candidates::default());
-
-        // the fake host has no thread manager, so apply_input_mode fails
-        // on its own — no extra hook needed
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
-            composition.selection_index = 2;
-            composition.corresponding_count = 7;
-            composition.preview = "わたし".to_string();
-            composition.suffix = "は".to_string();
-            composition.raw_input = "watashiha".to_string();
-            composition.raw_hiragana = "わたしは".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        let result = factory.handle_action(
-            &[ClientAction::SetIMEMode(InputMode::Kana)],
-            CompositionState::None,
-        );
-        assert!(
-            result.is_err(),
-            "the failure must still be surfaced, just not before the teardown"
-        );
-
-        let text_service = factory.borrow().unwrap();
-        let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(composition.preview, "");
-        assert_eq!(composition.suffix, "");
-        assert_eq!(composition.raw_input, "");
-        assert_eq!(composition.raw_hiragana, "");
-        assert_eq!(composition.selection_index, 0);
-        assert_eq!(composition.corresponding_count, 0);
-        drop(composition);
-        drop(text_service);
-
-        assert!(
-            recorded_calls(&fake).contains(&IpcCall::ClearText),
-            "the server's reading must be dropped too, or it comes back on the next key"
-        );
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// The context sent to the engine is the text before the composition,
-    /// and the caret sits after the preview AND the suffix. Passing only the
-    /// preview left the suffix inside the window, so the engine saw the
-    /// user's own half-typed reading as committed context.
-    #[test]
-    fn the_context_window_steps_back_over_the_suffix_too() {
-        let _guard = global_state_lock();
-        let _fake = install_fake_ipc(Candidates::default());
-
-        let log = Rc::new(RangeLog::default());
-        *log.text.borrow_mut() = "こんにちは".encode_utf16().collect();
-        let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
-        let tip = factory_with_context(context.clone());
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
-            composition.preview = "水".to_string();
-            composition.suffix = "うみ".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        // A converting batch, not an empty one: only those measure the
-        // context now (issue #36). update_context still runs before the
-        // actions, so the FIRST range request is the one under test — the
-        // rendering that follows makes requests of its own.
-        factory
-            .handle_action(&[ClientAction::RemoveText], CompositionState::Composing)
-            .unwrap();
-
-        assert_eq!(
-            log.shift_end_reqs.borrow().first(),
-            Some(&-3),
-            "preview + suffix is 3 UTF-16 units; the window must end before all of it"
-        );
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// Starting a composition asks the host first (UILess); a host without
-    /// a UI element manager wants our own window shown.
-    #[test]
-    fn start_composition_shows_our_window_without_a_uiless_host() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(Candidates::default());
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-
-        factory
-            .handle_action(
-                &[ClientAction::StartComposition],
-                CompositionState::Composing,
-            )
-            .unwrap();
-
-        assert!(
-            recorded_calls(&fake).contains(&IpcCall::ShowWindow),
-            "no UILess host answered, so our own window must be shown"
-        );
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// After F6–F10 (SetTextWithType) the written-back composition state must
-    /// describe what is actually on screen: the converted reading as the
-    /// preview, no pending suffix, and a corresponding_count covering every
-    /// input element. The old arm updated only the on-screen range; the stale
-    /// preview then made the next ShrinkText's shift_start commit just the
-    /// first `old_preview.len()` UTF-16 units of the converted text (e.g.
-    /// わたし → F7 →「ワタシ」, next keystroke committed only「ワ」), and a
-    /// stale non-empty suffix sent Enter down the "commit candidate, keep
-    /// composing" path instead of ending the composition.
-    #[test]
-    fn set_text_with_type_syncs_the_written_back_state_with_the_screen() {
-        let _guard = global_state_lock();
-        // handle_action requires a live-looking IPC service; the lazy
-        // channels never connect because this arm issues no RPC
-        IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
-            composition.preview = "私".to_string(); // the selected candidate
-            composition.suffix = "の".to_string(); // unconverted remainder
-            composition.raw_input = "watashino".to_string();
-            composition.raw_hiragana = "わたしの".to_string();
-            composition.corresponding_count = 7; // 私 ← "watashi"
-        }
-
-        factory
-            .handle_action(
-                &[ClientAction::SetTextWithType(SetTextType::Katakana)],
-                CompositionState::Previewing,
-            )
-            .unwrap();
-
-        let text_service = factory.borrow().unwrap();
-        let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(
-            composition.preview, "ワタシノ",
-            "the preview must be the converted text now shown on screen"
-        );
-        assert_eq!(
-            composition.suffix, "",
-            "the conversion consumed the whole reading — Enter must commit \
-             and end, not take the pending-suffix path"
-        );
-        assert_eq!(
-            composition.corresponding_count, 9,
-            "all typed input elements (watashino) correspond to the shown \
-             text, so a following ShrinkText must drop them all"
-        );
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// Only the batches whose engine call can USE the surrounding text pay
-    /// for measuring it (issue #36).
-    ///
-    /// `update_context` opens an edit session on the parent context and reads
-    /// the document back — per batch, on the UI thread, in front of the
-    /// keystroke. Candidate navigation and the MoveCursor no-op issue no
-    /// conversion at all, so the context they measured was thrown away; worse,
-    /// with the engine down each one also paid the SetContext deadline.
-    #[test]
-    fn only_converting_batches_measure_the_surrounding_text() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["水", "見ず"], "みず", &[4, 4], &[2, 2]));
-
-        let log = Rc::new(RangeLog::default());
-        *log.text.borrow_mut() = "こんにちは".encode_utf16().collect();
-        let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
-        let tip = factory_with_context(context.clone());
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
-            composition.preview = "水".to_string();
-            composition.candidates = scripted(&["水", "見ず"], "みず", &[4, 4], &[2, 2]);
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        let context_calls = |fake: &Arc<Mutex<FakeIpc>>| {
-            recorded_calls(fake)
-                .iter()
-                .filter(|c| matches!(c, IpcCall::SetContext(_)))
-                .count()
-        };
-
-        // moving the highlight converts nothing
-        factory
-            .handle_action(
-                &[ClientAction::SetSelection(SetSelectionType::Down)],
-                CompositionState::Previewing,
-            )
-            .unwrap();
-        assert_eq!(
-            context_calls(&fake),
-            0,
-            "candidate navigation must not read the document back"
-        );
-
-        // ...nor does the arrow-key no-op
-        factory
-            .handle_action(&[ClientAction::MoveCursor(-1)], CompositionState::Composing)
-            .unwrap();
-        assert_eq!(
-            context_calls(&fake),
-            0,
-            "the MoveCursor no-op must not either"
-        );
-
-        // typing does: this is the batch whose engine call reads the context
-        factory
-            .handle_action(
-                &[ClientAction::AppendText("mi".to_string())],
-                CompositionState::Composing,
-            )
-            .unwrap();
-        assert_eq!(
-            context_calls(&fake),
-            1,
-            "a conversion must be given the text it is converting after"
-        );
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// A keystroke the engine REJECTED must not be recorded as typed (#85).
-    ///
-    /// `raw_input` is the keystrokes the server has consumed, and the
-    /// write-back runs even when an action fails — deliberately, so a failure
-    /// cannot wedge input. Recording the keystroke before the call therefore
-    /// made a failed call spend it anyway, and F9/F10 (which render
-    /// `raw_input` directly) would then show input the engine never saw.
-    ///
-    /// The failure here is a plain engine error, NOT `ServerUnavailable`: that
-    /// one is already covered by the rebuild, which restores the whole
-    /// composition from the batch-start snapshot.
-    #[test]
-    fn a_rejected_keystroke_is_not_recorded_as_typed() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["水"], "みず", &[4], &[2]));
-        fake.lock().unwrap().engine_fails = true;
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
-            composition.raw_input = "mizu".to_string();
-            composition.raw_hiragana = "みず".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        let result = factory.handle_action(
-            &[ClientAction::AppendText("ka".to_string())],
-            CompositionState::Composing,
-        );
-        assert!(result.is_err(), "an engine error must still be surfaced");
-
-        let text_service = factory.borrow().unwrap();
-        let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(
-            composition.raw_input, "mizu",
-            "the engine rejected the keystroke, so it was never typed as far \
-             as the composition is concerned"
-        );
-        drop(composition);
-        drop(text_service);
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// The same for the commit path, which makes TWO calls and can stop
-    /// between them. A failed `ShrinkText` must leave the reading whole: the
-    /// old arm had already dropped the committed prefix (and appended the new
-    /// keystroke) before asking the server to commit anything (#85).
-    #[test]
-    fn a_failed_commit_leaves_the_keystrokes_alone() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["ん"], "ん", &[1], &[1]));
-        fake.lock().unwrap().engine_fails = true;
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
-            composition.preview = "水".to_string();
-            composition.raw_input = "mizu".to_string();
-            composition.corresponding_count = 4;
-            composition.surface_count = 2;
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        let result = factory.handle_action(
-            &[ClientAction::ShrinkText("n".to_string())],
-            CompositionState::Previewing,
-        );
-        assert!(result.is_err(), "an engine error must still be surfaced");
-
-        let text_service = factory.borrow().unwrap();
-        let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(
-            composition.raw_input, "mizu",
-            "ShrinkText failed, so nothing was committed and nothing was typed"
-        );
-        drop(composition);
-        drop(text_service);
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// A server that stalls for one call and then answers again must cost the
-    /// user that keystroke and nothing else (#35). The rebuild re-establishes
-    /// the reading the composition started the batch with — `ClearText`
-    /// followed by the whole `raw_input` replayed in one `AppendText` — so the
-    /// client, the server and the document agree again without the destructive
-    /// reset (#33) that used to be the only recovery.
-    #[test]
-    fn append_rebuilds_the_server_reading_when_the_server_only_stalls() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["水"], "みず", &[4], &[2]));
-        // only the keystroke's own AppendText fails; the rebuild's ClearText
-        // and AppendText are answered, as by a server that came back
-        fake.lock().unwrap().engine_unavailable_for = 1;
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
-            composition.preview = "水".to_string();
-            composition.raw_input = "mizu".to_string();
-            composition.raw_hiragana = "みず".to_string();
-            composition.corresponding_count = 4;
-            composition.surface_count = 2;
-            composition.candidates = scripted(&["水"], "みず", &[4], &[2]);
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        factory
-            .handle_action(
-                &[ClientAction::AppendText("ka".to_string())],
-                CompositionState::Composing,
-            )
-            .expect("a recovered stall must be swallowed, not surfaced");
-
-        let text_service = factory.borrow().unwrap();
-        let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(
-            composition.state,
-            CompositionState::Composing,
-            "a recoverable stall must not throw the composition away"
-        );
-        assert_eq!(
-            composition.raw_input, "mizu",
-            "the composition must be exactly the one the batch started with — \
-             the keystroke that hit the stall is dropped, the rest survives"
-        );
-        assert_eq!(composition.raw_hiragana, "みず");
-        assert_eq!(composition.preview, "水");
-        assert!(
-            composition.tip_composition.is_some(),
-            "the TSF composition must stay open"
-        );
-        drop(composition);
-        drop(text_service);
-
-        let calls = recorded_calls(&fake);
-        let clear = calls
-            .iter()
-            .position(|c| *c == IpcCall::ClearText)
-            .expect("the rebuild must clear the server's half-applied reading first");
-        let replay = calls
-            .iter()
-            .position(|c| *c == IpcCall::AppendText("mizu".to_string()))
-            .expect("the rebuild must replay the batch-start raw_input in one call");
-        assert!(
-            clear < replay,
-            "the reading must be re-established from scratch, not patched: {calls:?}"
-        );
-        assert!(
-            !calls.contains(&IpcCall::HideWindow),
-            "a recovered stall must leave the candidate window alone: {calls:?}"
-        );
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// A composition-ending batch (Enter, Escape, a mode switch) has already
-    /// committed or discarded the text on screen by the time an engine RPC
-    /// fails. Rebuilding the reading there would resurrect a composition the
-    /// user finished, so the recovery must skip straight to the teardown.
-    #[test]
-    fn ending_the_composition_does_not_rebuild_a_finished_reading() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(Candidates::default());
-        fake.lock().unwrap().engine_unavailable_for = 1;
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
-            composition.preview = "水".to_string();
-            composition.raw_input = "mizu".to_string();
-            composition.raw_hiragana = "みず".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        factory
-            .handle_action(&[ClientAction::EndComposition], CompositionState::None)
-            .expect("the swallowed server loss must not surface");
-
-        let text_service = factory.borrow().unwrap();
-        let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(composition.state, CompositionState::None);
-        assert!(
-            composition.raw_input.is_empty() && composition.preview.is_empty(),
-            "the finished composition must stay finished"
-        );
-        drop(composition);
-        drop(text_service);
-
-        assert!(
-            !recorded_calls(&fake).contains(&IpcCall::AppendText("mizu".to_string())),
-            "the reading of a committed composition must never be replayed"
-        );
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// A server crash/restart mid-composition must not wedge input. The
-    /// engine RPC comes back `ServerUnavailable` (the launcher is restarting
-    /// the crashed server, whose per-connection reading is now empty); the
-    /// client would otherwise keep its old preview/reading and append the next
-    /// keystroke onto a reading the fresh server never had. The rebuild above
-    /// is tried first and fails too, so the arm falls back to resetting the
-    /// composition to None locally — releasing the TSF composition and hiding
-    /// the candidate window — and swallows the error so the host does not also
-    /// process the key. The next keystroke then starts clean.
-    #[test]
-    fn append_resets_the_composition_when_the_server_becomes_unavailable() {
-        let _guard = global_state_lock();
-        let fake = install_fake_ipc(scripted(&["水"], "みず", &[4], &[2]));
-        // the server crashed: the next engine RPC fails as ServerUnavailable
-        fake.lock().unwrap().engine_unavailable = true;
-
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
-        let factory = factory_of(&tip);
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
-            composition.preview = "水".to_string();
-            composition.raw_input = "mizu".to_string();
-            composition.raw_hiragana = "みず".to_string();
-            composition.corresponding_count = 4;
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        // the crashing keystroke is swallowed, not surfaced as an error
-        factory
-            .handle_action(
-                &[ClientAction::AppendText("ka".to_string())],
-                CompositionState::Composing,
-            )
-            .expect("a server-loss recovery must be swallowed, not surfaced");
-
-        let text_service = factory.borrow().unwrap();
-        let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(
-            composition.state,
-            CompositionState::None,
-            "the composition must reset to None after the server was lost"
-        );
-        assert!(
-            composition.preview.is_empty()
-                && composition.suffix.is_empty()
-                && composition.raw_input.is_empty()
-                && composition.raw_hiragana.is_empty(),
-            "the stale reading must be cleared so the next keystroke starts fresh"
-        );
-        assert!(
-            composition.tip_composition.is_none(),
-            "the TSF composition handle must be released"
-        );
-        drop(composition);
-        drop(text_service);
-
-        // the candidate window was torn down (that is the still-live ui
-        // process); the conversion server was touched only by the one rebuild
-        // attempt, and the teardown after it spends no further RPC on a pipe
-        // that has already failed twice
-        let calls = recorded_calls(&fake);
-        assert!(
-            calls.contains(&IpcCall::HideWindow),
-            "the candidate window must hide on a server-loss reset: {calls:?}"
-        );
-        let hide = calls
-            .iter()
-            .position(|c| *c == IpcCall::HideWindow)
-            .expect("the teardown must have run");
-        assert!(
-            !calls[hide..].contains(&IpcCall::ClearText),
-            "the teardown must spend no further RPC on a pipe the rebuild \
-             already found dead: {calls:?}"
-        );
-        assert!(
-            !calls.contains(&IpcCall::AppendText("mizu".to_string())),
-            "the rebuild's ClearText failed, so it must not go on to replay: {calls:?}"
-        );
-
-        IMEState::get().unwrap().ipc_service = None;
-    }
-
-    /// End/Cancel teardown must clear the client state AND release the
-    /// composition even when the edit session fails partway. A host that
-    /// rejects the edit session used to abort the arm at the first `?`,
-    /// leaving raw_hiragana (and the server's reading) alive; the next
-    /// keystroke then appended to the old reading and the previous
-    /// composition's text reappeared.
-    #[test]
-    fn cancel_clears_client_state_even_when_the_edit_session_fails() {
-        let _guard = global_state_lock();
-        IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
-
-        // a host that rejects every edit session: set_text and
-        // end_composition both fail
-        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::Reject);
-        let factory = factory_of(&tip);
-
-        {
-            let text_service = factory.borrow().unwrap();
-            let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
-            composition.preview = "わたし".to_string();
-            composition.raw_input = "watashi".to_string();
-            composition.raw_hiragana = "わたし".to_string();
-            composition.corresponding_count = 7;
-            composition.tip_composition = Some(FakeComposition::new());
-        }
-
-        // the arm still surfaces the edit-session error...
-        let result =
-            factory.handle_action(&[ClientAction::CancelComposition], CompositionState::None);
-        assert!(
-            result.is_err(),
-            "a rejected edit session must still surface as an error"
-        );
-
-        // ...but only after the teardown ran
-        let text_service = factory.borrow().unwrap();
-        let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(composition.state, CompositionState::None);
-        assert!(
-            composition.raw_hiragana.is_empty()
-                && composition.raw_input.is_empty()
-                && composition.preview.is_empty(),
-            "the reading must be cleared even though the edit session failed; \
-             a stale reading made the next keystroke resurrect the old text"
-        );
-        assert!(
-            composition.tip_composition.is_none(),
-            "the dead composition handle must be released"
-        );
-
-        drop(composition);
-        drop(text_service);
-        IMEState::get().unwrap().ipc_service = None;
+    fn only_converting_actions_ask_for_the_surrounding_text() {
+        assert!(needs_context_update(&[ClientAction::AppendText(
+            "a".to_string()
+        )]));
+        assert!(needs_context_update(&[ClientAction::RemoveText]));
+        assert!(needs_context_update(&[ClientAction::ShrinkText(
+            "a".to_string()
+        )]));
+        assert!(needs_context_update(&[ClientAction::SetTextWithType(
+            SetTextType::Katakana
+        )]));
+
+        assert!(!needs_context_update(&[ClientAction::StartComposition]));
+        assert!(!needs_context_update(&[ClientAction::EndComposition]));
+        assert!(!needs_context_update(&[ClientAction::MoveCursor(-1)]));
+        assert!(!needs_context_update(&[ClientAction::SetSelection(
+            SetSelectionType::Down
+        )]));
+
+        // any converting action in the batch is enough
+        assert!(needs_context_update(&[
+            ClientAction::StartComposition,
+            ClientAction::AppendText("a".to_string()),
+        ]));
     }
 }
