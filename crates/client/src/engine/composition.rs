@@ -205,6 +205,32 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
     }
 }
 
+/// Whether a batch has to refresh the engine's view of the text surrounding
+/// the composition before it runs.
+///
+/// `update_context` is not cheap: it opens an edit session on the parent
+/// context, walks a range back over the composition and reads the document
+/// text, then sends it to the engine. It used to run on EVERY batch —
+/// candidate navigation, the MoveCursor no-op, mode switches, the teardown of
+/// a composition that is already over (issue #36).
+///
+/// Only the actions that ask the engine to CONVERT can use that context, and
+/// each of them refreshes it in its own batch, so nothing observes a stale
+/// one. `StartComposition` is not in the list because it never arrives alone:
+/// the transition table always pairs it with the keystroke that opened the
+/// composition (`transition.rs`), and that keystroke is an `AppendText`.
+fn needs_context_update(actions: &[ClientAction]) -> bool {
+    actions.iter().any(|action| {
+        matches!(
+            action,
+            ClientAction::AppendText(_)
+                | ClientAction::RemoveText
+                | ClientAction::ShrinkText(_)
+                | ClientAction::SetTextWithType(_)
+        )
+    })
+}
+
 /// Flags for `ui_update` when the whole candidate list was replaced.
 const CANDIDATES_CHANGED: u32 = TF_CLUIE_COUNT
     | TF_CLUIE_STRING
@@ -455,7 +481,9 @@ impl TextServiceFactory_Impl {
         // preview AND suffix: the caret sits after both, so a window that
         // only steps back over the preview feeds the suffix to the engine as
         // if it were text the user had already committed
-        self.update_context(&format!("{}{}", edit.preview, edit.suffix))?;
+        if needs_context_update(actions) {
+            self.update_context(&format!("{}{}", edit.preview, edit.suffix))?;
+        }
 
         // wrapped so the write-back below ALWAYS runs: an early return on a
         // failed action used to skip it, desyncing the client composition
@@ -1393,13 +1421,16 @@ mod tests {
             composition.tip_composition = Some(FakeComposition::new());
         }
 
-        // an empty batch still runs update_context, which is all this covers
+        // A converting batch, not an empty one: only those measure the
+        // context now (issue #36). update_context still runs before the
+        // actions, so the FIRST range request is the one under test — the
+        // rendering that follows makes requests of its own.
         factory
-            .handle_action(&[], CompositionState::Composing)
+            .handle_action(&[ClientAction::RemoveText], CompositionState::Composing)
             .unwrap();
 
         assert_eq!(
-            log.shift_end_reqs.borrow().last(),
+            log.shift_end_reqs.borrow().first(),
             Some(&-3),
             "preview + suffix is 3 UTF-16 units; the window must end before all of it"
         );
@@ -1484,6 +1515,79 @@ mod tests {
             composition.corresponding_count, 9,
             "all typed input elements (watashino) correspond to the shown \
              text, so a following ShrinkText must drop them all"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// Only the batches whose engine call can USE the surrounding text pay
+    /// for measuring it (issue #36).
+    ///
+    /// `update_context` opens an edit session on the parent context and reads
+    /// the document back — per batch, on the UI thread, in front of the
+    /// keystroke. Candidate navigation and the MoveCursor no-op issue no
+    /// conversion at all, so the context they measured was thrown away; worse,
+    /// with the engine down each one also paid the SetContext deadline.
+    #[test]
+    fn only_converting_batches_measure_the_surrounding_text() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(scripted(&["水", "見ず"], "みず", &[4, 4], &[2, 2]));
+
+        let log = Rc::new(RangeLog::default());
+        *log.text.borrow_mut() = "こんにちは".encode_utf16().collect();
+        let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
+        let tip = factory_with_context(context.clone());
+        let factory = factory_of(&tip);
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Previewing;
+            composition.preview = "水".to_string();
+            composition.candidates = scripted(&["水", "見ず"], "みず", &[4, 4], &[2, 2]);
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        let context_calls = |fake: &Arc<Mutex<FakeIpc>>| {
+            recorded_calls(fake)
+                .iter()
+                .filter(|c| matches!(c, IpcCall::SetContext(_)))
+                .count()
+        };
+
+        // moving the highlight converts nothing
+        factory
+            .handle_action(
+                &[ClientAction::SetSelection(SetSelectionType::Down)],
+                CompositionState::Previewing,
+            )
+            .unwrap();
+        assert_eq!(
+            context_calls(&fake),
+            0,
+            "candidate navigation must not read the document back"
+        );
+
+        // ...nor does the arrow-key no-op
+        factory
+            .handle_action(&[ClientAction::MoveCursor(-1)], CompositionState::Composing)
+            .unwrap();
+        assert_eq!(
+            context_calls(&fake),
+            0,
+            "the MoveCursor no-op must not either"
+        );
+
+        // typing does: this is the batch whose engine call reads the context
+        factory
+            .handle_action(
+                &[ClientAction::AppendText("mi".to_string())],
+                CompositionState::Composing,
+            )
+            .unwrap();
+        assert_eq!(
+            context_calls(&fake),
+            1,
+            "a conversion must be given the text it is converting after"
         );
 
         IMEState::get().unwrap().ipc_service = None;
