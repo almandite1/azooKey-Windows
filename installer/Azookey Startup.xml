@@ -27,7 +27,16 @@
          battery would kill the IME the moment a laptop is unplugged -->
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>false</StartWhenAvailable>
+    <!-- true: a logon trigger the scheduler misses (it was busy, or the
+         session was still coming up) is otherwise never retried, so the whole
+         IME stack never starts and the only symptom is that nothing converts
+         (issue #79). StartWhenAvailable runs the missed trigger as soon as it
+         can. Safe to retry: the launcher's single-instance mutex makes a
+         second start a no-op.
+         ASCII only in this file, like every comment above: the installer
+         round-trips it through an Inno AnsiString (UpdateTaskXml), and the
+         XML has no encoding declaration, so it must stay UTF-8-clean. -->
+    <StartWhenAvailable>true</StartWhenAvailable>
     <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
     <IdleSettings>
       <StopOnIdleEnd>true</StopOnIdleEnd>

@@ -10,7 +10,7 @@ use super::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
     full_width::{to_fullwidth, to_fullwidth_ascii, to_halfwidth},
     input_mode::InputMode,
-    ipc_service::{Candidates, IPCService, ServerUnavailable},
+    ipc_service::{Candidates, IPCService, is_server_unavailable},
     state::IMEState,
     text_util::{to_half_katakana, to_katakana},
     transition::{KeystrokeContext, is_modifier_key, shortcut_transition, transition},
@@ -53,13 +53,6 @@ pub struct Composition {
 
     pub state: CompositionState,
     pub tip_composition: Option<ITfComposition>,
-}
-
-/// True when `error` (or any of its causes) is a [`ServerUnavailable`] tag,
-/// i.e. an engine RPC failed because the conversion server was unreachable
-/// rather than because it rejected the request.
-fn is_server_unavailable(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<ServerUnavailable>())
 }
 
 /// Mirrors candidate entry `index` into the client-side composition

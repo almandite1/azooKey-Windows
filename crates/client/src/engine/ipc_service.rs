@@ -30,6 +30,14 @@ impl std::fmt::Display for ServerUnavailable {
 
 impl std::error::Error for ServerUnavailable {}
 
+/// True when `error` (or any of its causes) carries the [`ServerUnavailable`]
+/// tag, i.e. an engine RPC failed because the conversion server could not be
+/// reached rather than because it rejected the request. `exec` attaches the
+/// tag as the root cause under a `context`, so the whole chain is walked.
+pub fn is_server_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ServerUnavailable>())
+}
+
 // connect to kkc server
 #[derive(Debug, Clone)]
 pub struct IPCService {
@@ -197,6 +205,20 @@ impl IPCService {
         })
     }
 
+    /// `exec` for the ENGINE RPCs, which additionally records what the
+    /// outcome says about the server's reachability so the language bar can
+    /// report it (issue #79). Not used by the window RPCs: those talk to
+    /// `ui.exe`, and a dead candidate window is a different fault from a dead
+    /// conversion engine.
+    fn engine_exec<T>(
+        &self,
+        fut: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    ) -> Result<T> {
+        let result = self.exec(fut);
+        super::engine_health::record(&result);
+        result
+    }
+
     /// The wire tail shared by every candidate-window RPC: clone the window
     /// client, run one call through `exec`, and swallow any failure with a
     /// warning. Window RPCs are cosmetic — a dead or slow UI process must not
@@ -279,7 +301,7 @@ impl IPCService {
         }
 
         let mut client = self.azookey_client.clone();
-        let response = self.exec(async move {
+        let response = self.engine_exec(async move {
             client
                 .append_text(tonic::Request::new(shared::proto::AppendTextRequest {
                     text_to_append: text,
@@ -298,7 +320,7 @@ impl IPCService {
         }
 
         let mut client = self.azookey_client.clone();
-        let response = self.exec(async move {
+        let response = self.engine_exec(async move {
             client
                 .remove_text(tonic::Request::new(shared::proto::RemoveTextRequest {}))
                 .await
@@ -321,7 +343,7 @@ impl IPCService {
         }
 
         let mut client = self.azookey_client.clone();
-        self.exec(async move {
+        self.engine_exec(async move {
             client
                 .clear_text(tonic::Request::new(shared::proto::ClearTextRequest {}))
                 .await
@@ -343,7 +365,7 @@ impl IPCService {
         }
 
         let mut client = self.azookey_client.clone();
-        let response = self.exec(async move {
+        let response = self.engine_exec(async move {
             client
                 .shrink_text(tonic::Request::new(shared::proto::ShrinkTextRequest {
                     surface_offset,
@@ -364,7 +386,7 @@ impl IPCService {
         }
 
         let mut client = self.azookey_client.clone();
-        self.exec(async move {
+        self.engine_exec(async move {
             client
                 .set_context(tonic::Request::new(shared::proto::SetContextRequest {
                     context,

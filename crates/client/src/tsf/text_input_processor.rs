@@ -175,11 +175,20 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // previously activated TextService is displayed, confusing the user.
         match ipc_service::IPCService::new() {
             Ok(mut ipc_service) => {
-                // warm up the lazy connection; if the server is not running
+                // Warm up the lazy connection; if the server is not running
                 // yet this fails harmlessly and the channel reconnects on
-                // the next keystroke
+                // the next keystroke. The attempt also settles
+                // `engine_health` for the language-bar tooltip, which is the
+                // only way a user finds out the engine never started — the
+                // TIP otherwise looks perfectly healthy (issue #79).
+                //
+                // ERROR, not WARN: this is the line to look for first when
+                // the report is "it stopped converting".
                 if let Err(e) = ipc_service.append_text("".to_string()) {
-                    tracing::warn!("azookey server not reachable yet: {e}");
+                    tracing::error!(
+                        "azookey server not reachable at Activate; \
+                         conversion will not work until launcher.exe is running: {e}"
+                    );
                 }
                 IMEState::get()?.ipc_service = Some(ipc_service);
             }
