@@ -430,5 +430,18 @@ finally {
     # evidence, and it can be started by hand from Task Scheduler on the VM
     # desktop to watch the harness live. Each run unregisters it before
     # registering again, so nothing accumulates.
-    if ($session) { Remove-PSSession $session }
+    #
+    # The hang hook is NOT left behind, though. A machine-wide variable that
+    # says "hang the engine 20s after it starts" turns any later launch in
+    # the VM into a puzzling failure. The next run would clear it anyway;
+    # this just means nobody has to run one first.
+    if ($session) {
+        if ($Watchdog) {
+            Invoke-Command -Session $session -ScriptBlock {
+                [Environment]::SetEnvironmentVariable('AZOOKEY_TEST_HANG_AFTER_SECS', $null, 'Machine')
+            } -ErrorAction SilentlyContinue
+            Write-Host 'hang hook disarmed'
+        }
+        Remove-PSSession $session
+    }
 }
