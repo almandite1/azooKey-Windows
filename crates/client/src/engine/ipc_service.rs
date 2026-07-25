@@ -6,14 +6,48 @@ use std::{future::Future, sync::Arc, time::Duration};
 use tokio::time;
 use tonic::transport::Channel;
 
-/// Upper bound for a single IPC round trip. Every request is issued from the
-/// host application's UI thread via block_on, so a hung server must fail the
-/// request instead of freezing the host application forever.
-const RPC_TIMEOUT: Duration = Duration::from_secs(2);
+/// Deadlines, per kind of call. Every request is issued from the host
+/// application's UI thread via block_on, so the deadline is how long a hung
+/// process may freeze the host — one budget for all of them charged the
+/// slowest call's worst case to the fastest ones.
+///
+/// Upper bound for a call that actually converts (append/remove/shrink). The
+/// engine may run neural inference here, so this stays the generous two
+/// seconds it has always been: shortening it would fail honest conversions on
+/// slow hardware, which is a worse bug than the one being fixed.
+const CONVERSION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Upper bound for an engine call that only moves state around
+/// (clear/set-context). No dictionary or model is touched, so anything past a
+/// few milliseconds already means the server is not answering — waiting the
+/// full conversion budget would just hold the host thread longer.
+const HOUSEKEEPING_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Upper bound for a candidate-window call. These are cosmetic and several
+/// fire per keystroke, so a hung `ui.exe` must cost the typist as little as
+/// possible; the text still goes in without them.
+const WINDOW_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// How many times an IDEMPOTENT engine RPC may be issued before giving up.
+///
+/// Retrying is only sound when running the call twice is indistinguishable
+/// from running it once — `ClearText` and `SetContext` overwrite state, so
+/// they qualify; `AppendText`/`RemoveText`/`ShrinkText`/`MoveCursor` all edit
+/// the reading relative to itself and must never be replayed on their own (a
+/// resend that the first attempt actually delivered would type the keystroke
+/// twice). The whole-composition rebuild in `composition.rs` is how those
+/// recover instead: it re-establishes the reading from scratch, which is
+/// idempotent even though its parts are not.
+///
+/// Two attempts rather than more because the failure this covers is a
+/// one-shot: tonic's lazy channel notices the old pipe is gone on the call
+/// that fails and dials the restarted server on the next one.
+const IDEMPOTENT_ATTEMPTS: u32 = 2;
 
 /// Marker error meaning the conversion server could not be reached: it
 /// crashed, is restarting (the launcher supervises and relaunches it), or
-/// hung past [`RPC_TIMEOUT`]. Distinct from a server-side logic error so the
+/// hung past the deadline for its kind of call. Distinct from a server-side
+/// logic error so the
 /// composition layer can tell "the server lost my state" (reset the client
 /// composition) from "the server rejected this request" (surface as-is). The
 /// engine RPCs tag their transport/timeout failures with this; a normal RPC
@@ -29,6 +63,26 @@ impl std::fmt::Display for ServerUnavailable {
 }
 
 impl std::error::Error for ServerUnavailable {}
+
+/// Re-issues an IDEMPOTENT RPC that failed because the server was
+/// unreachable, up to [`IDEMPOTENT_ATTEMPTS`] times in total. See that
+/// constant for which RPCs may come through here and why the rest may not.
+/// Only [`ServerUnavailable`] is retried: a server-side rejection travelled
+/// over a working pipe and would be rejected again.
+///
+/// Wraps the whole call, not just the wire, so the attempt policy is part of
+/// the RPC's contract rather than an implementation detail of the transport.
+fn retry_idempotent<T>(mut call: impl FnMut() -> Result<T>) -> Result<T> {
+    for attempt in 1..IDEMPOTENT_ATTEMPTS {
+        match call() {
+            Err(error) if is_server_unavailable(&error) => {
+                tracing::warn!("idempotent IPC attempt {attempt} failed, retrying: {error:#}");
+            }
+            other => return other,
+        }
+    }
+    call()
+}
 
 /// True when `error` (or any of its causes) carries the [`ServerUnavailable`]
 /// tag, i.e. an engine RPC failed because the conversion server could not be
@@ -187,14 +241,20 @@ impl IPCService {
     /// that is not just `Unavailable`) is tagged [`ServerUnavailable`] so
     /// callers can recover the composition; a server-side status (e.g.
     /// `InvalidArgument`) is surfaced unchanged.
+    ///
+    /// On timeout the future is dropped, which cancels the tonic request: a
+    /// reply that arrives afterwards has nowhere to go and is discarded. The
+    /// SERVER may still have applied the call, so a caller that recovers must
+    /// resynchronize rather than assume the request never happened.
     fn exec<T>(
         &self,
+        deadline: Duration,
         fut: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     ) -> Result<T> {
         self.runtime.block_on(async {
-            match time::timeout(RPC_TIMEOUT, fut).await {
+            match time::timeout(deadline, fut).await {
                 Err(_) => Err(anyhow::Error::new(ServerUnavailable)
-                    .context(format!("IPC request timed out after {RPC_TIMEOUT:?}"))),
+                    .context(format!("IPC request timed out after {deadline:?}"))),
                 Ok(Err(status)) if shared::pipe::is_transport_failure(&status) => {
                     Err(anyhow::Error::new(ServerUnavailable)
                         .context(format!("IPC transport error: {status}")))
@@ -212,9 +272,10 @@ impl IPCService {
     /// conversion engine.
     fn engine_exec<T>(
         &self,
+        deadline: Duration,
         fut: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     ) -> Result<T> {
-        let result = self.exec(fut);
+        let result = self.exec(deadline, fut);
         super::engine_health::record(&result);
         result
     }
@@ -230,7 +291,7 @@ impl IPCService {
         Fut: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     {
         let client = self.window_client.clone();
-        if let Err(e) = self.exec(call(client)) {
+        if let Err(e) = self.exec(WINDOW_TIMEOUT, call(client)) {
             tracing::warn!("{name} failed: {e}");
         }
     }
@@ -254,6 +315,11 @@ pub struct FakeIpc {
     /// a crashed/restarting server (transport gone) rather than a generic
     /// error — the trigger for the composition-reset recovery path
     pub engine_unavailable: bool,
+    /// how many further engine RPCs fail with [`ServerUnavailable`] before the
+    /// server answers again. Models the fault the non-destructive rebuild
+    /// exists for — a stall or a restart the server comes back from — as
+    /// opposed to `engine_unavailable`, which never recovers.
+    pub engine_unavailable_for: u32,
 }
 
 #[cfg(test)]
@@ -274,14 +340,27 @@ pub enum IpcCall {
 
 #[cfg(test)]
 impl FakeIpc {
-    fn engine_answer(&mut self, call: IpcCall) -> anyhow::Result<Candidates> {
-        self.calls.push(call);
+    /// The failure switch every engine RPC of the fake goes through, so a
+    /// scripted outage covers `clear_text` too — the rebuild path starts with
+    /// it, and a fake that answered it while the rest of the engine was down
+    /// would never exercise a failing rebuild.
+    fn engine_outage(&mut self) -> anyhow::Result<()> {
+        if self.engine_unavailable_for > 0 {
+            self.engine_unavailable_for -= 1;
+            return Err(anyhow::Error::new(ServerUnavailable).context("fake server is stalled"));
+        }
         if self.engine_unavailable {
             return Err(anyhow::Error::new(ServerUnavailable).context("fake server unavailable"));
         }
         if self.engine_fails {
             anyhow::bail!("fake engine is down");
         }
+        Ok(())
+    }
+
+    fn engine_answer(&mut self, call: IpcCall) -> anyhow::Result<Candidates> {
+        self.calls.push(call);
+        self.engine_outage()?;
         Ok(self.scripted_candidates.clone())
     }
 }
@@ -301,7 +380,7 @@ impl IPCService {
         }
 
         let mut client = self.azookey_client.clone();
-        let response = self.engine_exec(async move {
+        let response = self.engine_exec(CONVERSION_TIMEOUT, async move {
             client
                 .append_text(tonic::Request::new(shared::proto::AppendTextRequest {
                     text_to_append: text,
@@ -320,7 +399,7 @@ impl IPCService {
         }
 
         let mut client = self.azookey_client.clone();
-        let response = self.engine_exec(async move {
+        let response = self.engine_exec(CONVERSION_TIMEOUT, async move {
             client
                 .remove_text(tonic::Request::new(shared::proto::RemoveTextRequest {}))
                 .await
@@ -329,21 +408,25 @@ impl IPCService {
         candidates_or_missing(response.composing_text)
     }
 
+    /// Idempotent: clearing an already-cleared reading lands on the same
+    /// state, so it may be retried — and it is the first half of the
+    /// whole-composition rebuild, which is worth the extra attempt.
     #[tracing::instrument(skip(self))]
     pub fn clear_text(&mut self) -> anyhow::Result<()> {
+        retry_idempotent(|| self.clear_text_once())
+    }
+
+    fn clear_text_once(&self) -> anyhow::Result<()> {
         #[cfg(test)]
         if let Some(result) = self.fake_call(|fake| {
             fake.calls.push(IpcCall::ClearText);
-            if fake.engine_fails {
-                anyhow::bail!("fake engine is down");
-            }
-            Ok(())
+            fake.engine_outage()
         }) {
             return result;
         }
 
         let mut client = self.azookey_client.clone();
-        self.engine_exec(async move {
+        self.engine_exec(HOUSEKEEPING_TIMEOUT, async move {
             client
                 .clear_text(tonic::Request::new(shared::proto::ClearTextRequest {}))
                 .await
@@ -365,7 +448,7 @@ impl IPCService {
         }
 
         let mut client = self.azookey_client.clone();
-        let response = self.engine_exec(async move {
+        let response = self.engine_exec(CONVERSION_TIMEOUT, async move {
             client
                 .shrink_text(tonic::Request::new(shared::proto::ShrinkTextRequest {
                     surface_offset,
@@ -376,7 +459,13 @@ impl IPCService {
         candidates_or_missing(response.composing_text)
     }
 
+    /// Idempotent: the context is overwritten wholesale, so a resend that the
+    /// first attempt already delivered changes nothing.
     pub fn set_context(&mut self, context: String) -> anyhow::Result<()> {
+        retry_idempotent(|| self.set_context_once(context.clone()))
+    }
+
+    fn set_context_once(&self, context: String) -> anyhow::Result<()> {
         #[cfg(test)]
         if let Some(result) = self.fake_call(|fake| {
             fake.calls.push(IpcCall::SetContext(context.clone()));
@@ -386,7 +475,7 @@ impl IPCService {
         }
 
         let mut client = self.azookey_client.clone();
-        self.engine_exec(async move {
+        self.engine_exec(HOUSEKEEPING_TIMEOUT, async move {
             client
                 .set_context(tonic::Request::new(shared::proto::SetContextRequest {
                     context,
@@ -546,6 +635,85 @@ mod tests {
             "IPCService::new must succeed without an ambient Tokio runtime \
              (channels are lazy, so no connection is attempted): {:?}",
             service.err()
+        );
+    }
+
+    /// A server that accepts the call and then never answers is the fault the
+    /// deadline exists for: `exec` runs on the host application's UI thread,
+    /// so without one the host would hang for as long as the engine does.
+    /// A future that never completes stands in for the hung server; the
+    /// deadline must turn it into `ServerUnavailable` — the tag the
+    /// composition layer recovers from — rather than waiting.
+    #[test]
+    fn a_call_that_never_answers_fails_as_unavailable_at_the_deadline() {
+        let service = IPCService::new().unwrap();
+        let deadline = Duration::from_millis(50);
+
+        let started = std::time::Instant::now();
+        let result: Result<()> = service.exec(deadline, std::future::pending());
+        let waited = started.elapsed();
+
+        let error = result.expect_err("a hung server must fail the call, not hang the host");
+        assert!(
+            is_server_unavailable(&error),
+            "a timeout must be tagged ServerUnavailable so the composition can \
+             be recovered: {error:#}"
+        );
+        assert!(
+            waited < Duration::from_secs(1),
+            "the host thread was held for {waited:?}, far past the {deadline:?} deadline"
+        );
+    }
+
+    /// The deadlines are ordered by what the call actually does, and the
+    /// ordering is the point: a cosmetic candidate-window call must not be
+    /// allowed to hold the typist for as long as a neural conversion, and
+    /// clearing a reading does no conversion work at all. Pinned here because
+    /// the values are otherwise only visible at their call sites.
+    #[test]
+    fn the_deadlines_are_ordered_by_how_much_work_the_call_does() {
+        assert!(
+            WINDOW_TIMEOUT < HOUSEKEEPING_TIMEOUT,
+            "a cosmetic window call must give up before an engine call does"
+        );
+        assert!(
+            HOUSEKEEPING_TIMEOUT < CONVERSION_TIMEOUT,
+            "state-shuffling must give up before conversion, which may run \
+             neural inference"
+        );
+        assert_eq!(
+            CONVERSION_TIMEOUT,
+            Duration::from_secs(2),
+            "the conversion budget must not shrink: honest conversions on slow \
+             hardware take seconds, and failing them would be a worse bug than \
+             the stall this deadline guards against"
+        );
+    }
+
+    /// An idempotent RPC gets a second attempt because tonic's lazy channel
+    /// only notices a dead pipe on the call that fails — the retry is what
+    /// dials the restarted server. It must be exactly one extra attempt: the
+    /// host thread is charged the deadline for each.
+    #[test]
+    fn an_idempotent_rpc_is_retried_exactly_once() {
+        let (mut service, fake) = IPCService::new_fake().unwrap();
+        // the whole outage lasts one call, so the retry is what succeeds
+        fake.lock().unwrap().engine_unavailable_for = 1;
+        service
+            .clear_text()
+            .expect("the retry must carry the call through a one-call outage");
+
+        // ...and an outage that outlives both attempts still surfaces
+        let (mut service, fake) = IPCService::new_fake().unwrap();
+        fake.lock().unwrap().engine_unavailable_for = IDEMPOTENT_ATTEMPTS;
+        let error = service
+            .clear_text()
+            .expect_err("an outage past the attempt budget must surface");
+        assert!(is_server_unavailable(&error), "{error:#}");
+        assert_eq!(
+            fake.lock().unwrap().engine_unavailable_for,
+            0,
+            "both attempts must have been spent, and no more than that"
         );
     }
 
