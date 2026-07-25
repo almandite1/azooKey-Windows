@@ -123,13 +123,22 @@ fn assign_to_child_job(child: &Child, prefix: &str) {
 static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 
 fn init_log_file() {
-    let Some(base) = env::var_os("LOCALAPPDATA") else {
+    // %LOCALAPPDATA% first, then the temp directory. The fallback is what
+    // keeps the failure path observable: a launcher whose log directory is
+    // unusable used to run with no record at all, so a missing log could not
+    // be read as "it never started" (issue #79). A log in the wrong place is
+    // strictly better than no log.
+    let localappdata = env::var_os("LOCALAPPDATA")
+        .map(|base| Path::new(&base).join("Azookey").join("logs"))
+        .filter(|dir| std::fs::create_dir_all(dir).is_ok());
+    let fallback = std::env::temp_dir().join("Azookey-logs");
+    let Some(dir) = localappdata.or_else(|| {
+        std::fs::create_dir_all(&fallback)
+            .is_ok()
+            .then_some(fallback)
+    }) else {
         return;
     };
-    let dir = Path::new(&base).join("Azookey").join("logs");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
 
     prune_old_logs(&dir);
 
@@ -190,6 +199,20 @@ fn log_err(line: &str) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_log_file();
+
+    // The first line of every session, before anything can go wrong. Without
+    // it, "no log for this boot" was ambiguous between the launcher never
+    // being started (a logon trigger that did not fire) and the launcher
+    // starting and dying before it had anything to report — and telling those
+    // apart is most of the diagnosis (issue #79).
+    log_info(&format!(
+        "azooKey launcher {} starting (pid {}, exe {})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|e| format!("<unknown: {e}>")),
+    ));
 
     // single-instance guard: the scheduled task and a manual start can race,
     // and two launchers would fight over this session's pipe names — the

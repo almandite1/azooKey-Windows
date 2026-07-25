@@ -1,5 +1,6 @@
 pub(super) mod client_action;
 pub(super) mod composition;
+pub(super) mod engine_health;
 pub(super) mod full_width;
 pub(super) mod input_mode;
 pub(super) mod ipc_service;

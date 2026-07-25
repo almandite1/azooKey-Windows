@@ -17,8 +17,8 @@ use windows::{
 
 use crate::{
     engine::{
-        client_action::ClientAction, composition::CompositionState, input_mode::InputMode,
-        theme::get_theme,
+        client_action::ClientAction, composition::CompositionState, engine_health,
+        input_mode::InputMode, theme::get_theme,
     },
     globals::{DllModule, GUID_TEXT_SERVICE, TEXTSERVICE_LANGBARITEMSINK_COOKIE},
 };
@@ -104,10 +104,22 @@ impl ITfLangBarItem_Impl for TextServiceFactory_Impl {
         Ok(())
     }
 
-    // this will be shown as a tooltip when you hover the language bar item
+    // This is shown as a tooltip when you hover the language bar item, and it
+    // is where an unreachable conversion engine gets said out loud: the icon,
+    // the mode switching and the composition all keep working when
+    // launcher.exe never started, so "nothing converts" is otherwise
+    // indistinguishable from a conversion bug (issue #79). A healthy engine
+    // has nothing to add, and returns the empty string as before.
+    //
+    // Reads the atomic in `engine_health` rather than any borrowed state:
+    // this callback arrives on hover, at a moment TSF chooses, and a tooltip
+    // must not be what fails on a re-entrant borrow.
     #[macros::anyhow]
     fn GetTooltipString(&self) -> Result<BSTR> {
-        Ok(BSTR::default())
+        Ok(match engine_health::tooltip(engine_health::get()) {
+            Some(text) => BSTR::from(text),
+            None => BSTR::default(),
+        })
     }
 }
 
@@ -219,9 +231,12 @@ mod tests {
     use windows::core::{IUnknown, Interface as _};
 
     use super::{INFO, langbar_icon_id};
+    use crate::engine::engine_health::{self, EngineHealth};
     use crate::engine::input_mode::InputMode;
     use crate::globals::TEXTSERVICE_LANGBARITEMSINK_COOKIE;
-    use crate::tsf::test_support::{EditSessionBehavior, factory_with_fake_context};
+    use crate::tsf::test_support::{
+        EditSessionBehavior, factory_with_fake_context, global_state_lock,
+    };
 
     fn langbar_source() -> (ITfTextInputProcessor, ITfSource) {
         let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
@@ -340,11 +355,40 @@ mod tests {
 
     /// Unused, but part of the interface the host may call at any time.
     #[test]
-    fn the_item_reports_no_status_and_no_tooltip() {
+    fn the_item_reports_no_status() {
         let (tip, _source) = langbar_source();
         let item = tip.cast::<ITfLangBarItem>().unwrap();
 
         assert_eq!(unsafe { item.GetStatus() }.unwrap(), 0);
+    }
+
+    /// A working engine is the quiet case: hovering the mode button must not
+    /// grow a tooltip just because the feature exists.
+    #[test]
+    fn a_reachable_engine_leaves_the_tooltip_empty() {
+        let _serialize = global_state_lock();
+        engine_health::set(EngineHealth::Reachable);
+        let (tip, _source) = langbar_source();
+        let item = tip.cast::<ITfLangBarItem>().unwrap();
+
         assert!(unsafe { item.GetTooltipString() }.unwrap().is_empty());
+    }
+
+    /// The whole point of issue #79: with the engine down, the language bar
+    /// is the one place that says so, because the icon and the mode switching
+    /// carry on looking perfectly healthy.
+    #[test]
+    fn an_unreachable_engine_is_reported_through_the_tooltip() {
+        let _serialize = global_state_lock();
+        engine_health::set(EngineHealth::Unreachable);
+        let (tip, _source) = langbar_source();
+        let item = tip.cast::<ITfLangBarItem>().unwrap();
+
+        let tooltip = unsafe { item.GetTooltipString() }.unwrap().to_string();
+
+        assert_eq!(
+            tooltip,
+            engine_health::tooltip(EngineHealth::Unreachable).unwrap()
+        );
     }
 }
