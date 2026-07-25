@@ -278,6 +278,12 @@ async fn a_long_candidate_widens_the_window() {
     let candidate = ui.candidate();
     ui.show_at(caret_with_room()).await;
 
+    // The three widths below are the constants in src/geometry.rs:
+    // MIN_CANDIDATE_WINDOW_WIDTH (225), MAX_CANDIDATE_WINDOW_WIDTH (640),
+    // and CANDIDATE_ROW_CHROME_WIDTH + n * CANDIDATE_PX_PER_CHAR in between.
+    // Spelled out rather than imported: `ui` is a bin crate, so an
+    // integration test cannot reach into it.
+
     // one short candidate: below the floor, so the window takes its minimum
     ui.set_candidates(&["水"]).await;
     let narrow = poll_until(SETTLE_TIMEOUT, || {

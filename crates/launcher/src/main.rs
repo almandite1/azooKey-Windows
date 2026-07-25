@@ -1,177 +1,24 @@
-use shared::AppConfig;
+//! The supervisor that keeps the engine and the candidate window alive.
+//!
+//! Started at logon by a scheduled task. Four concerns, one per module:
+//! [`logging`] (the session log file), [`job`] (the kill-on-close job the
+//! children are tied to), [`policy`] (the pure restart/hang decisions) and
+//! [`supervisor`] (the loop that applies them). This file is startup: the
+//! single-instance guard, the backend PATH, and the two supervisors.
+
+mod job;
+mod logging;
+mod policy;
+mod supervisor;
+
 use std::env;
-use std::io::Write as _;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
-use tonic_health::pb::HealthCheckRequest;
-use tonic_health::pb::health_client::HealthClient;
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
-use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
-};
+
+use shared::AppConfig;
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::core::{PCWSTR, w};
 
-/// give up when a child keeps crashing this many times within RESTART_WINDOW
-const MAX_RESTARTS_IN_WINDOW: usize = 5;
-const RESTART_WINDOW: Duration = Duration::from_secs(60);
-const MAX_BACKOFF: Duration = Duration::from_secs(8);
-
-// -- watchdog --
-/// how often the health of a child is checked
-const PING_INTERVAL: Duration = Duration::from_secs(10);
-/// hard deadline for a single health check
-const PING_TIMEOUT: Duration = Duration::from_secs(5);
-/// this many failures in a row (after the child was healthy once) = hung
-const MAX_CONSECUTIVE_PING_FAILURES: u32 = 3;
-/// a child that never answers a single ping gets this long before it is
-/// declared hung (covers dictionary/model loading at startup)
-const STARTUP_GRACE: Duration = Duration::from_secs(120);
-/// give up when the watchdog kills a child this many times in a row
-/// without the child ever becoming healthy in between
-const MAX_CONSECUTIVE_WATCHDOG_KILLS: u32 = 5;
-
-/// Distinguishes this component's logs from the server's and the client's in
-/// the shared directory — and so decides which ones rotation may delete. The
-/// retention policy itself is `shared::logs`.
-const LOG_PREFIX: &str = "launcher-";
-
-/// A job object with KILL_ON_JOB_CLOSE: the children are added to it, so if
-/// the launcher dies (crash or kill) instead of exiting cleanly, Windows
-/// closes the last job handle and tears the children down too. Without this,
-/// orphaned server/ui processes keep the machine-global pipe names open, and
-/// the next logon's launcher — which the single-instance mutex lets through,
-/// since it only guards launchers — burns its whole restart budget losing
-/// first_pipe_instance to the orphan.
-///
-/// The handle is deliberately leaked into a OnceLock and never closed: the
-/// job must outlive every child, i.e. live exactly as long as this process.
-static CHILD_JOB: OnceLock<JobHandle> = OnceLock::new();
-
-struct JobHandle(HANDLE);
-// the job handle is only ever passed to AssignProcessToJobObject, which is
-// thread-safe; children are assigned from the per-child supervisor tasks
-unsafe impl Send for JobHandle {}
-unsafe impl Sync for JobHandle {}
-
-/// Creates the kill-on-close job the children are assigned to. A failure is
-/// not fatal — the launcher still supervises, it just loses the guarantee
-/// that its children die with it.
-fn init_child_job() {
-    let job = unsafe {
-        match CreateJobObjectW(None, PCWSTR::null()) {
-            Ok(job) => job,
-            Err(e) => {
-                log_err(&format!(
-                    "CreateJobObject failed ({e}); children won't be tied to the launcher's lifetime"
-                ));
-                return;
-            }
-        }
-    };
-
-    let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-        BasicLimitInformation:
-            windows::Win32::System::JobObjects::JOBOBJECT_BASIC_LIMIT_INFORMATION {
-                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                ..Default::default()
-            },
-        ..Default::default()
-    };
-
-    let ok = unsafe {
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const std::ffi::c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-    };
-    if let Err(e) = ok {
-        log_err(&format!(
-            "SetInformationJobObject failed ({e}); children won't be tied to the launcher's lifetime"
-        ));
-        return;
-    }
-
-    let _ = CHILD_JOB.set(JobHandle(job));
-}
-
-/// Adds a freshly spawned child to the kill-on-close job, if the job exists.
-fn assign_to_child_job(child: &Child, prefix: &str) {
-    let Some(job) = CHILD_JOB.get() else {
-        return;
-    };
-    let Some(raw) = child.raw_handle() else {
-        log_err(&format!("{prefix} has no handle to assign to the job"));
-        return;
-    };
-    if let Err(e) = unsafe { AssignProcessToJobObject(job.0, HANDLE(raw)) } {
-        log_err(&format!("{prefix} could not be assigned to the job ({e})"));
-    }
-}
-
-// The launcher normally runs headless from the logon scheduled task, so
-// console output is lost — everything is also teed into
-// %LOCALAPPDATA%\Azookey\logs\launcher-<timestamp>-<pid>.log. This is the
-// only record of server crashes, watchdog kills, and restarts in the field.
-static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
-
-fn init_log_file() {
-    // %LOCALAPPDATA% first, then the temp directory. The fallback is what
-    // keeps the failure path observable: a launcher whose log directory is
-    // unusable used to run with no record at all, so a missing log could not
-    // be read as "it never started" (issue #79). A log in the wrong place is
-    // strictly better than no log.
-    let localappdata = shared::logs::log_dir().filter(|dir| std::fs::create_dir_all(dir).is_ok());
-    let fallback = std::env::temp_dir().join("Azookey-logs");
-    let Some(dir) = localappdata.or_else(|| {
-        std::fs::create_dir_all(&fallback)
-            .is_ok()
-            .then_some(fallback)
-    }) else {
-        return;
-    };
-
-    shared::logs::prune_old_logs(&dir, LOG_PREFIX);
-
-    let name = format!(
-        "{LOG_PREFIX}{}-{}.log",
-        chrono::Local::now().format("%Y%m%d-%H%M%S"),
-        std::process::id()
-    );
-    if let Ok(file) = std::fs::File::create(dir.join(name)) {
-        let _ = LOG_FILE.set(Mutex::new(file));
-    }
-}
-
-fn log_to_file(line: &str) {
-    if let Some(file) = LOG_FILE.get() {
-        let mut file = file.lock().unwrap_or_else(PoisonError::into_inner);
-        let _ = writeln!(
-            file,
-            "[{}] {}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-            line
-        );
-    }
-}
-
-fn log_info(line: &str) {
-    println!("{line}");
-    log_to_file(line);
-}
-
-fn log_err(line: &str) {
-    eprintln!("{line}");
-    log_to_file(line);
-}
+use logging::{init_log_file, log_err, log_info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -210,8 +57,34 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // children are added to this job so a launcher crash can't orphan them
-    init_child_job();
+    job::init_child_job();
 
+    prepend_backend_to_path()?;
+
+    // a crashed OR HUNG server would otherwise leave the IME dead in every
+    // application until re-login, so both children are supervised: exits
+    // are restarted with backoff, and a health-check watchdog kills a child
+    // that stops answering (the kill then flows into the same restart path)
+    let server_handle = tokio::spawn(supervisor::run_supervisor(
+        "azookey-server.exe",
+        "[server]",
+        shared::pipe::server_pipe(),
+    ));
+    let ui_handle = tokio::spawn(supervisor::run_supervisor(
+        "ui.exe",
+        "[ui]",
+        shared::pipe::ui_pipe(),
+    ));
+
+    let _ = server_handle.await;
+    let _ = ui_handle.await;
+
+    Ok(())
+}
+
+/// Puts the configured llama backend directory at the front of `PATH`, so
+/// each child inherits a `PATH` on which it can find the backend DLLs.
+fn prepend_backend_to_path() -> anyhow::Result<()> {
     let config = AppConfig::new();
 
     let exe_path = env::current_exe()?
@@ -228,296 +101,18 @@ async fn main() -> anyhow::Result<()> {
     let backend_path = exe_path.join(backend_dir);
     let backend_path_str = backend_path.to_string_lossy();
 
-    let mut new_path = env::var("PATH").unwrap_or_else(|_| String::new());
-    new_path = format!("{};{}", backend_path_str, new_path);
+    let existing = env::var("PATH").unwrap_or_default();
+    let new_path = format!("{};{}", backend_path_str, existing);
     // set_var is unsafe as of edition 2024: it is UB if another thread reads
     // the environment concurrently. Sound here — this runs before either
-    // tokio::spawn below, so the only other threads in the process are the
+    // tokio::spawn in main, so the only other threads in the process are the
     // runtime's idle workers, which never touch the environment while parked.
     // The later reads that matter (each child Command inheriting this PATH so
     // it can find the llama backend DLLs) happen on tasks spawned after this
     // point, and the spawn supplies the happens-before edge.
     unsafe { env::set_var("PATH", &new_path) };
 
-    // a crashed OR HUNG server would otherwise leave the IME dead in every
-    // application until re-login, so both children are supervised: exits
-    // are restarted with backoff, and a health-check watchdog kills a child
-    // that stops answering (the kill then flows into the same restart path)
-    let server_handle = tokio::spawn(run_supervisor(
-        "azookey-server.exe",
-        "[server]",
-        shared::pipe::server_pipe(),
-    ));
-    let ui_handle = tokio::spawn(run_supervisor("ui.exe", "[ui]", shared::pipe::ui_pipe()));
-
-    let _ = server_handle.await;
-    let _ = ui_handle.await;
-
     Ok(())
-}
-
-/// Runs one child's supervisor and, if it gives up, ends the whole launcher.
-///
-/// If a supervisor gives up (spawn failure, or a crash/hang loop that blew
-/// its budget) the IME is dead until something restarts it — but the
-/// single-instance mutex is held for as long as this launcher lives, so a
-/// manual relaunch would just exit immediately. Exiting the process releases
-/// that mutex (letting a fresh launch recover) and, via the job's
-/// KILL_ON_JOB_CLOSE, tears down the other child so it can't linger and hold
-/// the pipe names.
-async fn run_supervisor(exe: &'static str, prefix: &'static str, pipe_name: String) {
-    if supervise(exe, prefix, &pipe_name).await == SuperviseOutcome::GaveUp {
-        log_err(&format!(
-            "{prefix} is unrecoverable; exiting the launcher so a fresh start can take over"
-        ));
-        std::process::exit(1);
-    }
-}
-
-/// Why a supervisor loop stopped.
-#[derive(Debug, PartialEq, Eq)]
-enum SuperviseOutcome {
-    /// The child exited cleanly and on purpose. Nothing to recover. (The
-    /// UIAccess re-exec no longer takes this path: the spawned ui.exe stays
-    /// alive as a shim that mirrors the UIAccess child's exit code, so this
-    /// supervisor keeps covering the process that actually draws the UI.)
-    Exited,
-    /// The child is unrecoverable — spawn failure, or a crash/hang loop that
-    /// exhausted the restart budget. The launcher should stand down.
-    GaveUp,
-}
-
-/// Keeps a child process running: restarts it when it exits abnormally or
-/// stops answering health checks, with exponential backoff, and gives up on
-/// a tight crash/hang loop.
-async fn supervise(exe: &'static str, prefix: &'static str, pipe_name: &str) -> SuperviseOutcome {
-    let mut policy = RestartPolicy::new();
-
-    loop {
-        let Some(mut child) = start_process(exe, prefix) else {
-            // spawn failure (e.g. missing binary) won't fix itself
-            log_err(&format!("{prefix} could not be started; giving up"));
-            return SuperviseOutcome::GaveUp;
-        };
-
-        let started_at = Instant::now();
-        let saw_healthy = Arc::new(AtomicBool::new(false));
-
-        let hung = tokio::select! {
-            status = child.wait() => {
-                match status {
-                    Ok(s) if s.success() => {
-                        log_info(&format!("{prefix} exited normally"));
-                        return SuperviseOutcome::Exited;
-                    }
-                    Ok(s) => {
-                        log_err(&format!("{prefix} exited abnormally: {s}"));
-                        false
-                    }
-                    Err(e) => {
-                        // can't observe the child anymore: treat as
-                        // unrecoverable rather than spin-restarting blind
-                        log_err(&format!("{prefix} wait failed: {e}"));
-                        return SuperviseOutcome::GaveUp;
-                    }
-                }
-            }
-            _ = watchdog(pipe_name, prefix, saw_healthy.clone()) => {
-                log_err(&format!("{prefix} stopped answering health checks; killing it"));
-                // tokio's kill() forces termination and reaps the child
-                if let Err(e) = child.kill().await {
-                    log_err(&format!("{prefix} kill failed: {e}"));
-                }
-                true
-            }
-        };
-
-        let backoff = match policy.on_child_stopped(
-            hung,
-            saw_healthy.load(Ordering::SeqCst),
-            started_at.elapsed(),
-            Instant::now(),
-        ) {
-            RestartDecision::GiveUpHangLoop => {
-                log_err(&format!(
-                    "{prefix} was killed by the watchdog {MAX_CONSECUTIVE_WATCHDOG_KILLS} times without ever becoming healthy; giving up"
-                ));
-                return SuperviseOutcome::GaveUp;
-            }
-            RestartDecision::GiveUpCrashLoop => {
-                log_err(&format!(
-                    "{prefix} crashed {MAX_RESTARTS_IN_WINDOW} times within {RESTART_WINDOW:?}; giving up"
-                ));
-                return SuperviseOutcome::GaveUp;
-            }
-            RestartDecision::RetryAfter(backoff) => backoff,
-        };
-
-        log_err(&format!("{prefix} restarting in {backoff:?}"));
-        tokio::time::sleep(backoff).await;
-    }
-}
-
-/// What to do after a child stopped.
-#[derive(Debug, PartialEq, Eq)]
-enum RestartDecision {
-    /// Wait this long, then start the child again.
-    RetryAfter(Duration),
-    /// The watchdog killed the child over and over and it never became
-    /// healthy in between.
-    GiveUpHangLoop,
-    /// The child crashed too often inside the crash window.
-    GiveUpCrashLoop,
-}
-
-/// Pure restart policy, separated from I/O for unit testing — the same shape
-/// as `WatchdogPolicy` below. Everything the decision needs (whether the
-/// watchdog killed the child, whether it was ever healthy, how long it ran,
-/// and the current time) is passed in.
-struct RestartPolicy {
-    /// When the child was restarted, within the crash window.
-    recent_restarts: Vec<Instant>,
-    backoff: Duration,
-    consecutive_watchdog_kills: u32,
-}
-
-impl RestartPolicy {
-    fn new() -> Self {
-        Self {
-            recent_restarts: Vec::new(),
-            backoff: Duration::from_secs(1),
-            consecutive_watchdog_kills: 0,
-        }
-    }
-
-    fn on_child_stopped(
-        &mut self,
-        hung: bool,
-        saw_healthy: bool,
-        ran_for: Duration,
-        now: Instant,
-    ) -> RestartDecision {
-        // a hang loop is slower than the 60s crash window (detection alone
-        // takes ~45s), so count watchdog kills separately: reaching a
-        // healthy state is what proves a restart was worthwhile
-        if hung && !saw_healthy {
-            self.consecutive_watchdog_kills += 1;
-            if self.consecutive_watchdog_kills >= MAX_CONSECUTIVE_WATCHDOG_KILLS {
-                return RestartDecision::GiveUpHangLoop;
-            }
-        } else if saw_healthy {
-            self.consecutive_watchdog_kills = 0;
-        }
-
-        // a stable AND healthy stretch resets the backoff — "alive for a
-        // minute" alone would also match a server that hangs right away
-        if ran_for >= RESTART_WINDOW && saw_healthy {
-            self.backoff = Duration::from_secs(1);
-            self.recent_restarts.clear();
-        }
-
-        self.recent_restarts
-            .retain(|t| now.duration_since(*t) < RESTART_WINDOW);
-        if self.recent_restarts.len() >= MAX_RESTARTS_IN_WINDOW {
-            return RestartDecision::GiveUpCrashLoop;
-        }
-        self.recent_restarts.push(now);
-
-        let backoff = self.backoff;
-        self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
-        RestartDecision::RetryAfter(backoff)
-    }
-}
-
-/// Resolves only when the peer is declared hung. Sets `saw_healthy` as soon
-/// as one health check succeeds.
-async fn watchdog(pipe_name: &str, prefix: &'static str, saw_healthy: Arc<AtomicBool>) {
-    let Ok(channel) = shared::pipe::lazy_pipe_channel(pipe_name.to_string()) else {
-        // cannot even build a channel: run without hang detection rather
-        // than killing a possibly-fine child
-        log_err(&format!(
-            "watchdog for {pipe_name} disabled: failed to build channel"
-        ));
-        std::future::pending::<()>().await;
-        unreachable!();
-    };
-    let mut client = HealthClient::new(channel);
-    let mut policy = WatchdogPolicy::new(Instant::now());
-
-    loop {
-        tokio::time::sleep(PING_INTERVAL).await;
-
-        // healthy = the RPC answered in time AND reports SERVING; the UI
-        // flips itself to NOT_SERVING when its event loop stalls
-        let ok = matches!(
-            tokio::time::timeout(
-                PING_TIMEOUT,
-                client.check(HealthCheckRequest {
-                    service: String::new(),
-                }),
-            )
-            .await,
-            Ok(Ok(response))
-                if response.get_ref().status
-                    == tonic_health::pb::health_check_response::ServingStatus::Serving as i32
-        );
-
-        if ok && !saw_healthy.swap(true, Ordering::SeqCst) {
-            log_info(&format!("{prefix} health check ok"));
-        }
-
-        if policy.on_ping_result(ok, Instant::now()) == Verdict::Hung {
-            return;
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Verdict {
-    Healthy,
-    Hung,
-}
-
-/// Pure hang-detection policy, separated from I/O for unit testing.
-struct WatchdogPolicy {
-    started_at: Instant,
-    ever_succeeded: bool,
-    consecutive_failures: u32,
-}
-
-impl WatchdogPolicy {
-    fn new(now: Instant) -> Self {
-        Self {
-            started_at: now,
-            ever_succeeded: false,
-            consecutive_failures: 0,
-        }
-    }
-
-    fn on_ping_result(&mut self, ok: bool, now: Instant) -> Verdict {
-        if ok {
-            self.ever_succeeded = true;
-            self.consecutive_failures = 0;
-            return Verdict::Healthy;
-        }
-
-        if !self.ever_succeeded {
-            // startup grace: the pipe does not even exist while the child
-            // is loading its dictionary/model, so failures don't count —
-            // but a child that NEVER comes up is itself a hang
-            if now.duration_since(self.started_at) <= STARTUP_GRACE {
-                return Verdict::Healthy;
-            }
-            return Verdict::Hung;
-        }
-
-        self.consecutive_failures += 1;
-        if self.consecutive_failures >= MAX_CONSECUTIVE_PING_FAILURES {
-            Verdict::Hung
-        } else {
-            Verdict::Healthy
-        }
-    }
 }
 
 /// Returns true when another process already owns the named mutex.
@@ -530,104 +125,9 @@ fn another_instance_running(name: PCWSTR) -> windows::core::Result<bool> {
     }
 }
 
-fn start_process(exe: &str, prefix: &str) -> Option<Child> {
-    // Resolve the child against the launcher's OWN directory instead of
-    // relying on CreateProcess's search order, which also consults PATH — and
-    // the backend directory (llama_*) is prepended to PATH. Fall back to the
-    // bare name if the launcher path can't be determined.
-    let resolved = env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|dir| dir.join(exe)));
-    let mut command = match &resolved {
-        Some(path) => Command::new(path),
-        None => Command::new(exe),
-    };
-
-    let mut child = match command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            log_err(&format!("Failed to start {}: {}", exe, e));
-            return None;
-        }
-    };
-
-    // tie the child to the launcher's lifetime before anything else, so a
-    // launcher crash in the next instant still can't orphan it
-    assign_to_child_job(&child, prefix);
-
-    if let Some(stdout) = child.stdout.take() {
-        let prefix = prefix.to_string();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                log_info(&format!("{}: {}", prefix, line));
-            }
-        });
-    }
-
-    if let Some(stderr) = child.stderr.take() {
-        let prefix = prefix.to_string();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                log_err(&format!("{}: {}", prefix, line));
-            }
-        });
-    }
-
-    Some(child)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn at(base: Instant, secs: u64) -> Instant {
-        base + Duration::from_secs(secs)
-    }
-
-    /// The rotation itself is tested in `shared::logs`; what belongs here is
-    /// that the launcher asks for ITS OWN prefix. A wrong one would rotate
-    /// away another component's logs and never its own.
-    #[test]
-    fn the_launcher_rotates_only_launcher_logs() {
-        let dir = std::env::temp_dir().join(format!("azk-prune-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        for day in 1..=12 {
-            std::fs::write(
-                dir.join(format!("{LOG_PREFIX}202601{day:02}-000000-1.log")),
-                "x",
-            )
-            .unwrap();
-            std::fs::write(dir.join(format!("server-202601{day:02}-000000-1.log")), "x").unwrap();
-        }
-
-        shared::logs::prune_old_logs(&dir, LOG_PREFIX);
-
-        let names = |prefix: &str| {
-            let mut names: Vec<String> = std::fs::read_dir(&dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.starts_with(prefix))
-                .collect();
-            names.sort();
-            names
-        };
-
-        let remaining = names(LOG_PREFIX);
-        // room is left for the new session's file: 12 -> MAX_LOG_FILES - 1
-        assert_eq!(remaining.len(), shared::logs::MAX_LOG_FILES - 1);
-        assert!(remaining[0].contains("20260104"), "kept {remaining:?}");
-        assert_eq!(names("server-").len(), 12, "another component's logs stay");
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
 
     #[test]
     fn second_mutex_holder_detects_the_first() {
@@ -637,299 +137,5 @@ mod tests {
         // the first handle is still open in this process, so a second
         // acquisition sees ERROR_ALREADY_EXISTS — same as a second process
         assert!(another_instance_running(name).unwrap());
-    }
-
-    #[test]
-    fn failures_during_startup_grace_are_not_counted() {
-        let base = Instant::now();
-        let mut policy = WatchdogPolicy::new(base);
-
-        for i in 1..=10 {
-            assert_eq!(
-                policy.on_ping_result(false, at(base, i * 10)),
-                Verdict::Healthy,
-                "failure at {}s should be within grace",
-                i * 10
-            );
-        }
-    }
-
-    #[test]
-    fn never_becoming_healthy_past_grace_is_hung() {
-        let base = Instant::now();
-        let mut policy = WatchdogPolicy::new(base);
-
-        assert_eq!(policy.on_ping_result(false, at(base, 60)), Verdict::Healthy);
-        assert_eq!(policy.on_ping_result(false, at(base, 121)), Verdict::Hung);
-    }
-
-    #[test]
-    fn hang_needs_consecutive_failures_after_health() {
-        let base = Instant::now();
-        let mut policy = WatchdogPolicy::new(base);
-
-        assert_eq!(policy.on_ping_result(true, at(base, 10)), Verdict::Healthy);
-        assert_eq!(policy.on_ping_result(false, at(base, 20)), Verdict::Healthy);
-        assert_eq!(policy.on_ping_result(false, at(base, 30)), Verdict::Healthy);
-        assert_eq!(policy.on_ping_result(false, at(base, 40)), Verdict::Hung);
-    }
-
-    #[test]
-    fn one_success_resets_the_failure_streak() {
-        let base = Instant::now();
-        let mut policy = WatchdogPolicy::new(base);
-
-        assert_eq!(policy.on_ping_result(true, at(base, 10)), Verdict::Healthy);
-        assert_eq!(policy.on_ping_result(false, at(base, 20)), Verdict::Healthy);
-        assert_eq!(policy.on_ping_result(false, at(base, 30)), Verdict::Healthy);
-        // recovers just in time
-        assert_eq!(policy.on_ping_result(true, at(base, 40)), Verdict::Healthy);
-        assert_eq!(policy.on_ping_result(false, at(base, 50)), Verdict::Healthy);
-        assert_eq!(policy.on_ping_result(false, at(base, 60)), Verdict::Healthy);
-        assert_eq!(policy.on_ping_result(false, at(base, 70)), Verdict::Hung);
-    }
-
-    #[test]
-    fn success_after_grace_still_arms_normally() {
-        let base = Instant::now();
-        let mut policy = WatchdogPolicy::new(base);
-
-        // slow startup, first success arrives after the grace window would
-        // have expired for failures
-        assert_eq!(
-            policy.on_ping_result(false, at(base, 100)),
-            Verdict::Healthy
-        );
-        assert_eq!(policy.on_ping_result(true, at(base, 110)), Verdict::Healthy);
-        assert_eq!(
-            policy.on_ping_result(false, at(base, 200)),
-            Verdict::Healthy
-        );
-        assert_eq!(
-            policy.on_ping_result(false, at(base, 210)),
-            Verdict::Healthy
-        );
-        assert_eq!(policy.on_ping_result(false, at(base, 220)), Verdict::Hung);
-    }
-
-    /// A crash: the child exited on its own (not killed by the watchdog) and
-    /// never answered a ping.
-    fn crashed(policy: &mut RestartPolicy, now: Instant) -> RestartDecision {
-        policy.on_child_stopped(false, false, Duration::from_secs(1), now)
-    }
-
-    #[test]
-    fn the_backoff_doubles_and_stops_at_the_cap() {
-        let base = Instant::now();
-        let mut policy = RestartPolicy::new();
-
-        // one restart per crash window, so the crash budget never fills and
-        // only the backoff is under test
-        let delays: Vec<Duration> = (0..6)
-            .map(|i| match crashed(&mut policy, at(base, i * 61)) {
-                RestartDecision::RetryAfter(delay) => delay,
-                other => panic!("expected a retry, got {other:?}"),
-            })
-            .collect();
-
-        assert_eq!(
-            delays,
-            vec![
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(4),
-                Duration::from_secs(8),
-                MAX_BACKOFF,
-                MAX_BACKOFF,
-            ]
-        );
-        assert_eq!(MAX_BACKOFF, Duration::from_secs(8), "the cap is 8s");
-    }
-
-    /// The crash budget: the fifth crash inside the window is the one that
-    /// stands the launcher down, because four restarts are already on record.
-    #[test]
-    fn crashing_the_budget_away_inside_the_window_gives_up() {
-        let base = Instant::now();
-        let mut policy = RestartPolicy::new();
-
-        for i in 0..MAX_RESTARTS_IN_WINDOW {
-            assert!(
-                matches!(
-                    crashed(&mut policy, at(base, i as u64)),
-                    RestartDecision::RetryAfter(_)
-                ),
-                "restart {i} is still within budget"
-            );
-        }
-
-        assert_eq!(
-            crashed(&mut policy, at(base, MAX_RESTARTS_IN_WINDOW as u64)),
-            RestartDecision::GiveUpCrashLoop
-        );
-    }
-
-    /// Restarts age out of the window: a child that crashes once a minute
-    /// forever is unhealthy but recoverable, and the launcher must keep
-    /// restarting it.
-    #[test]
-    fn restarts_older_than_the_window_are_not_counted() {
-        let base = Instant::now();
-        let mut policy = RestartPolicy::new();
-
-        for i in 0..20 {
-            assert!(
-                matches!(
-                    crashed(&mut policy, at(base, i * 61)),
-                    RestartDecision::RetryAfter(_)
-                ),
-                "the crash at {}s stands alone in its window",
-                i * 61
-            );
-        }
-    }
-
-    /// A restart exactly RESTART_WINDOW old is already out (`<`), so five
-    /// crashes spread over just more than the window are survivable.
-    #[test]
-    fn a_restart_exactly_a_window_old_has_aged_out() {
-        let base = Instant::now();
-        let mut policy = RestartPolicy::new();
-
-        for i in 0..MAX_RESTARTS_IN_WINDOW {
-            crashed(&mut policy, at(base, i as u64));
-        }
-        // the first restart is now exactly RESTART_WINDOW old
-        assert!(matches!(
-            crashed(&mut policy, base + RESTART_WINDOW),
-            RestartDecision::RetryAfter(_)
-        ));
-    }
-
-    /// Stable AND healthy: a child that ran out the window and answered at
-    /// least one ping earned a clean slate.
-    #[test]
-    fn a_stable_healthy_run_resets_the_backoff_and_the_budget() {
-        let base = Instant::now();
-        let mut policy = RestartPolicy::new();
-
-        for i in 0..3 {
-            crashed(&mut policy, at(base, i));
-        }
-
-        let decision = policy.on_child_stopped(false, true, RESTART_WINDOW, at(base, 100));
-
-        assert_eq!(
-            decision,
-            RestartDecision::RetryAfter(Duration::from_secs(1))
-        );
-        // and the budget went with it: four more crashes still fit
-        for i in 0..MAX_RESTARTS_IN_WINDOW - 1 {
-            assert!(matches!(
-                crashed(&mut policy, at(base, 101 + i as u64)),
-                RestartDecision::RetryAfter(_)
-            ));
-        }
-    }
-
-    /// The reason the reset needs both halves: a server that comes up and
-    /// hangs immediately can stay "alive" for hours without ever serving a
-    /// conversion, and resetting on uptime alone would let it restart forever.
-    #[test]
-    fn a_long_run_that_was_never_healthy_does_not_reset_the_backoff() {
-        let base = Instant::now();
-        let mut policy = RestartPolicy::new();
-
-        crashed(&mut policy, at(base, 0));
-        let decision = policy.on_child_stopped(false, false, RESTART_WINDOW * 10, at(base, 61));
-
-        assert_eq!(
-            decision,
-            RestartDecision::RetryAfter(Duration::from_secs(2)),
-            "the backoff must keep growing"
-        );
-    }
-
-    /// Hang detection takes ~45s per round, so a hang loop never fills the
-    /// 60s crash window — hence its own counter.
-    #[test]
-    fn five_watchdog_kills_without_a_healthy_run_give_up() {
-        let base = Instant::now();
-        let mut policy = RestartPolicy::new();
-
-        for i in 0..MAX_CONSECUTIVE_WATCHDOG_KILLS - 1 {
-            assert!(
-                matches!(
-                    policy.on_child_stopped(
-                        true,
-                        false,
-                        Duration::from_secs(45),
-                        at(base, i as u64 * 100)
-                    ),
-                    RestartDecision::RetryAfter(_)
-                ),
-                "kill {i} is still within budget"
-            );
-        }
-
-        assert_eq!(
-            policy.on_child_stopped(
-                true,
-                false,
-                Duration::from_secs(45),
-                at(base, MAX_CONSECUTIVE_WATCHDOG_KILLS as u64 * 100)
-            ),
-            RestartDecision::GiveUpHangLoop
-        );
-    }
-
-    /// A kill that followed a healthy stretch is not part of a hang loop: the
-    /// restart did produce a working engine, so the streak starts over.
-    #[test]
-    fn a_healthy_run_resets_the_watchdog_kill_streak() {
-        let base = Instant::now();
-        let mut policy = RestartPolicy::new();
-
-        for i in 0..MAX_CONSECUTIVE_WATCHDOG_KILLS - 1 {
-            policy.on_child_stopped(
-                true,
-                false,
-                Duration::from_secs(45),
-                at(base, i as u64 * 100),
-            );
-        }
-        // this one served requests before it hung
-        policy.on_child_stopped(true, true, Duration::from_secs(45), at(base, 1000));
-
-        // so the counter starts from zero again rather than tripping here
-        assert!(matches!(
-            policy.on_child_stopped(true, false, Duration::from_secs(45), at(base, 1100)),
-            RestartDecision::RetryAfter(_)
-        ));
-    }
-
-    /// The hang counter is not touched by ordinary crashes, and the crash
-    /// budget is what catches those.
-    #[test]
-    fn a_crash_neither_advances_nor_resets_the_watchdog_kill_streak() {
-        let base = Instant::now();
-        let mut policy = RestartPolicy::new();
-
-        for i in 0..MAX_CONSECUTIVE_WATCHDOG_KILLS - 1 {
-            policy.on_child_stopped(
-                true,
-                false,
-                Duration::from_secs(45),
-                at(base, i as u64 * 100),
-            );
-        }
-        // a plain crash in between: never healthy, but not a watchdog kill
-        crashed(&mut policy, at(base, 900));
-
-        assert_eq!(
-            policy.on_child_stopped(true, false, Duration::from_secs(45), at(base, 1000)),
-            RestartDecision::GiveUpHangLoop,
-            "the streak is unbroken"
-        );
     }
 }

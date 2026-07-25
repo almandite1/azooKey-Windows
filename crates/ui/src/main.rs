@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 use azookey_server::TonicNamedPipeServer;
 use ipc::{WindowAction, WindowController, WindowService};
 use shared::proto::window_service_server::WindowServiceServer;
-use tao::dpi::LogicalSize;
+use tao::event_loop::EventLoopProxy;
 use tao::platform::windows::EventLoopBuilderExtWindows;
+use tao::window::Window;
 use tao::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
@@ -14,13 +15,16 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use uiaccess::prepare_uiaccess_token;
-use wry::WebContext;
+use wry::{WebContext, WebView};
 
 pub mod candidate;
+pub mod geometry;
 pub mod indicator;
 pub mod ipc;
+pub mod placement;
+pub mod startup;
 pub mod uiaccess;
-pub mod utils;
+pub mod webview;
 pub mod window;
 pub mod window_actions;
 
@@ -38,10 +42,97 @@ pub enum UserEvent {
 }
 
 /// Where WebView2 keeps its profile (issue #54). The decision itself lives
-/// in `utils::webview2_data_dir_in` so it can be tested without the
+/// in `startup::webview2_data_dir_in` so it can be tested without the
 /// environment; this only resolves the root.
 fn webview2_data_dir() -> std::path::PathBuf {
-    utils::webview2_data_dir_in(shared::local_data_root())
+    startup::webview2_data_dir_in(shared::local_data_root())
+}
+
+/// `evaluate_script`, with the failure logged. Every call in the event loop
+/// wants exactly this: there is no recovery from a webview that will not run
+/// a script, and dropping the update is better than tearing the loop down.
+fn eval(webview: &WebView, script: &str) {
+    if let Err(e) = webview.evaluate_script(script) {
+        eprintln!("evaluate_script failed: {e}");
+    }
+}
+
+/// Everything the event loop does with a [`UserEvent`].
+///
+/// Extracted from the `match` arm it used to be so `event_loop.run`'s closure
+/// stays a dispatcher: the arms had grown to hold the B20 logical-size rule
+/// and two of the issue-#59 gate releases inline.
+#[allow(clippy::too_many_arguments)]
+fn handle_user_event(
+    event: UserEvent,
+    candidate_window: &Window,
+    candidate_webview: &WebView,
+    indicator_window: &Window,
+    indicator_webview: &WebView,
+    indicator_flash: &Arc<Mutex<Option<JoinHandle<()>>>>,
+    proxy: &EventLoopProxy<UserEvent>,
+    placement: &mut placement::CandidatePlacement,
+    last_beat: &std::sync::Mutex<Instant>,
+) {
+    match event {
+        UserEvent::UpdateCandidates(candidates) => eval(
+            candidate_webview,
+            &webview::update_candidates_script(&candidates),
+        ),
+        UserEvent::UpdateSelection(index) => {
+            eval(candidate_webview, &webview::update_selection_script(index))
+        }
+        UserEvent::UpdateInputMethod(input_method) => eval(
+            indicator_webview,
+            &webview::update_input_method_script(&input_method),
+        ),
+        UserEvent::UpdateHeight(height) => {
+            // a taller list can now overflow the work-area bottom (or flip
+            // and overflow the top); resize_candidate re-clamps for the size
+            // the window is GOING to have (issue #3)
+            window_actions::resize_candidate(
+                candidate_window,
+                None,
+                Some(height as f64),
+                &placement.caret,
+            );
+
+            // the window is now the size it is going to be, so a Show that
+            // was waiting on the measurement can be honoured (issue #59)
+            if placement.on_height() {
+                window_actions::show_candidate(candidate_window);
+            }
+        }
+        UserEvent::ShowDeadline => {
+            // the position never came (a host that reports no layout for the
+            // range). Candidates in a stale spot still beat no candidates at
+            // all (issue #59).
+            if placement.on_deadline() {
+                window_actions::show_candidate(candidate_window);
+            }
+        }
+        UserEvent::Heartbeat => {
+            // test hook: simulate a stalled event loop (inert unless the env
+            // var is set)
+            if std::env::var_os("AZOOKEY_TEST_BLOCK_EVENT_LOOP").is_some() {
+                eprintln!("TEST MODE: blocking the event loop now");
+                std::thread::sleep(std::time::Duration::MAX);
+            }
+            *last_beat
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
+        }
+        UserEvent::WindowAction(action) => {
+            window_actions::handle_window_action(
+                action,
+                candidate_window,
+                indicator_window,
+                indicator_flash,
+                proxy,
+                placement,
+            );
+        }
+    }
 }
 
 /// how often the event loop's liveness is probed
@@ -69,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel(32);
     let window_controller = WindowController::new(tx.clone());
     // who the visible window belongs to; shared with the disconnect watcher
-    let show_owner = Arc::new(std::sync::Mutex::new(utils::ShowOwner::default()));
+    let show_owner = Arc::new(std::sync::Mutex::new(placement::ShowOwner::default()));
     let grpc_service = WindowService {
         controller: window_controller.clone(),
         show_owner: show_owner.clone(),
@@ -83,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
     // normally the session's own name; `--pipe-base` lets the display tests
     // run a second ui.exe beside the installed one (see the function's note on
     // why only this end honours an override)
-    let pipe_base = utils::pipe_base_from_args(std::env::args().skip(1))
+    let pipe_base = startup::pipe_base_from_args(std::env::args().skip(1))
         .unwrap_or_else(shared::pipe::ui_pipe_base);
     let incoming = TonicNamedPipeServer::with_disconnect_notify(&pipe_base, disconnect_tx)?;
     // health service for the launcher's watchdog. The reported status
@@ -145,13 +236,14 @@ async fn main() -> anyhow::Result<()> {
     let candidate_webview = candidate_webview_builder
         .with_devtools(true)
         .with_ipc_handler(move |message| {
-            if let Ok(message) = serde_json::from_str::<serde_json::Value>(message.body())
-                && let Some(type_value) = message.get("type")
-                && type_value == "resize"
-                && let Some(height) = message.get("height")
-            {
-                let height = height.as_f64().unwrap_or(0.0);
-                let _ = proxy_clone.send_event(UserEvent::UpdateHeight(height as i32));
+            match webview::parse_webview_message(message.body()) {
+                Some(webview::WebviewMessage::Resize { height }) => {
+                    let _ = proxy_clone.send_event(UserEvent::UpdateHeight(height as i32));
+                }
+                // A message we cannot read is a silent failure: the very
+                // first Show waits 120 ms for a height that never arrives
+                // and then shows the window anyway (issue #59). Say so.
+                None => eprintln!("unparsable webview message: {}", message.body()),
             }
         })
         .build(&candidate_window)?;
@@ -211,7 +303,7 @@ async fn main() -> anyhow::Result<()> {
     // reported (kept so resizes can re-clamp the grown window into the work
     // area, issue #3) plus whether that rect belongs to the composition being
     // shown (issue #59)
-    let mut placement = utils::CandidatePlacement::default();
+    let mut placement = placement::CandidatePlacement::default();
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -244,88 +336,17 @@ async fn main() -> anyhow::Result<()> {
                 // without a candidate window. The launcher owns ui.exe's
                 // lifecycle and tears it down via the job object when needed.
             }
-            Event::UserEvent(script) => match script {
-                UserEvent::UpdateCandidates(candidates) => {
-                    if let Err(e) = candidate_webview
-                        .evaluate_script(&format!("updateCandidates({})", candidates))
-                    {
-                        eprintln!("evaluate_script failed: {e}");
-                    }
-                }
-                UserEvent::UpdateSelection(index) => {
-                    if let Err(e) =
-                        candidate_webview.evaluate_script(&format!("updateSelection({})", index))
-                    {
-                        eprintln!("evaluate_script failed: {e}");
-                    }
-                }
-                UserEvent::UpdateInputMethod(input_method) => {
-                    // quoted and escaped through serde_json (see the function's
-                    // comment): the mode string is untrusted RPC input
-                    if let Err(e) = indicator_webview
-                        .evaluate_script(&utils::update_input_method_script(&input_method))
-                    {
-                        eprintln!("evaluate_script failed: {e}");
-                    }
-                }
-                UserEvent::UpdateHeight(height) => {
-                    // the webview reports CSS px (logical); the width must be
-                    // logical too. Feeding the PHYSICAL inner width into a
-                    // LogicalSize grew the window by the scale factor on
-                    // every resize at high DPI (B20).
-                    let scale = candidate_window.scale_factor();
-                    let width = candidate_window.inner_size().to_logical::<f64>(scale).width;
-                    let new_size = LogicalSize::new(width, height as f64);
-                    candidate_window.set_inner_size(new_size);
-
-                    // a taller list can now overflow the work-area bottom (or
-                    // flip and overflow the top); re-clamp for the size the
-                    // window is GOING to have (issue #3)
-                    let physical = new_size.to_physical::<i32>(scale);
-                    window_actions::reposition_candidate(
-                        &candidate_window,
-                        &placement.caret,
-                        physical.width,
-                        physical.height,
-                    );
-
-                    // the window is now the size it is going to be, so a Show
-                    // that was waiting on the measurement can be honoured
-                    // (issue #59)
-                    if placement.on_height() {
-                        window_actions::show_candidate(&candidate_window);
-                    }
-                }
-                UserEvent::ShowDeadline => {
-                    // the position never came (a host that reports no layout
-                    // for the range). Candidates in a stale spot still beat
-                    // no candidates at all (issue #59).
-                    if placement.on_deadline() {
-                        window_actions::show_candidate(&candidate_window);
-                    }
-                }
-                UserEvent::Heartbeat => {
-                    // test hook: simulate a stalled event loop (inert unless
-                    // the env var is set)
-                    if std::env::var_os("AZOOKEY_TEST_BLOCK_EVENT_LOOP").is_some() {
-                        eprintln!("TEST MODE: blocking the event loop now");
-                        std::thread::sleep(std::time::Duration::MAX);
-                    }
-                    *last_beat
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
-                }
-                UserEvent::WindowAction(action) => {
-                    window_actions::handle_window_action(
-                        action,
-                        &candidate_window,
-                        &indicator_window,
-                        &task_guard,
-                        &event_loop_proxy,
-                        &mut placement,
-                    );
-                }
-            },
+            Event::UserEvent(user_event) => handle_user_event(
+                user_event,
+                &candidate_window,
+                &candidate_webview,
+                &indicator_window,
+                &indicator_webview,
+                &task_guard,
+                &event_loop_proxy,
+                &mut placement,
+                &last_beat,
+            ),
             _ => (),
         }
     });

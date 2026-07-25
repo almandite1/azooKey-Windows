@@ -4471,6 +4471,7 @@ dependencies = [
  "anyhow",
  "azookey-server",
  "embed-resource",
+ "serde",
  "serde_json",
  "shared",
  "tao",

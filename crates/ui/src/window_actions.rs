@@ -1,7 +1,7 @@
 //! The interpreter for [`WindowAction`] requests coming over IPC from the
-//! TIP. Position/size *decisions* are the pure functions in `utils`
-//! (tested); the win32 calls are the named helpers in `window` — this
-//! module only sequences them.
+//! TIP. Position/size *decisions* are the pure functions in `geometry` and
+//! `placement` (tested); the win32 calls are the named helpers in `window` —
+//! this module only sequences them.
 
 use std::sync::Arc;
 
@@ -13,8 +13,9 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::UserEvent;
+use crate::geometry::{self, CaretRect};
 use crate::ipc::WindowAction;
-use crate::utils::{self, CandidatePlacement, CaretRect, ShowDecision};
+use crate::placement::{CandidatePlacement, ShowDecision};
 use crate::window::{is_visible, notify_ime_event, pin_topmost, set_visibility};
 use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_IME_CHANGE, EVENT_OBJECT_IME_HIDE, EVENT_OBJECT_IME_SHOW,
@@ -34,8 +35,46 @@ pub fn reposition_candidate(
     let Some(caret) = last_caret else {
         return;
     };
-    let (x, y) = utils::get_candidate_window_position(caret, win_width, win_height);
+    let (x, y) = geometry::get_candidate_window_position(caret, win_width, win_height);
     candidate_window.set_outer_position(PhysicalPosition::new(x, y));
+}
+
+/// Resizes the candidate window and re-clamps it for the size it is GOING to
+/// have. `width` and `height` are LOGICAL (CSS) px; `None` keeps the current
+/// value.
+///
+/// One function for what used to be two mirror-image copies — width set with
+/// the height kept (a longer candidate), height set with the width kept (a
+/// longer list) — each carrying its own copy of the B20 and issue-#3
+/// invariants:
+///
+/// - the size must be applied as a `LogicalSize`, because the webview lays
+///   out in CSS px: feeding the PHYSICAL inner size back in grew the window
+///   by the scale factor on every resize at high DPI (B20);
+/// - the re-clamp must use the size the window is about to have, because
+///   `inner_size()` can still report the pre-resize value right here
+///   (issue #3).
+pub fn resize_candidate(
+    candidate_window: &Window,
+    width: Option<f64>,
+    height: Option<f64>,
+    last_caret: &Option<CaretRect>,
+) {
+    let scale = candidate_window.scale_factor();
+    let current = candidate_window.inner_size().to_logical::<f64>(scale);
+    let new_size = LogicalSize::new(
+        width.unwrap_or(current.width),
+        height.unwrap_or(current.height),
+    );
+    candidate_window.set_inner_size(new_size);
+
+    let physical = new_size.to_physical::<i32>(scale);
+    reposition_candidate(
+        candidate_window,
+        last_caret,
+        physical.width,
+        physical.height,
+    );
 }
 
 /// How long a `Show` waits for the position that belongs to it before giving
@@ -43,12 +82,35 @@ pub fn reposition_candidate(
 /// `TS_E_NOLAYOUT`, short enough not to read as lag.
 const POSITION_GRACE: std::time::Duration = std::time::Duration::from_millis(120);
 
+/// How long the mode indicator stays up after an あ/A switch. Long enough to
+/// read, short enough not to sit over the text the user went on to type.
+const INDICATOR_FLASH: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Makes the candidate window visible, announcing the transition only when it
 /// really is one: the TIP sends Show/Hide freely, and announcing every
 /// request buried listeners in redundant events.
 pub fn show_candidate(candidate_window: &Window) {
     if !set_visibility(candidate_window.hwnd(), true) {
         notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_SHOW);
+    }
+}
+
+/// The counterpart of [`show_candidate`], with the same "only a real
+/// transition is announced" rule.
+pub fn hide_candidate(candidate_window: &Window) {
+    if set_visibility(candidate_window.hwnd(), false) {
+        notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_HIDE);
+    }
+}
+
+/// Announces a content/position change, but only while the window is visible.
+///
+/// The guard is the point: ending a composition sends `hide_window()` and
+/// then `set_candidates(vec![])`, so without it a CHANGE was announced on a
+/// window that had just been hidden.
+fn notify_change_if_visible(candidate_window: &Window) {
+    if is_visible(candidate_window.hwnd()) {
+        notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_CHANGE);
     }
 }
 
@@ -94,9 +156,7 @@ pub fn handle_window_action(
         }
         WindowAction::Hide => {
             placement.on_hide();
-            if set_visibility(candidate_window.hwnd(), false) {
-                notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_HIDE);
-            }
+            hide_candidate(candidate_window);
         }
         WindowAction::SetPosition {
             top,
@@ -128,7 +188,7 @@ pub fn handle_window_action(
             // clamp the indicator into the work area too — it used to hang
             // off-screen near screen edges (B20)
             let indicator_size = indicator_window.inner_size();
-            let (ix, iy) = utils::get_indicator_position(
+            let (ix, iy) = geometry::get_indicator_position(
                 &caret,
                 indicator_size.width as i32,
                 indicator_size.height as i32,
@@ -141,36 +201,15 @@ pub fn handle_window_action(
                 show_candidate(candidate_window);
             }
 
-            if is_visible(candidate_window.hwnd()) {
-                notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_CHANGE);
-            }
+            notify_change_if_visible(candidate_window);
         }
         WindowAction::SetCandidate { candidates } => {
-            let max_len = utils::max_candidate_chars(&candidates);
-
-            // logical (CSS px) size: the webview lays out in CSS px, so a
-            // physical-px window stayed too small at high DPI and clipped
-            // the candidate text (B20)
-            let scale = candidate_window.scale_factor();
-            let height = candidate_window
-                .inner_size()
-                .to_logical::<f64>(scale)
-                .height;
-            let new_size = LogicalSize::new(
-                utils::candidate_window_logical_width(max_len) as f64,
-                height,
-            );
-            candidate_window.set_inner_size(new_size);
-
-            // the window may have just grown for a longer candidate;
-            // re-clamp for the size it is GOING to have — inner_size() can
-            // still report the pre-resize value here (issue #3)
-            let physical = new_size.to_physical::<i32>(scale);
-            reposition_candidate(
+            let max_len = geometry::max_candidate_chars(&candidates);
+            resize_candidate(
                 candidate_window,
+                Some(geometry::candidate_window_logical_width(max_len) as f64),
+                None,
                 &placement.caret,
-                physical.width,
-                physical.height,
             );
 
             // Vec<String> serialization cannot fail; fall back to an empty
@@ -182,13 +221,7 @@ pub fn handle_window_action(
 
             // The window has already been resized here; the list contents
             // land asynchronously once the webview runs the script.
-            //
-            // Only while visible: ending a composition sends hide_window()
-            // and then set_candidates(vec![]), which announced a CHANGE on a
-            // window that had just been hidden.
-            if is_visible(candidate_window.hwnd()) {
-                notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_CHANGE);
-            }
+            notify_change_if_visible(candidate_window);
         }
         WindowAction::SetSelection { index } => {
             let _ = proxy.send_event(UserEvent::UpdateSelection(index));
@@ -201,10 +234,9 @@ pub fn handle_window_action(
                     task.abort();
                 }
 
-                // flash the mode indicator for half a second
                 *flash = Some(tokio::spawn(async move {
                     set_visibility(indicator_hwnd, true);
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(INDICATOR_FLASH).await;
                     set_visibility(indicator_hwnd, false);
                 }));
             }
