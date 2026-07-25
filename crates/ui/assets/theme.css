@@ -1,9 +1,12 @@
 /*
  * Design tokens + shared window chrome for the candidate window and the
- * mode indicator. This file is THE theming surface: the planned theme
- * feature only needs to override these custom properties (and the frontend
- * preview in frontend/src/index.css mirrors the same values — keep them in
- * sync until themes are single-sourced).
+ * mode indicator. This file is THE theming surface for ui.exe: the planned
+ * theme feature only needs to override these custom properties.
+ *
+ * The settings app's candidate-window preview (frontend/src/index.css,
+ * `.candidate-*`) is a SEPARATE copy: hardcoded hex, light mode only, and
+ * nothing keeps it in sync. Changing a token here does not change the
+ * preview. Sharing the tokens with the frontend is tracked separately.
  */
 
 :root {

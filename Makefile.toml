@@ -129,8 +129,8 @@ foreach ($d in 'Dictionary', 'EmojiDictionary', 'llama_cpu', 'x86') {
 }
 
 Copy-Item "target/$profileDir/azookey-e2e.exe" $stage
-# the second host for scenario 3 (bin/host.rs); the harness launches it by
-# name from beside itself
+# the second host for scenario 3 (src/bin/azookey-e2e-host.rs); the harness
+# launches it by name from beside itself
 Copy-Item "target/$profileDir/azookey-e2e-host.exe" $stage
 
 $zip = Join-Path $env:TEMP "azookey-e2e.zip"
@@ -138,6 +138,22 @@ Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
 # no -f format strings: cargo-make mangles brace placeholders
 $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
 Write-Host "payload: $zip ($mb MB)"
+"""
+args = ["${@}"]
+
+# The supported way to run the E2E harness: it stages the payload, copies it
+# into the test VM, and drives the run from the host side. Never run
+# azookey-e2e.exe on a development machine — it switches the DEFAULT input
+# method of whoever runs it and types into whatever has focus.
+[tasks.e2e]
+description = "Run the E2E scenarios in the test VM (see scripts/e2e-vm-run.ps1 -?)"
+script_runner = "powershell"
+script_extension = "ps1"
+script = """
+$ErrorActionPreference = "Stop"
+# cargo-make runs tasks from the workspace root
+& "./scripts/e2e-vm-run.ps1" @args
+if ($LASTEXITCODE -ne 0) { throw "e2e-vm-run.ps1 failed with exit code $LASTEXITCODE" }
 """
 args = ["${@}"]
 

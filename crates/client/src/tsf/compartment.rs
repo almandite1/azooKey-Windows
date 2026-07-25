@@ -18,7 +18,7 @@
 //!    `OnChange` synchronously, on this same STA thread, from inside
 //!    `SetValue` — so a live borrow turns into a borrow error inside the
 //!    callback. This is the same re-entrancy that `update_lang_bar` hits via
-//!    `AddItem` -> `GetIcon` (see engine/composition.rs).
+//!    `AddItem` -> `GetIcon` (see engine/input_mode.rs).
 //!
 //!    Today that failure happens to be harmless here, because the only
 //!    `OnChange` we trigger ourselves is an echo that the guard below

@@ -79,9 +79,7 @@ impl DefaultProfile {
             })
         }
     }
-}
 
-impl DefaultProfile {
     /// Whether there was another input method to cycle through.
     pub fn has_previous(&self) -> bool {
         self.previous.is_some()

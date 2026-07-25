@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::LazyLock};
 
 // azooKey never converts ASCII letters or digits to full width, so 0-9, A-Z
 // and a-z are intentionally omitted from this map (they map to themselves).
-// The full mapping that does include them is HALF_FULL below.
+// F9-style full-width ASCII is a separate transform — see to_fullwidth_ascii.
 static HALF_FULL_AZOOKEY: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     HashMap::from([
         ("!", "！"),
@@ -43,37 +43,6 @@ static HALF_FULL_AZOOKEY: LazyLock<HashMap<&'static str, &'static str>> = LazyLo
     ])
 });
 
-static HALF_FULL: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
-    HashMap::from([
-        ("a", "ａ"),
-        ("b", "ｂ"),
-        ("c", "ｃ"),
-        ("d", "ｄ"),
-        ("e", "ｅ"),
-        ("f", "ｆ"),
-        ("g", "ｇ"),
-        ("h", "ｈ"),
-        ("i", "ｉ"),
-        ("j", "ｊ"),
-        ("k", "ｋ"),
-        ("l", "ｌ"),
-        ("m", "ｍ"),
-        ("n", "ｎ"),
-        ("o", "ｏ"),
-        ("p", "ｐ"),
-        ("q", "ｑ"),
-        ("r", "ｒ"),
-        ("s", "ｓ"),
-        ("t", "ｔ"),
-        ("u", "ｕ"),
-        ("v", "ｖ"),
-        ("w", "ｗ"),
-        ("x", "ｘ"),
-        ("y", "ｙ"),
-        ("z", "ｚ"),
-    ])
-});
-
 pub fn to_halfwidth(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -87,14 +56,12 @@ pub fn to_halfwidth(s: &str) -> String {
         .collect()
 }
 
-pub fn to_fullwidth(s: &str, process_alphabet: bool) -> String {
+/// Kana-input keystroke mapping: the symbols azooKey types as their kana
+/// punctuation, everything else (ASCII letters and digits included) unchanged.
+pub fn to_fullwidth(s: &str) -> String {
     s.chars()
         .map(|c| {
             let key = c.to_string();
-
-            if process_alphabet && let Some(&v) = HALF_FULL.get(key.as_str()) {
-                return v.to_string();
-            }
 
             if let Some(&v) = HALF_FULL_AZOOKEY.get(key.as_str()) {
                 v.to_string()
@@ -127,23 +94,22 @@ mod tests {
 
     #[test]
     fn symbols_are_converted_to_fullwidth() {
-        assert_eq!(to_fullwidth("!?", false), "！？");
-        assert_eq!(to_fullwidth("-", false), "ー");
-        assert_eq!(to_fullwidth(",.", false), "、。");
-        assert_eq!(to_fullwidth("[]", false), "「」");
+        assert_eq!(to_fullwidth("!?"), "！？");
+        assert_eq!(to_fullwidth("-"), "ー");
+        assert_eq!(to_fullwidth(",."), "、。");
+        assert_eq!(to_fullwidth("[]"), "「」");
     }
 
     #[test]
-    fn alphabet_is_kept_halfwidth_unless_requested() {
+    fn alphabet_is_kept_halfwidth() {
         // roman input is sent to the engine as halfwidth ASCII
-        assert_eq!(to_fullwidth("ka", false), "ka");
-        assert_eq!(to_fullwidth("ka", true), "ｋａ");
+        assert_eq!(to_fullwidth("ka"), "ka");
     }
 
     #[test]
     fn unmapped_characters_pass_through() {
-        assert_eq!(to_fullwidth("あ漢1", false), "あ漢1");
-        assert_eq!(to_fullwidth("", false), "");
+        assert_eq!(to_fullwidth("あ漢1"), "あ漢1");
+        assert_eq!(to_fullwidth(""), "");
         assert_eq!(to_halfwidth("あ漢A"), "あ漢A");
         assert_eq!(to_halfwidth(""), "");
     }
@@ -151,7 +117,7 @@ mod tests {
     #[test]
     fn halfwidth_reverses_fullwidth_symbols() {
         for half in ["!", "?", "(", ")", "[", "]", "-", ",", "."] {
-            let full = to_fullwidth(half, false);
+            let full = to_fullwidth(half);
             assert_eq!(to_halfwidth(&full), half, "roundtrip failed for {half}");
         }
     }

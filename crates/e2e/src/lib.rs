@@ -39,15 +39,13 @@ pub fn poll_until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) ->
 }
 
 /// The stage a run reached, so a failure says *where* it broke rather than
-/// only that it did (an acceptance criterion of the plan).
+/// only that it did (an acceptance criterion of the plan). Only the two
+/// whole-run prerequisites are banners; everything past them is per-scenario
+/// and reported by the scenario itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stage {
     Guard,
     Profile,
-    Launch,
-    Focus,
-    Inject,
-    Read,
 }
 
 impl Stage {
@@ -55,10 +53,6 @@ impl Stage {
         match self {
             Stage::Guard => "guard    (VM の中か)",
             Stage::Profile => "profile  (既定 IME の切替)",
-            Stage::Launch => "launch   (ホストアプリの新規起動)",
-            Stage::Focus => "focus    (前面化と入力先の確定)",
-            Stage::Inject => "inject   (SendInput による打鍵)",
-            Stage::Read => "read     (UI Automation での本文読取)",
         }
     }
 }

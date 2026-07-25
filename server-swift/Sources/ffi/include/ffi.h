@@ -6,9 +6,11 @@
 /*
  * THE canonical declaration of the engine's C FFI.
  *
- * The Swift side (azookey_server.swift) implements these with @_cdecl
- * exports; the Rust side (crates/server/src/ffi.rs) mirrors them in an
- * extern "C" block. Swift imports this header (module `ffi`), so the
+ * The Swift side (Sources/azookey-server/FFIExports.swift, on top of
+ * EngineConfig.swift / EngineState.swift / Conversion.swift) implements
+ * these with @_cdecl exports; the Rust side (crates/server/src/ffi.rs)
+ * mirrors them in an extern "C" block. Swift imports this header
+ * (module `ffi`), so the
  * struct layout is single-sourced, but the FUNCTION signatures are not
  * checked mechanically against either implementation — when you add or
  * change a function, update all three places and run the --ignored smoke

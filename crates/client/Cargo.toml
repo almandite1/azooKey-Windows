@@ -16,9 +16,6 @@ expect_used = "deny"
 
 [dependencies]
 anyhow = { workspace = true }
-log = "0.4"
-fern = "0.7.0"
-chrono = { workspace = true }
 windows-core = { workspace = true }
 shared = { workspace = true }
 macros = { workspace = true }
@@ -29,8 +26,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-core = { workspace = true }
-serde_json = { workspace = true }
-serde = { workspace = true }
 
 [dependencies.windows]
 workspace = true

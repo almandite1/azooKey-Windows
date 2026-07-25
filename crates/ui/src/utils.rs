@@ -627,10 +627,12 @@ mod tests {
         );
     }
 
-    /// …but the measurement is NOT per composition. candidate.js measures
-    /// once on DOMContentLoaded and never again, so clearing this on hide
-    /// would make every composition after the first sit out the full grace
-    /// period waiting for an UpdateHeight that never comes.
+    /// …but the measurement gate is NOT per composition. candidate.js
+    /// re-measures on every `updateCandidates` (#81), yet the gate only asks
+    /// "has the window stopped being tao's 800x600 default" — which happens
+    /// once per ui.exe lifetime. Clearing it on hide would make every
+    /// composition after the first sit out the full grace period, waiting on
+    /// a measurement that only arrives once the candidates do.
     #[test]
     fn a_hide_keeps_the_measured_height() {
         let mut placement = measured();

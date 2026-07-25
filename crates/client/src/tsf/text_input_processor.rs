@@ -127,9 +127,6 @@ impl TextServiceFactory_Impl {
         // this activation.
         text_service.input_mode = crate::engine::input_mode::InputMode::default();
         text_service.suppress_compartment_echo = false;
-        // a stale flag would otherwise be inherited by a plain Activate() that
-        // carries no flags of its own
-        text_service.activate_flags = 0;
         // Also let go of the last document's context: handle_key re-sets it on
         // every keystroke after the next Activate, and end_composition() above
         // already ran, so nothing dereferences it in between. Keeping it would
@@ -225,10 +222,14 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // whose failure is fatal — undo tid/thread_mgr and the dll ref, and
         // report it.
         //
-        // The compartments are not initialised yet at this point, so the
-        // re-entrant OnSetFocus reads a VT_EMPTY open/close on a fresh thread
-        // — which `decode` already treats as "nobody has decided" rather than
-        // as a failure.
+        // Advising it re-enters the key sink's own OnSetFocus synchronously,
+        // and that reads the compartments (sync_input_mode_from_compartments)
+        // before `init_compartments` has run. On a thread no IME has claimed
+        // yet, open/close is VT_EMPTY, which `read_i32` reports as 0 and
+        // `decode` therefore reads as Latin — equal to the still-default
+        // `input_mode`, so the sync bails on its equality guard and applies
+        // nothing. Adopting (or publishing) the real mode is
+        // `init_compartments`' job, further down.
         tracing::debug!("AdviseKeyEventSink");
         if let Err(error) = self.advise_key_sink(&thread_mgr, tid) {
             tracing::error!("AdviseKeyEventSink failed; the TIP cannot receive keys: {error:?}");
@@ -378,16 +379,9 @@ impl ITfTextInputProcessorEx_Impl for TextServiceFactory_Impl {
         // called when the text service is activated
         // if this function is implemented, the Activate() function won't be called
         // so we need to call the Activate function manually
+        // The flags are logged and then dropped: UI suppression is decided by
+        // BeginUIElement's pbShow, never by an activation flag.
         tracing::debug!("Activated(Ex) with tid: {tid}, flags: {dwflags:#x}");
-
-        // Diagnostics only: UI suppression is decided by BeginUIElement's
-        // pbShow, never by an activation flag. Scope the borrow — Activate
-        // takes its own borrow_mut straight away.
-        {
-            if let Ok(mut text_service) = self.borrow_mut() {
-                text_service.activate_flags = dwflags;
-            }
-        }
 
         self.Activate(ptim, tid)?;
         Ok(())

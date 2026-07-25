@@ -78,15 +78,13 @@ fn apply_selected_candidate(
 
 /// Backspace shortened the reading: keep only the leading keystrokes the new
 /// top candidate covers. `count` is `corresponding_count`, already clamped to
-/// the list by the engine — the `as usize` cast is the original inline
-/// arithmetic, kept exact so the golden tests stay unchanged.
+/// the list by the engine.
 fn raw_input_kept_for_count(raw_input: &str, count: i32) -> String {
     raw_input.chars().take(count as usize).collect()
 }
 
 /// A candidate was committed (shrink): append the freshly typed keystrokes,
-/// then drop from the front the keystrokes that candidate consumed. The same
-/// two steps the inline code took (`push_str` then `skip`), as one value.
+/// then drop from the front the keystrokes that candidate consumed.
 fn raw_input_after_commit(raw_input: &str, appended: &str, count: i32) -> String {
     let mut combined = raw_input.to_string();
     combined.push_str(appended);
@@ -611,7 +609,7 @@ impl TextServiceFactory_Impl {
         }
 
         let replay = match mode {
-            InputMode::Kana => to_fullwidth(&snapshot.raw_input, false),
+            InputMode::Kana => to_fullwidth(&snapshot.raw_input),
             InputMode::Latin => snapshot.raw_input.clone(),
         };
 
@@ -712,7 +710,7 @@ impl TextServiceFactory_Impl {
         text: &str,
     ) -> Result<()> {
         let keystrokes = match mode {
-            InputMode::Kana => to_fullwidth(text, false),
+            InputMode::Kana => to_fullwidth(text),
             InputMode::Latin => text.to_string(),
         };
 
@@ -856,7 +854,7 @@ impl TextServiceFactory_Impl {
         edit.raw_input = after_commit;
 
         let keystrokes = match mode {
-            InputMode::Kana => to_fullwidth(text, false),
+            InputMode::Kana => to_fullwidth(text),
             InputMode::Latin => text.to_string(),
         };
         let candidates = ipc_service.append_text(keystrokes)?;

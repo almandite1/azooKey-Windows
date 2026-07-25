@@ -144,9 +144,6 @@ pub struct TextService {
     /// `OnChange` that TSF dispatches synchronously from inside `SetValue`
     /// does not bounce straight back into another write.
     pub suppress_compartment_echo: bool,
-    /// `ActivateEx`'s `dwflags`. Diagnostics only — the UI suppression gate
-    /// is `BeginUIElement`'s `pbShow`, never a flag.
-    pub activate_flags: u32,
     /// UILess-mode state for the candidate list.
     pub ui_element: UiElementState,
     // NOTE: no `this` self-reference here. The COM object is reachable from

@@ -7,7 +7,7 @@ use shared::proto::window_service_server::WindowServiceServer;
 use tao::dpi::LogicalSize;
 use tao::platform::windows::EventLoopBuilderExtWindows;
 use tao::{
-    event::{Event, StartCause, WindowEvent},
+    event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
 };
 use tokio::sync::{Mutex, mpsc};
@@ -217,7 +217,6 @@ async fn main() -> anyhow::Result<()> {
         *control_flow = ControlFlow::Wait;
 
         match event {
-            Event::NewEvents(StartCause::Init) => {}
             Event::WindowEvent {
                 event: WindowEvent::ScaleFactorChanged { new_inner_size, .. },
                 window_id,

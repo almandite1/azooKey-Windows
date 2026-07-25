@@ -12,9 +12,10 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 
-# the custom host binary (bin/host.rs) is a Win32 GUI, so it is not a plain
-# console exe — but it is launched by the harness, not double-clicked, and a
-# console would flash. windows_subsystem in the file handles that.
+# the custom host binary (src/bin/azookey-e2e-host.rs) is a Win32 GUI, so it
+# is not a plain console exe — but it is launched by the harness, not
+# double-clicked, and a console would flash. windows_subsystem in the file
+# handles that.
 
 [dependencies.windows]
 workspace = true
