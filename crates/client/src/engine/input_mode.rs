@@ -36,13 +36,18 @@ impl TextServiceFactory_Impl {
         // other order flashes it at the stale spot and then moves it.
         // Outside a composition nothing else refreshes that position at all
         // (issue #55).
-        self.update_pos_from_selection()?;
+        self.update_pos_from_selection();
 
-        if let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() {
-            ipc_service.set_input_mode(match mode {
-                InputMode::Latin => "A",
-                InputMode::Kana => "あ",
-            });
+        // advisory: no service yet (Activate has not wired one up) simply
+        // means there is no indicator to publish to
+        if let Some(ipc_service) = IMEState::ipc()? {
+            ipc_service.set_input_mode(
+                match mode {
+                    InputMode::Latin => "A",
+                    InputMode::Kana => "あ",
+                }
+                .to_string(),
+            );
         }
 
         if write_compartments {

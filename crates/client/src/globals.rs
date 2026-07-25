@@ -52,6 +52,30 @@ pub const GUID_PRESERVEDKEY_TOGGLE_KANJI: GUID =
 pub const GUID_PRESERVEDKEY_TOGGLE_ALT_GRAVE: GUID =
     GUID::from_u128(0xffdefe7f_2fc2_11ef_b16b_94e70b2c378c);
 
+/// `VK_DBE_SBCSCHAR` / `VK_DBE_DBCSCHAR` — the two virtual keys the
+/// Zenkaku/Hankaku key produces depending on the current mode.
+pub const VK_ZENKAKU_HANKAKU: [u32; 2] = [0xF3, 0xF4];
+
+/// `VK_KANJI`. The 漢字 key of a JIS keyboard — and, with Alt held, what
+/// Windows translates **Alt+`** into on a 101-key Japanese layout. Measured
+/// on hardware: the key arrives as `OnKeyDown(wparam=0x19)` with the Alt flag
+/// set in lparam and the scan code of the `` ` `` key (0x29). It does NOT
+/// arrive as `VK_OEM_3`, so that reservation alone never fires.
+pub const VK_KANJI: u32 = 0x19;
+
+/// `VK_OEM_3` — `` ` `` on a US layout. Reserved with Alt as well, for
+/// layouts and hosts where the translation above does not happen.
+pub const VK_OEM_3: u32 = 0xC0;
+
+/// Every virtual key that means "switch the IME on/off".
+///
+/// Read from both sides of the same decision and therefore declared once:
+/// `tsf::preserved_key` asks TSF to route these through `OnPreservedKey`, and
+/// `engine::user_action` recognises them when a host delivers one raw anyway.
+/// They used to be spelled out as bare `0xF3 | 0xF4 | 0x19` literals on the
+/// engine side.
+pub const VK_IME_TOGGLE: [u32; 3] = [VK_ZENKAKU_HANKAKU[0], VK_ZENKAKU_HANKAKU[1], VK_KANJI];
+
 pub const DISPLAY_ATTRIBUTE: TF_DISPLAYATTRIBUTE = TF_DISPLAYATTRIBUTE {
     crText: TF_DA_COLOR {
         r#type: TF_CT_NONE,
@@ -168,11 +192,14 @@ impl DllModule {
         }
     }
 
-    pub fn add_ref(&mut self) -> usize {
-        self.ref_count.fetch_add(1, Ordering::SeqCst)
+    // Both return nothing: `DllCanUnloadNow` always answers S_FALSE (the
+    // count does not yet track every live COM object), so the previous value
+    // has no reader and every call site was discarding it.
+    pub fn add_ref(&mut self) {
+        self.ref_count.fetch_add(1, Ordering::SeqCst);
     }
 
-    pub fn release(&mut self) -> usize {
-        self.ref_count.fetch_sub(1, Ordering::SeqCst)
+    pub fn release(&mut self) {
+        self.ref_count.fetch_sub(1, Ordering::SeqCst);
     }
 }

@@ -37,6 +37,24 @@ impl IMEState {
             }
         }
     }
+
+    /// The process-wide IPC handle, cloned for the caller. The one way to
+    /// reach it — five call sites used to spell this out four different ways.
+    ///
+    /// The two failure modes are deliberately distinct, because callers treat
+    /// them differently:
+    /// - `Err` is `get()`'s re-entrancy (or borrow) bail, never "no service".
+    /// - `Ok(None)` means no service is installed: before `Activate` finished
+    ///   wiring one up, or after `Deactivate` dropped it.
+    ///
+    /// What to do about `Ok(None)` stays the CALLER's decision, and that is
+    /// why the call sites still differ: `handle_action` cannot do its job
+    /// without a service and turns it into an error, while every advisory
+    /// path (caret position, surrounding text, UILess Show, mode indicator)
+    /// simply skips its work.
+    pub fn ipc() -> anyhow::Result<Option<IPCService>> {
+        Ok(Self::get()?.ipc_service.clone())
+    }
 }
 
 #[cfg(test)]

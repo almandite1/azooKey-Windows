@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
+    best_effort::BestEffort,
     engine::{composition::Composition, ipc_service, state::IMEState},
     globals::{DllModule, GUID_DISPLAY_ATTRIBUTE},
 };
@@ -19,19 +20,6 @@ use windows::{
 };
 
 use anyhow::Result;
-
-/// Records the first failure of a best-effort teardown step while letting the
-/// remaining steps run. Used across Deactivate and its `teardown_*` helpers so
-/// a single failing unadvise cannot strand the others (which would leak a sink
-/// into the host or pin its ITfContext).
-fn record(slot: &mut Result<()>, result: Result<()>) {
-    if let Err(error) = result {
-        tracing::warn!("Deactivate step failed: {error:?}");
-        if slot.is_ok() {
-            *slot = Err(error);
-        }
-    }
-}
 
 impl TextServiceFactory_Impl {
     /// Advises the key-event sink — the lifeline every keystroke arrives
@@ -72,17 +60,14 @@ impl TextServiceFactory_Impl {
         // the registry anyway would lose the record of what is still held.
         let preserved = std::mem::take(&mut self.borrow_mut()?.preserved_keys);
 
-        let mut first_error = Ok(());
+        let mut steps = BestEffort::new("Deactivate (thread-scoped)");
         tracing::debug!("UnadviseKeyEventSink");
-        record(&mut first_error, self.unadvise_key_sink(&thread_mgr, tid));
+        steps.step(self.unadvise_key_sink(&thread_mgr, tid));
         tracing::debug!("UnpreserveKey");
-        record(
-            &mut first_error,
-            self.unpreserve_keys(&thread_mgr, &preserved),
-        );
+        steps.step(self.unpreserve_keys(&thread_mgr, &preserved));
         tracing::debug!("Remove langbar");
-        record(&mut first_error, self.remove_langbar_item(&thread_mgr));
-        first_error
+        steps.step(self.remove_langbar_item(&thread_mgr));
+        steps.finish()
     }
 
     /// Deactivate phase 2: unadvise the per-instance sinks (thread-mgr event
@@ -91,31 +76,19 @@ impl TextServiceFactory_Impl {
     /// effort — returns the first failure.
     fn teardown_instance_state(&self) -> Result<()> {
         let mut text_service = self.borrow_mut()?;
-        let mut first_error = Ok(());
+        let mut steps = BestEffort::new("Deactivate (instance state)");
 
         tracing::debug!("UnadviseThreadMgrEventSink");
-        match text_service.thread_mgr() {
-            Ok(thread_mgr) => match thread_mgr.cast::<ITfSource>() {
-                Ok(source) => record(
-                    &mut first_error,
-                    self.unadvise_sink::<ITfThreadMgrEventSink>(&source, &mut text_service),
-                ),
-                Err(error) => record(&mut first_error, Err(error.into())),
-            },
-            Err(error) => record(&mut first_error, Err(error)),
-        }
+        steps.step((|| {
+            let source = text_service.thread_mgr()?.cast::<ITfSource>()?;
+            self.unadvise_sink::<ITfThreadMgrEventSink>(&source, &mut text_service)
+        })());
 
         tracing::debug!("UnadviseTextLayoutSink");
-        record(
-            &mut first_error,
-            self.unadvise_text_layout_sink(&mut text_service),
-        );
+        steps.step(self.unadvise_text_layout_sink(&mut text_service));
 
         tracing::debug!("UnadviseCompartmentSinks");
-        record(
-            &mut first_error,
-            self.unadvise_compartment_sinks(&mut text_service),
-        );
+        steps.step(self.unadvise_compartment_sinks(&mut text_service));
 
         // clear display attribute
         text_service.display_attribute_atom.clear();
@@ -145,66 +118,25 @@ impl TextServiceFactory_Impl {
         // keystroke would land in the Composing arm with no live
         // tip_composition, set_text would no-op, and the typing would be
         // invisible.
-        match text_service.borrow_mut_composition() {
-            Ok(mut composition) => *composition = Composition::default(),
-            Err(error) => record(&mut first_error, Err(error)),
-        }
+        steps.step(match text_service.borrow_mut_composition() {
+            Ok(mut composition) => {
+                *composition = Composition::default();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        });
 
-        first_error
+        steps.finish()
     }
-}
 
-impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
-    #[macros::anyhow]
-    // skip(self): the #[implement]-generated TextServiceFactory_Impl has no
-    // Debug, and the factory's Debug output is a whole composition dump in
-    // any case — the tid is what identifies the activation
-    #[tracing::instrument(skip(self, ptim))]
-    fn Activate(&self, ptim: windows_core::Ref<'_, ITfThreadMgr>, tid: u32) -> Result<()> {
-        tracing::debug!("Activated with tid: {tid}");
-
-        // add reference to the dll instance to prevent it from being unloaded
-        let mut dll_instance = DllModule::get()?;
-        dll_instance.add_ref();
-
-        // initialize ipc_service
-        // Activate() should not return an error: if it does, the icon of the
-        // previously activated TextService is displayed, confusing the user.
-        match ipc_service::IPCService::new() {
-            Ok(mut ipc_service) => {
-                // Warm up the lazy connection; if the server is not running
-                // yet this fails harmlessly and the channel reconnects on
-                // the next keystroke. The attempt also settles
-                // `engine_health` for the language-bar tooltip, which is the
-                // only way a user finds out the engine never started — the
-                // TIP otherwise looks perfectly healthy (issue #79).
-                //
-                // ERROR, not WARN: this is the line to look for first when
-                // the report is "it stopped converting".
-                if let Err(e) = ipc_service.append_text("".to_string()) {
-                    tracing::error!(
-                        "azookey server not reachable at Activate; \
-                         conversion will not work until launcher.exe is running: {e}"
-                    );
-                }
-                IMEState::get()?.ipc_service = Some(ipc_service);
-            }
-            Err(e) => {
-                tracing::error!("Failed to initialize IPC service: {e}");
-                return Ok(());
-            }
-        }
-
-        // resolve the thread manager up front; on null, release the dll ref
-        // taken above before bailing (the old code leaked it here)
-        let thread_mgr = match ptim.as_ref() {
-            Some(thread_mgr) => thread_mgr.clone(),
-            None => {
-                dll_instance.release();
-                return Err(anyhow::anyhow!("Thread manager is null"));
-            }
-        };
-
+    /// Activate phase 1, the mirror image of `teardown_thread_scoped`:
+    /// everything whose failure means there is no working IME at all.
+    ///
+    /// Only the key-event sink qualifies. Without it NO keystroke reaches the
+    /// TIP and nothing composes or converts, so a failure here rolls the
+    /// activation state back and is reported; the caller releases the dll ref
+    /// it took.
+    fn activate_mandatory(&self, thread_mgr: &ITfThreadMgr, tid: u32) -> Result<()> {
         // Scoped on purpose: the advise below must hold NO borrow. TSF gives
         // the focus to a freshly advised key sink synchronously, from inside
         // AdviseKeyEventSink, and our OnSetFocus goes on to
@@ -217,52 +149,53 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             text_service.thread_mgr = Some(thread_mgr.clone());
         }
 
-        // The key-event sink is the lifeline: without it NO keystroke reaches
-        // the TIP and nothing composes or converts. This is the ONLY step
-        // whose failure is fatal — undo tid/thread_mgr and the dll ref, and
-        // report it.
-        //
-        // Advising it re-enters the key sink's own OnSetFocus synchronously,
-        // and that reads the compartments (sync_input_mode_from_compartments)
-        // before `init_compartments` has run. On a thread no IME has claimed
-        // yet, open/close is VT_EMPTY, which `read_i32` reports as 0 and
-        // `decode` therefore reads as Latin — equal to the still-default
-        // `input_mode`, so the sync bails on its equality guard and applies
-        // nothing. Adopting (or publishing) the real mode is
-        // `init_compartments`' job, further down.
+        // That same re-entrant OnSetFocus reads the compartments before
+        // `init_compartments` has run. On a thread no IME has claimed yet,
+        // open/close is VT_EMPTY, which `read_i32` reports as 0 and `decode`
+        // therefore reads as Latin — equal to the still-default `input_mode`,
+        // so the sync bails on its equality guard and applies nothing.
+        // Adopting (or publishing) the real mode is `init_compartments`' job,
+        // in the advisory phase.
         tracing::debug!("AdviseKeyEventSink");
-        if let Err(error) = self.advise_key_sink(&thread_mgr, tid) {
-            tracing::error!("AdviseKeyEventSink failed; the TIP cannot receive keys: {error:?}");
-            // re-take the borrow for the rollback; a borrow that is somehow
-            // unavailable here must not mask the advise failure itself
-            match self.borrow_mut() {
-                Ok(mut text_service) => {
-                    text_service.tid = 0;
-                    text_service.thread_mgr = None;
-                }
-                Err(error) => tracing::warn!("could not roll back the activation: {error:?}"),
-            }
-            dll_instance.release();
-            return Err(error);
-        }
+        let Err(error) = self.advise_key_sink(thread_mgr, tid) else {
+            return Ok(());
+        };
 
-        // Claim the IME on/off keys. Advisory, and deliberately still outside
-        // any borrow: without this the OS keeps Alt+` (the US-layout on/off
-        // chord) to itself and the key never reaches the TIP at all (#19).
+        tracing::error!("AdviseKeyEventSink failed; the TIP cannot receive keys: {error:?}");
+        // re-take the borrow for the rollback; a borrow that is somehow
+        // unavailable here must not mask the advise failure itself
+        match self.borrow_mut() {
+            Ok(mut text_service) => {
+                text_service.tid = 0;
+                text_service.thread_mgr = None;
+            }
+            Err(error) => tracing::warn!("could not roll back the activation: {error:?}"),
+        }
+        Err(error)
+    }
+
+    /// Activate phase 2, the mirror image of `teardown_instance_state`:
+    /// everything that makes the IME pleasant rather than possible.
+    ///
+    /// None of it may abort `Activate`:
+    ///   - returning Err leaves the previously active IME's icon up (the user
+    ///     cannot select azooKey), and
+    ///   - unwinding the key-event sink on such a failure stops conversion
+    ///     entirely. A langbar AddItem failure taking typing down with it was
+    ///     exactly the "cannot convert" regression.
+    ///
+    /// So every step warns and carries on, keeping the key sink. `Deactivate`
+    /// unadvises whatever the per-instance cookie map recorded, so nothing
+    /// that succeeded leaks. The `Result` is the borrow, not the steps.
+    fn activate_advisory(&self, thread_mgr: &ITfThreadMgr, tid: u32) -> Result<()> {
+        // Claim the IME on/off keys. Deliberately still outside any borrow:
+        // without this the OS keeps Alt+` (the US-layout on/off chord) to
+        // itself and the key never reaches the TIP at all (#19).
         tracing::debug!("PreserveKey (IME on/off)");
-        let preserved = self.preserve_toggle_keys(&thread_mgr, tid);
+        let preserved = self.preserve_toggle_keys(thread_mgr, tid);
 
         let mut text_service = self.borrow_mut()?;
         text_service.preserved_keys = preserved;
-
-        // Everything below is ADVISORY. A failure here must NOT abort Activate:
-        //   - returning Err leaves the previously active IME's icon up (the
-        //     user cannot select azooKey), and
-        //   - unwinding the key-event sink on such a failure stops conversion
-        //     entirely. A langbar AddItem failure taking typing down with it
-        //     was exactly the "cannot convert" regression.
-        // Warn and keep the key sink. Deactivate later unadvises whatever the
-        // per-instance cookie map recorded, so nothing that succeeded leaks.
 
         tracing::debug!("AdviseThreadMgrEventSink");
         if let Err(error) = (|| -> Result<()> {
@@ -298,13 +231,13 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         }
 
         tracing::debug!("Initialize langbar");
-        if let Err(error) = self.add_langbar_item(&thread_mgr) {
+        if let Err(error) = self.add_langbar_item(thread_mgr) {
             tracing::warn!("langbar AddItem failed (non-fatal): {error:?}");
         }
 
         tracing::debug!("Initialize input-mode compartments");
-        // Advisory: a host without ITfCompartmentMgr (or one that refuses the
-        // compartments) must still get a working IME.
+        // a host without ITfCompartmentMgr (or one that refuses the
+        // compartments) must still get a working IME
         let adopted = match self.init_compartments(&mut text_service) {
             Ok(adopted) => adopted,
             Err(error) => {
@@ -322,6 +255,70 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         {
             tracing::warn!("adopting the compartment mode failed (non-fatal): {error:?}");
         }
+
+        Ok(())
+    }
+}
+
+impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
+    #[macros::anyhow]
+    // skip(self): the #[implement]-generated TextServiceFactory_Impl has no
+    // Debug, and the factory's Debug output is a whole composition dump in
+    // any case — the tid is what identifies the activation
+    #[tracing::instrument(skip(self, ptim))]
+    fn Activate(&self, ptim: windows_core::Ref<'_, ITfThreadMgr>, tid: u32) -> Result<()> {
+        tracing::debug!("Activated with tid: {tid}");
+
+        // add reference to the dll instance to prevent it from being unloaded
+        let mut dll_instance = DllModule::get()?;
+        dll_instance.add_ref();
+
+        // initialize ipc_service
+        // Activate() should not return an error: if it does, the icon of the
+        // previously activated TextService is displayed, confusing the user.
+        match ipc_service::IPCService::new() {
+            Ok(ipc_service) => {
+                // Warm up the lazy connection; if the server is not running
+                // yet this fails harmlessly and the channel reconnects on
+                // the next keystroke. The attempt also settles
+                // `engine_health` for the language-bar tooltip, which is the
+                // only way a user finds out the engine never started — the
+                // TIP otherwise looks perfectly healthy (issue #79).
+                //
+                // ERROR, not WARN: this is the line to look for first when
+                // the report is "it stopped converting".
+                if let Err(e) = ipc_service.append_text("".to_string()) {
+                    tracing::error!(
+                        "azookey server not reachable at Activate; \
+                         conversion will not work until launcher.exe is running: {e}"
+                    );
+                }
+                IMEState::get()?.ipc_service = Some(ipc_service);
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize IPC service: {e}");
+                return Ok(());
+            }
+        }
+
+        // resolve the thread manager up front; on null, release the dll ref
+        // taken above before bailing (the old code leaked it here)
+        let thread_mgr = match ptim.as_ref() {
+            Some(thread_mgr) => thread_mgr.clone(),
+            None => {
+                dll_instance.release();
+                return Err(anyhow::anyhow!("Thread manager is null"));
+            }
+        };
+
+        // The only step whose failure aborts the activation. It rolls its own
+        // state back; the dll ref is this function's to release.
+        if let Err(error) = self.activate_mandatory(&thread_mgr, tid) {
+            dll_instance.release();
+            return Err(error);
+        }
+
+        self.activate_advisory(&thread_mgr, tid)?;
 
         tracing::debug!("Activate success");
 
@@ -341,30 +338,30 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // The old code chained the unadvises with `?`, so a single failing
         // step (e.g. end_composition on a document being torn down during a
         // profile switch) stranded the remaining unadvises — leaking a sink
-        // into the host or pinning its ITfContext. `record` remembers the
-        // first error; it is surfaced at the end, in the order the steps run.
-        let mut first_error: Result<()> = Ok(());
+        // into the host or pinning its ITfContext.
+        let mut steps = BestEffort::new("Deactivate");
 
         // end composition (releases the client-side handle even on failure)
-        record(&mut first_error, self.end_composition());
+        steps.step(self.end_composition());
 
         // MANDATORY, not best-effort housekeeping: BeginUIElement made the
         // host AddRef this object and hold it until EndUIElement. Leaving an
         // element open across Deactivate pins the TIP in the host forever —
         // the B15 leak shape all over again.
-        record(&mut first_error, self.ui_end());
+        steps.step(self.ui_end());
 
         // phase 1: thread-scoped registrations (key sink, langbar)
-        record(&mut first_error, self.teardown_thread_scoped());
+        steps.step(self.teardown_thread_scoped());
 
         // phase 2: per-instance sinks + field reset for the next Activate
-        record(&mut first_error, self.teardown_instance_state());
+        steps.step(self.teardown_instance_state());
 
-        if first_error.is_ok() {
+        let result = steps.finish();
+        if result.is_ok() {
             tracing::debug!("Deactivate success");
         }
 
-        first_error
+        result
     }
 }
 

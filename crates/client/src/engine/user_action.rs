@@ -1,4 +1,6 @@
+use crate::engine::client_action::SetTextType;
 use crate::extension::VKeyExt;
+use crate::globals::VK_IME_TOGGLE;
 use anyhow::Result;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardState, ToUnicode, VK_CAPITAL, VK_KANA, VK_SHIFT,
@@ -55,12 +57,15 @@ fn without_input_locks(mut key_state: [u8; 256]) -> [u8; 256] {
 
 /// Whether a virtual key means "switch the IME on/off".
 ///
-/// `VK_KANJI` (0x19) is one of them because Windows translates **Alt+`** on a
+/// `VK_KANJI` is one of them because Windows translates **Alt+`** on a
 /// 101-key Japanese layout into it, with Alt still held. `process_key` has to
 /// know that before it reaches its Ctrl/Alt chord branch, which would
 /// otherwise discard the chord as a host shortcut (issue #19).
+///
+/// The keys themselves are [`VK_IME_TOGGLE`], shared with the reservations
+/// `tsf::preserved_key` makes — the two must not drift apart.
 pub fn is_ime_toggle_key(key_code: usize) -> bool {
-    matches!(key_code, 0xF3 | 0xF4 | 0x19)
+    u32::try_from(key_code).is_ok_and(|vk| VK_IME_TOGGLE.contains(&vk))
 }
 
 #[derive(Debug)]
@@ -76,7 +81,11 @@ pub enum UserAction {
     Escape,
     Unknown,
     Navigation(Navigation),
-    Function(Function),
+    /// F6–F10: rewrite the whole reading as the named form. Carries the
+    /// [`SetTextType`] directly rather than an F-key-shaped enum of its own,
+    /// so the five forms are listed once (there) instead of being restated
+    /// here and re-matched one-for-one in the transition table.
+    Function(SetTextType),
     Number(i8),
     ToggleInputMode,
     /// Host editing keys (Delete/Insert/Home/End/PageUp/PageDown). Left to
@@ -92,15 +101,6 @@ pub enum Navigation {
     Down,
     Left,
     Right,
-}
-
-#[derive(Debug)]
-pub enum Function {
-    Six,
-    Seven,
-    Eight,
-    Nine,
-    Ten,
 }
 
 impl TryFrom<usize> for UserAction {
@@ -121,31 +121,23 @@ impl TryFrom<usize> for UserAction {
             0x27 => UserAction::Navigation(Navigation::Right), // VK_RIGHT
             0x28 => UserAction::Navigation(Navigation::Down), // VK_DOWN
 
+            // VK_0..VK_9 and VK_NUMPAD0..VK_NUMPAD9. Both runs are laid out
+            // so the low nibble IS the digit, which is what the ten-arm table
+            // this replaces spelled out one line at a time.
             0x30..=0x39 | 0x60..=0x69 if !VK_SHIFT.is_pressed() => {
-                match key_code {
-                    0x30 | 0x60 => UserAction::Number(0), // VK_0, VK_NUMPAD0
-                    0x31 | 0x61 => UserAction::Number(1), // VK_1, VK_NUMPAD1
-                    0x32 | 0x62 => UserAction::Number(2), // VK_2, VK_NUMPAD2
-                    0x33 | 0x63 => UserAction::Number(3), // VK_3, VK_NUMPAD3
-                    0x34 | 0x64 => UserAction::Number(4), // VK_4, VK_NUMPAD4
-                    0x35 | 0x65 => UserAction::Number(5), // VK_5, VK_NUMPAD5
-                    0x36 | 0x66 => UserAction::Number(6), // VK_6, VK_NUMPAD6
-                    0x37 | 0x67 => UserAction::Number(7), // VK_7, VK_NUMPAD7
-                    0x38 | 0x68 => UserAction::Number(8), // VK_8, VK_NUMPAD8
-                    0x39 | 0x69 => UserAction::Number(9), // VK_9, VK_NUMPAD9
-                    _ => UserAction::Unknown,
-                }
+                UserAction::Number((key_code & 0x0F) as i8)
             }
 
-            0x75 => UserAction::Function(Function::Six), // VK_F6
-            0x76 => UserAction::Function(Function::Seven), // VK_F7
-            0x77 => UserAction::Function(Function::Eight), // VK_F8
-            0x78 => UserAction::Function(Function::Nine), // VK_F9
-            0x79 => UserAction::Function(Function::Ten), // VK_F10
+            // VK_F6..VK_F10
+            0x75 => UserAction::Function(SetTextType::Hiragana),
+            0x76 => UserAction::Function(SetTextType::Katakana),
+            0x77 => UserAction::Function(SetTextType::HalfKatakana),
+            0x78 => UserAction::Function(SetTextType::FullLatin),
+            0x79 => UserAction::Function(SetTextType::HalfLatin),
 
             // Zenkaku/Hankaku, and VK_KANJI — which is what Windows
             // translates Alt+` into on a 101-key Japanese layout
-            0xF3 | 0xF4 | 0x19 => UserAction::ToggleInputMode,
+            _ if is_ime_toggle_key(key_code) => UserAction::ToggleInputMode,
 
             _ => {
                 let key_state = {
