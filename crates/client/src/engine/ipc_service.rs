@@ -186,25 +186,14 @@ fn candidates_or_missing(
 
 impl IPCService {
     pub fn new() -> Result<Self> {
-        let runtime = tokio::runtime::Runtime::new()?;
-
-        // Enter the runtime context before building the channels. tonic's
-        // connect_with_connector_lazy installs the channel's connection task
-        // and needs an ambient Tokio reactor; this runs on the host app's UI
-        // thread, which has no runtime otherwise. Without this guard,
-        // IPCService::new panics inside Activate with "there is no reactor
-        // running", the panic is caught and turned into E_FAIL, and the TIP
-        // never activates (the previously active IME's icon stays). The guard
-        // is dropped at the end of new(); RPCs later run via runtime.block_on,
-        // which enters the context on their own.
-        let _guard = runtime.enter();
-
-        // lazy channels: no connection is attempted here. Each RPC connects
-        // on demand and tonic re-establishes the connection after transport
-        // failures, so the IME recovers automatically when the server or UI
-        // process restarts — without re-activating the text service.
-        let server_channel = shared::pipe::lazy_pipe_channel(shared::pipe::server_pipe())?;
-        let ui_channel = shared::pipe::lazy_pipe_channel(shared::pipe::ui_pipe())?;
+        // The runtime, and the channels built inside its context — see
+        // shared::pipe::blocking_channels for why the context matters here.
+        let (runtime, (server_channel, ui_channel)) = shared::pipe::blocking_channels(|| {
+            Ok::<_, anyhow::Error>((
+                shared::pipe::lazy_pipe_channel(shared::pipe::server_pipe())?,
+                shared::pipe::lazy_pipe_channel(shared::pipe::ui_pipe())?,
+            ))
+        })?;
 
         let azookey_client = AzookeyServiceClient::new(server_channel);
         let window_client = WindowServiceClient::new(ui_channel);

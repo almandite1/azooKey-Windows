@@ -80,6 +80,41 @@ fn current_session_id() -> u32 {
 /// recover automatically when the peer process restarts. The busy-retry
 /// loop below never gives up on its own — callers MUST bound every RPC
 /// (and thereby the connection attempt) with a timeout.
+/// Builds a Tokio runtime and, inside its context, the lazy channels
+/// `build` asks for.
+///
+/// The entering is the whole point, and it is why this is shared rather than
+/// written out twice. Both blocking callers — the TIP (crates/client) and the
+/// settings app (frontend/src-tauri) — construct their channels on a thread
+/// with no ambient reactor: a host application's UI thread, and Tauri's main
+/// thread. `connect_with_connector_lazy` installs the channel's connection
+/// task and needs one, so building a channel outside the context panics with
+/// "there is no reactor running". In the TIP that panic is caught and turned
+/// into E_FAIL, so the text service never activates and the previous IME's
+/// icon stays; in the settings app it cannot unwind across the WebView2 COM
+/// callback and aborts the process.
+///
+/// The guard is dropped before returning: the RPCs themselves go through
+/// `runtime.block_on`, which enters the context on their own.
+///
+/// No connection is attempted here — that is what "lazy" means. Each RPC
+/// connects on demand and tonic re-establishes the connection after a
+/// transport failure, so both callers recover automatically when the server
+/// restarts.
+pub fn blocking_channels<T, E>(
+    build: impl FnOnce() -> Result<T, E>,
+) -> Result<(tokio::runtime::Runtime, T), E>
+where
+    E: From<std::io::Error>,
+{
+    let runtime = tokio::runtime::Runtime::new()?;
+    let channels = {
+        let _guard = runtime.enter();
+        build()?
+    };
+    Ok((runtime, channels))
+}
+
 pub fn lazy_pipe_channel(pipe_name: String) -> Result<Channel, tonic::transport::Error> {
     // the URI is a placeholder; the connector below opens a named pipe
     Ok(

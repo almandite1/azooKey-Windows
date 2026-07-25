@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use azookey_server::PipeConnectInfo;
 use tonic::Request;
 
-use crate::ffi::RemoveSession;
+use crate::wrappers::remove_session;
 
 /// Sessions are created implicitly on first use, but nothing tells the
 /// server when a client connection goes away — evict engine state that has
@@ -76,7 +76,7 @@ fn touch_and_take_expired(id: i64, now: Instant) -> Vec<i64> {
 
 fn touch_session(id: i64) {
     for sid in touch_and_take_expired(id, Instant::now()) {
-        unsafe { RemoveSession(sid) };
+        remove_session(sid);
     }
 }
 
@@ -84,8 +84,9 @@ fn touch_session(id: i64) {
 mod tests {
     //! IMPORTANT: nothing here may reference an FFI symbol, directly or
     //! through a helper that calls one — see the note in `wrappers.rs`. That
-    //! is why these drive `touch_and_take_expired` and `session_id_of`
-    //! rather than `touch_session`/`session_of`, which call `RemoveSession`.
+    //! is why these drive `touch_and_take_expired` and `session_id_of` rather
+    //! than `touch_session`/`session_of`, which reach `RemoveSession` through
+    //! `wrappers::remove_session`.
 
     use super::{
         SESSION_IDLE_TIMEOUT, SESSION_LAST_USED, expired_sessions, session_id_of,

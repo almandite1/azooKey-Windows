@@ -18,21 +18,15 @@ pub struct IPCService {
 
 impl IPCService {
     pub fn new() -> Result<Self> {
-        let runtime = tokio::runtime::Runtime::new()?;
-
-        // Enter the runtime context before building the channel: tonic's
-        // connect_with_connector_lazy spawns the channel's connection task
-        // and needs an ambient Tokio reactor, but Tauri invokes commands on
-        // the main thread, which has none. Without this guard the spawn
-        // panics ("there is no reactor running"), and the panic aborts the
-        // whole settings app because it cannot unwind across the WebView2
-        // COM callback that invoked the command. Same pattern as
-        // crates/client/src/engine/ipc_service.rs.
-        let _guard = runtime.enter();
-
-        // lazy: no connection is attempted until the first RPC, and tonic
-        // reconnects automatically after the server restarts
-        let server_channel = shared::pipe::lazy_pipe_channel(shared::pipe::server_pipe())?;
+        // The runtime, and the channel built inside its context — see
+        // shared::pipe::blocking_channels. Tauri invokes commands on the main
+        // thread, which has no ambient reactor, and the panic that would
+        // cause cannot unwind across the WebView2 COM callback: it aborts the
+        // settings app. This used to be a hand-copied version of the TIP's
+        // constructor.
+        let (runtime, server_channel) = shared::pipe::blocking_channels(|| {
+            Ok::<_, anyhow::Error>(shared::pipe::lazy_pipe_channel(shared::pipe::server_pipe())?)
+        })?;
         let azookey_client = AzookeyServiceClient::new(server_channel);
 
         Ok(Self {
@@ -44,6 +38,13 @@ impl IPCService {
 
 // implement methods to interact with kkc server
 impl IPCService {
+    /// NOTE: unlike the TIP, this does not classify the failure with
+    /// `shared::pipe::is_transport_failure` — every error, timeout or
+    /// rejection alike, is reported to the settings UI the same way. That is
+    /// deliberate for now: the settings app has one RPC and nothing to
+    /// recover, so telling "the server is gone" from "the server said no"
+    /// would change what the user is shown without changing what they can do
+    /// about it. Revisit together with the settings app's error surface.
     pub fn update_config(&mut self) -> anyhow::Result<()> {
         let mut client = self.azookey_client.clone();
         self.runtime.block_on(async move {

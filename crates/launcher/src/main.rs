@@ -1,7 +1,6 @@
 use shared::AppConfig;
 use std::env;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -38,8 +37,10 @@ const STARTUP_GRACE: Duration = Duration::from_secs(120);
 /// without the child ever becoming healthy in between
 const MAX_CONSECUTIVE_WATCHDOG_KILLS: u32 = 5;
 
-/// keep at most this many launcher session logs
-const MAX_LOG_FILES: usize = 10;
+/// Distinguishes this component's logs from the server's and the client's in
+/// the shared directory — and so decides which ones rotation may delete. The
+/// retention policy itself is `shared::logs`.
+const LOG_PREFIX: &str = "launcher-";
 
 /// A job object with KILL_ON_JOB_CLOSE: the children are added to it, so if
 /// the launcher dies (crash or kill) instead of exiting cleanly, Windows
@@ -128,9 +129,7 @@ fn init_log_file() {
     // unusable used to run with no record at all, so a missing log could not
     // be read as "it never started" (issue #79). A log in the wrong place is
     // strictly better than no log.
-    let localappdata = env::var_os("LOCALAPPDATA")
-        .map(|base| Path::new(&base).join("Azookey").join("logs"))
-        .filter(|dir| std::fs::create_dir_all(dir).is_ok());
+    let localappdata = shared::logs::log_dir().filter(|dir| std::fs::create_dir_all(dir).is_ok());
     let fallback = std::env::temp_dir().join("Azookey-logs");
     let Some(dir) = localappdata.or_else(|| {
         std::fs::create_dir_all(&fallback)
@@ -140,37 +139,15 @@ fn init_log_file() {
         return;
     };
 
-    prune_old_logs(&dir);
+    shared::logs::prune_old_logs(&dir, LOG_PREFIX);
 
     let name = format!(
-        "launcher-{}-{}.log",
+        "{LOG_PREFIX}{}-{}.log",
         chrono::Local::now().format("%Y%m%d-%H%M%S"),
         std::process::id()
     );
     if let Ok(file) = std::fs::File::create(dir.join(name)) {
         let _ = LOG_FILE.set(Mutex::new(file));
-    }
-}
-
-fn prune_old_logs(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut logs: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("launcher-") && n.ends_with(".log"))
-        })
-        .collect();
-    // timestamped names sort chronologically
-    logs.sort();
-    if logs.len() >= MAX_LOG_FILES {
-        for old in &logs[..logs.len() + 1 - MAX_LOG_FILES] {
-            let _ = std::fs::remove_file(old);
-        }
     }
 }
 
@@ -613,32 +590,41 @@ mod tests {
         base + Duration::from_secs(secs)
     }
 
+    /// The rotation itself is tested in `shared::logs`; what belongs here is
+    /// that the launcher asks for ITS OWN prefix. A wrong one would rotate
+    /// away another component's logs and never its own.
     #[test]
-    fn prune_keeps_only_the_newest_logs() {
+    fn the_launcher_rotates_only_launcher_logs() {
         let dir = std::env::temp_dir().join(format!("azk-prune-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for day in 1..=12 {
-            let name = format!("launcher-202601{day:02}-000000-1.log");
-            std::fs::write(dir.join(name), "x").unwrap();
+            std::fs::write(
+                dir.join(format!("{LOG_PREFIX}202601{day:02}-000000-1.log")),
+                "x",
+            )
+            .unwrap();
+            std::fs::write(dir.join(format!("server-202601{day:02}-000000-1.log")), "x").unwrap();
         }
-        std::fs::write(dir.join("unrelated.txt"), "x").unwrap();
 
-        prune_old_logs(&dir);
+        shared::logs::prune_old_logs(&dir, LOG_PREFIX);
 
-        let mut remaining: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("launcher-"))
-            .collect();
-        remaining.sort();
+        let names = |prefix: &str| {
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(prefix))
+                .collect();
+            names.sort();
+            names
+        };
 
+        let remaining = names(LOG_PREFIX);
         // room is left for the new session's file: 12 -> MAX_LOG_FILES - 1
-        assert_eq!(remaining.len(), MAX_LOG_FILES - 1);
-        // the oldest files are the ones deleted
-        assert!(remaining[0].contains("20260104"));
-        // non-log files are untouched
-        assert!(dir.join("unrelated.txt").exists());
+        assert_eq!(remaining.len(), shared::logs::MAX_LOG_FILES - 1);
+        assert!(remaining[0].contains("20260104"), "kept {remaining:?}");
+        assert_eq!(names("server-").len(), 12, "another component's logs stay");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

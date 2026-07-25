@@ -11,6 +11,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
+# only for shared::logs: the harness scans the very directory the components
+# write to, so it must not carry its own copy of that path
+shared = { workspace = true }
 
 # the custom host binary (src/bin/azookey-e2e-host.rs) is a Win32 GUI, so it
 # is not a plain console exe — but it is launched by the harness, not
