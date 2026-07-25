@@ -398,7 +398,6 @@ impl ITfTextInputProcessorEx_Impl for TextServiceFactory_Impl {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::rc::Rc;
-    use std::sync::Mutex;
 
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
     use windows::Win32::UI::TextServices::{
@@ -407,7 +406,7 @@ mod tests {
 
     use crate::engine::composition::CompositionState;
     use crate::engine::state::IMEState;
-    use crate::globals::{DLL_INSTANCE, DllModule};
+    use crate::globals::DllModule;
     use crate::tsf::factory::TextServiceFactory;
     use crate::tsf::test_support::{
         CompartmentLog, EditSessionBehavior, FakeContext, FakeThreadMgr, ThreadMgrLog, factory_of,
@@ -418,12 +417,17 @@ mod tests {
     // so every test here holds the crate-wide global_state_lock (shared with
     // the update_pos/update_context tests, which read the same global).
 
-    /// A `#[test]` never runs DllMain, so the global DllModule the real
-    /// Activate reference-counts is never initialized. Set it up once; the
-    /// hinst stays None, which is fine because Activate only ever add_ref/
-    /// releases the counter, never dereferences the module handle.
+    /// A `#[test]` never runs DllMain. That is no longer a problem for the
+    /// counter — `DllModule::get` builds it on first use, deliberately, so
+    /// that DllMain does not have to allocate under the loader lock — and it
+    /// was never a problem for the module handle, which Activate only
+    /// reference-counts around and never dereferences.
+    ///
+    /// Kept as an explicit call so the tests still say what they depend on.
+    /// The guard is dropped on the same statement on purpose — this only
+    /// forces the one-time init, it is not holding the lock for anything.
     fn ensure_dll_module() {
-        let _ = DLL_INSTANCE.set(Mutex::new(DllModule::new()));
+        drop(DllModule::get());
     }
 
     /// Fresh IMEState so one test's leftover ipc_service can't leak into the

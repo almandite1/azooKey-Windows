@@ -255,6 +255,19 @@ jobs:
     - name: Test (x86)
       run: cargo test -p azookey-windows --target i686-pc-windows-msvc --release
 
+    # DllMain runs under the loader lock inside every application that loads
+    # the IME, Explorer included, so a fault there is a frozen desktop rather
+    # than a crash report. Nothing above ever loads the DLL: `cargo test`
+    # exercises the crate's code, not its entry point. This does, without
+    # registering the TIP, so it stays CI-safe. Both bitnesses, each from a
+    # host of its own width — LoadLibrary cannot cross that boundary.
+    - name: Test (TIP DLL lifecycle)
+      run: |
+        powershell -ExecutionPolicy Bypass -File scripts/test_client_dll_lifecycle.ps1 -Path build/azookey_windows.dll
+        if ($LASTEXITCODE -ne 0) { throw "x64 DLL lifecycle test failed" }
+        & "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe" -ExecutionPolicy Bypass -File "$PWD\scripts\test_client_dll_lifecycle.ps1" -Path "$PWD\build\x86\azookey_windows.dll"
+        if ($LASTEXITCODE -ne 0) { throw "x86 DLL lifecycle test failed" }
+
     # upload v7 and download v8 (in the release job) look mismatched but are
     # the matching pair: the two actions live in separate repositories whose
     # major numbers are offset by one, and they are bumped together on the same

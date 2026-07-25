@@ -1,7 +1,6 @@
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock,
     atomic::{AtomicUsize, Ordering},
-    mpsc::Sender,
 };
 
 use anyhow::{Context, Result};
@@ -76,37 +75,65 @@ pub const TEXTSERVICE_LANGBARITEMSINK_COOKIE: u32 = 0;
 
 pub static DLL_INSTANCE: OnceLock<Mutex<DllModule>> = OnceLock::new();
 
+/// The module handle `DllMain` was given, as a plain integer.
+///
+/// An atomic rather than a field of the `Mutex<DllModule>` below because
+/// `DllMain` runs under the LOADER LOCK: taking a lock there can deadlock the
+/// host against any other thread that holds it and is waiting on the loader.
+/// A relaxed store of a pointer-sized integer cannot. Everything that needs
+/// the handle reads it back through [`DllModule::hmodule`], which is likewise
+/// lock-free.
+///
+/// Zero means "DllMain has not run", which is the case in unit tests.
+static DLL_HMODULE: AtomicUsize = AtomicUsize::new(0);
+
+/// Records the handle `DllMain` received. The only thing `DLL_PROCESS_ATTACH`
+/// does besides `DisableThreadLibraryCalls`.
+pub fn set_dll_hmodule(hinst: HMODULE) {
+    DLL_HMODULE.store(hinst.0 as usize, Ordering::Relaxed);
+}
+
 unsafe impl Sync for DllModule {}
 unsafe impl Send for DllModule {}
 
+/// The COM lock count for `DllCanUnloadNow`. It used to carry the module
+/// handle and a channel sender too; the handle moved to [`DLL_HMODULE`] (see
+/// there) and the sender was never assigned by anything.
 #[derive(Debug)]
 pub struct DllModule {
     pub ref_count: Arc<AtomicUsize>,
-    pub hinst: Option<HMODULE>,
-    pub sender: Option<Sender<bool>>,
 }
 
 impl DllModule {
     pub fn new() -> Self {
         Self {
             ref_count: Arc::new(AtomicUsize::new(0)),
-            hinst: None,
-            sender: None,
         }
     }
 
     pub fn get() -> Result<MutexGuard<'static, DllModule>> {
-        // recover from poisoning: one panic while the lock was held must
-        // not permanently break every later Activate/LockServer call
+        // Initialized here, on first use, rather than in DllMain: building it
+        // allocates, and the less that happens under the loader lock the
+        // better. Every caller is a COM entry point, well outside it.
+        //
+        // Poisoning is recovered from: one panic while the lock was held must
+        // not permanently break every later Activate/LockServer call.
         Ok(DLL_INSTANCE
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("DllModule is not initialized"))?
+            .get_or_init(|| Mutex::new(DllModule::new()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
+    /// The module handle, or an error before `DllMain` has run (unit tests).
+    pub fn hmodule() -> Result<HMODULE> {
+        match DLL_HMODULE.load(Ordering::Relaxed) {
+            0 => Err(anyhow::anyhow!("DllMain has not recorded a module handle")),
+            handle => Ok(HMODULE(handle as *mut core::ffi::c_void)),
+        }
+    }
+
     pub fn get_path() -> anyhow::Result<String> {
-        let dll_instance = DllModule::get()?.hinst.context("Dll instance not found")?;
+        let dll_instance = Self::hmodule().context("Dll instance not found")?;
 
         // GetModuleFileNameW does not report the required length: it fills the
         // buffer, and if the path does not fit it truncates and returns the

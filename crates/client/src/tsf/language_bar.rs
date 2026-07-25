@@ -23,7 +23,7 @@ use crate::{
     globals::{DllModule, GUID_TEXT_SERVICE, TEXTSERVICE_LANGBARITEMSINK_COOKIE},
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 
 use super::factory::TextServiceFactory_Impl;
 
@@ -153,7 +153,7 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
 
     #[macros::anyhow]
     fn GetIcon(&self) -> Result<HICON> {
-        let dll_module = DllModule::get()?;
+        let hmodule = DllModule::hmodule()?;
         let input_mode = self.borrow()?.input_mode.clone();
         let theme = get_theme()?;
 
@@ -163,9 +163,7 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
             let handle = LoadImageW(
                 // 0.62 takes an Option<HINSTANCE> here rather than the HMODULE
                 // the DLL entry point handed us; same handle either way
-                Some(HINSTANCE(
-                    dll_module.hinst.context("Dll instance not found")?.0,
-                )),
+                Some(HINSTANCE(hmodule.0)),
                 PCWSTR(icon_id as *mut u16),
                 IMAGE_ICON,
                 0,
