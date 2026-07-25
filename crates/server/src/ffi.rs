@@ -34,6 +34,9 @@ pub(crate) struct FFICandidate {
 unsafe extern "C" {
     pub(crate) fn Initialize(path: *const c_char);
     pub(crate) fn SetContext(session: i64, context: *const c_char);
+    // `cursorPtr` receives the absolute cursor position in the reading after
+    // the call, counted in kana from its start. MoveCursor takes a relative
+    // offset but reports a position too, not the distance it moved (#82).
     pub(crate) fn AppendText(
         session: i64,
         input: *const c_char,

@@ -155,13 +155,13 @@ struct CompositionEditingTests {
         return (reading.map { String(cString: $0) } ?? "", cursor)
     }
 
-    private func moveCursor(_ session: Int64, _ offset: Int32) -> (reading: String, moved: Int32) {
-        var moved: Int32 = -1
-        let reading = withUnsafeMutablePointer(to: &moved) {
+    private func moveCursor(_ session: Int64, _ offset: Int32) -> (reading: String, cursor: Int32) {
+        var cursor: Int32 = -1
+        let reading = withUnsafeMutablePointer(to: &cursor) {
             move_cursor(session: session, offset: offset, cursorPtr: $0)
         }
         defer { free_string(ptr: reading) }
-        return (reading.map { String(cString: $0) } ?? "", moved)
+        return (reading.map { String(cString: $0) } ?? "", cursor)
     }
 
     private func shrink(_ session: Int64, by surfaces: Int32) -> String {
@@ -217,24 +217,26 @@ struct CompositionEditingTests {
     /// The offset is whatever the client sent, so this is the FFI boundary:
     /// it clamps at both ends instead of running off the reading.
     ///
-    /// NOTE: the out-parameter is the DISTANCE actually moved, while
-    /// `AppendText`/`RemoveText` report the absolute cursor position in the
-    /// same field. Nothing consumes it today (the client's MoveCursor arm is
-    /// a deliberate no-op until predictive conversion lands), so this pins
-    /// the behavior as it is rather than papering over the difference.
+    /// The out-parameter is the absolute cursor position after the move, the
+    /// same thing `AppendText`/`RemoveText` report in that field — the
+    /// underlying `moveCursorFromCursorPosition` hands back the distance it
+    /// travelled instead, and letting that through made one argument mean two
+    /// things (#82).
     @Test("MoveCursor clamps at both ends of the reading")
     func moveCursorClamps() {
         let session: Int64 = 0x7101_0004
         defer { remove_session(session: session) }
         append("mizu", to: session)  // 2 kana, cursor at 2
 
-        #expect(moveCursor(session, -100).moved == -2, "clamped to the start")
+        #expect(moveCursor(session, -100).cursor == 0, "clamped to the start")
         #expect(sessions[session]?.composingText.convertTargetCursorPosition == 0)
 
-        #expect(moveCursor(session, 100).moved == 2, "clamped to the end")
+        #expect(moveCursor(session, 100).cursor == 2, "clamped to the end")
         #expect(sessions[session]?.composingText.convertTargetCursorPosition == 2)
 
-        #expect(moveCursor(session, 100).moved == 0, "already at the end")
+        // a move that goes nowhere still reports where the cursor is, not the
+        // zero distance it covered
+        #expect(moveCursor(session, 100).cursor == 2, "already at the end")
     }
 
     /// Committing the front of the composition: `ShrinkText` spends a KANA

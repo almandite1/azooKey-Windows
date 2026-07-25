@@ -86,9 +86,14 @@ import ffi
     cursorPtr: UnsafeMutablePointer<Int32>
 ) -> UnsafeMutablePointer<CChar>? {
     withSession(session) { state in
-        let cursor = state.composingText.moveCursorFromCursorPosition(count: Int(offset))
+        // moveCursorFromCursorPosition returns the clamped DISTANCE it
+        // moved, not the position it arrived at. Every other export writes
+        // an absolute position through this out-parameter, so discard the
+        // distance and report the position, or the same argument would mean
+        // two different things depending on which call filled it in.
+        _ = state.composingText.moveCursorFromCursorPosition(count: Int(offset))
 
-        cursorPtr.pointee = Int32(cursor)
+        cursorPtr.pointee = Int32(state.composingText.convertTargetCursorPosition)
         return _strdup(kanaReading(state.composingText.convertTarget))
     }
 }
