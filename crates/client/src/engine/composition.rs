@@ -683,14 +683,19 @@ impl TextServiceFactory_Impl {
         mode: &InputMode,
         text: &str,
     ) -> Result<()> {
-        edit.raw_input.push_str(text);
-
-        let text = match mode {
+        let keystrokes = match mode {
             InputMode::Kana => to_fullwidth(text, false),
             InputMode::Latin => text.to_string(),
         };
 
-        let candidates = ipc_service.append_text(text)?;
+        let candidates = ipc_service.append_text(keystrokes)?;
+
+        // Only now, with the engine's answer in hand. raw_input is the
+        // keystrokes the SERVER has consumed, and the write-back runs even
+        // when an action fails, so recording the keystroke before the call
+        // meant a failed call still spent it: F9/F10 would then render input
+        // the engine never saw (#85).
+        edit.raw_input.push_str(text);
         // The engine returned a fresh list; an index carried over from
         // Previewing (the arrow keys transition to Composing but map to the
         // MoveCursor no-op, which keeps the index) would adopt the wrong
@@ -802,16 +807,30 @@ impl TextServiceFactory_Impl {
         mode: &InputMode,
         text: &str,
     ) -> Result<()> {
-        edit.raw_input = raw_input_after_commit(&edit.raw_input, text, edit.corresponding_count);
+        // Both values are computed up front because they read
+        // `corresponding_count`, which `adopt_fresh` below overwrites — but
+        // each is APPLIED only once the call it describes has landed. The
+        // write-back runs even when an action fails, so assigning either one
+        // early spent keystrokes on a call that might not happen (#85).
+        //
+        // Two of them because this arm makes two calls and can stop between
+        // them: after the commit the server has dropped the prefix but has
+        // not seen the new keystroke yet.
+        let spent = edit.corresponding_count;
+        let after_commit = raw_input_after_commit(&edit.raw_input, "", spent);
+        let after_append = raw_input_after_commit(&edit.raw_input, text, spent);
 
         // kana, not keystrokes: only the reading can express a candidate
         // that ends inside a romaji cluster
         ipc_service.shrink_text(edit.surface_count)?;
-        let text = match mode {
+        edit.raw_input = after_commit;
+
+        let keystrokes = match mode {
             InputMode::Kana => to_fullwidth(text, false),
             InputMode::Latin => text.to_string(),
         };
-        let candidates = ipc_service.append_text(text)?;
+        let candidates = ipc_service.append_text(keystrokes)?;
+        edit.raw_input = after_append;
 
         // shift_start needs the preview being replaced, captured before
         // adopt_fresh overwrites it (it does not read edit.candidates, so
@@ -1466,6 +1485,94 @@ mod tests {
             "all typed input elements (watashino) correspond to the shown \
              text, so a following ShrinkText must drop them all"
         );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// A keystroke the engine REJECTED must not be recorded as typed (#85).
+    ///
+    /// `raw_input` is the keystrokes the server has consumed, and the
+    /// write-back runs even when an action fails — deliberately, so a failure
+    /// cannot wedge input. Recording the keystroke before the call therefore
+    /// made a failed call spend it anyway, and F9/F10 (which render
+    /// `raw_input` directly) would then show input the engine never saw.
+    ///
+    /// The failure here is a plain engine error, NOT `ServerUnavailable`: that
+    /// one is already covered by the rebuild, which restores the whole
+    /// composition from the batch-start snapshot.
+    #[test]
+    fn a_rejected_keystroke_is_not_recorded_as_typed() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(scripted(&["水"], "みず", &[4], &[2]));
+        fake.lock().unwrap().engine_fails = true;
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = factory_of(&tip);
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Composing;
+            composition.raw_input = "mizu".to_string();
+            composition.raw_hiragana = "みず".to_string();
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        let result = factory.handle_action(
+            &[ClientAction::AppendText("ka".to_string())],
+            CompositionState::Composing,
+        );
+        assert!(result.is_err(), "an engine error must still be surfaced");
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(
+            composition.raw_input, "mizu",
+            "the engine rejected the keystroke, so it was never typed as far \
+             as the composition is concerned"
+        );
+        drop(composition);
+        drop(text_service);
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// The same for the commit path, which makes TWO calls and can stop
+    /// between them. A failed `ShrinkText` must leave the reading whole: the
+    /// old arm had already dropped the committed prefix (and appended the new
+    /// keystroke) before asking the server to commit anything (#85).
+    #[test]
+    fn a_failed_commit_leaves_the_keystrokes_alone() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(scripted(&["ん"], "ん", &[1], &[1]));
+        fake.lock().unwrap().engine_fails = true;
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = factory_of(&tip);
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Previewing;
+            composition.preview = "水".to_string();
+            composition.raw_input = "mizu".to_string();
+            composition.corresponding_count = 4;
+            composition.surface_count = 2;
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        let result = factory.handle_action(
+            &[ClientAction::ShrinkText("n".to_string())],
+            CompositionState::Previewing,
+        );
+        assert!(result.is_err(), "an engine error must still be surfaced");
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(
+            composition.raw_input, "mizu",
+            "ShrinkText failed, so nothing was committed and nothing was typed"
+        );
+        drop(composition);
+        drop(text_service);
 
         IMEState::get().unwrap().ipc_service = None;
     }
