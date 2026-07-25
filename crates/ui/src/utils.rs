@@ -178,12 +178,29 @@ impl ShowOwner {
     }
 }
 
+/// Narrowest the candidate window may get, in CSS px: below this the window
+/// reads as a stray tooltip rather than a list.
+const MIN_CANDIDATE_WINDOW_WIDTH: u32 = 225;
+
+/// Widest it may get. Candidate length is not bounded — a prediction can
+/// cover a whole phrase — and an uncapped window stretched to match, at which
+/// point `clamp_candidate_position` had to slide it away from the caret to
+/// keep it inside the work area, leaving the candidates nowhere near the text
+/// they belong to. Past this the rows are ellipsized instead
+/// (`candidate.css`), which costs the tail of one long candidate rather than
+/// the position of all of them.
+const MAX_CANDIDATE_WINDOW_WIDTH: u32 = 640;
+
 /// Logical (CSS px) width of the candidate window for the longest candidate,
 /// in characters. The webview lays out in CSS px, so this must be applied as
 /// a `LogicalSize` — applying it as physical px left the window too small on
 /// high-DPI displays (B20).
 pub fn candidate_window_logical_width(max_len: u32) -> u32 {
-    std::cmp::max(225, 120 + max_len * 18)
+    // saturating: `max_len` is a character count that arrives from the engine,
+    // and an overflowing multiply would wrap to a comically narrow window
+    // rather than a wide one
+    let wanted = 120u32.saturating_add(max_len.saturating_mul(18));
+    wanted.clamp(MIN_CANDIDATE_WINDOW_WIDTH, MAX_CANDIDATE_WINDOW_WIDTH)
 }
 
 /// Length of the longest candidate in CHARS, not bytes — a byte count would
@@ -394,6 +411,28 @@ mod tests {
     fn width_scales_with_the_longest_candidate() {
         assert_eq!(candidate_window_logical_width(6), 228);
         assert_eq!(candidate_window_logical_width(20), 480);
+    }
+
+    /// Candidate length is unbounded, the window is not. Without the cap one
+    /// long prediction stretched the window until `clamp_candidate_position`
+    /// had to slide it away from the caret to fit the work area — so a single
+    /// candidate moved the whole list away from the text it belonged to.
+    #[test]
+    fn width_has_a_maximum() {
+        // 120 + 28*18 = 624, still under the cap
+        assert_eq!(candidate_window_logical_width(28), 624);
+        // 120 + 29*18 = 642 would exceed it
+        assert_eq!(candidate_window_logical_width(29), 640);
+        assert_eq!(candidate_window_logical_width(200), 640);
+    }
+
+    /// The character count comes from the engine, and `120 + len * 18` is a
+    /// u32 multiply. Wrapping would size the window from the low bits of a
+    /// huge number, which lands anywhere — including below the floor.
+    #[test]
+    fn an_absurd_candidate_length_saturates_instead_of_wrapping() {
+        assert_eq!(candidate_window_logical_width(u32::MAX), 640);
+        assert_eq!(candidate_window_logical_width(u32::MAX / 18), 640);
     }
 
     #[test]

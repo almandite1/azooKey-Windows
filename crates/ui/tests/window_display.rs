@@ -308,6 +308,23 @@ async fn a_long_candidate_widens_the_window() {
         )
     });
 
+    // ...but only up to the cap. Candidate length is unbounded, and an
+    // uncapped window stretched until it had to be slid away from the caret
+    // to fit the work area, taking the whole list away from the text.
+    ui.set_candidates(&["あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめも"])
+        .await;
+    poll_until(SETTLE_TIMEOUT, || {
+        let width = candidate.logical_width();
+        ((width - 640.0).abs() < 2.0).then_some(width)
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "a 35-char candidate must stop at the 640px cap, got {:.0}px (at {} dpi)",
+            candidate.logical_width(),
+            candidate.dpi()
+        )
+    });
+
     ui.assert_no_errors();
 }
 
