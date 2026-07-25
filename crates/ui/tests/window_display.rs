@@ -355,9 +355,7 @@ async fn the_window_is_as_tall_as_the_list() {
         let height = candidate.logical_height();
         (height > two + 1.0).then_some(height)
     })
-    .unwrap_or_else(|| {
-        panic!("a five-item list must grow the window back from {two:.0}px")
-    });
+    .unwrap_or_else(|| panic!("a five-item list must grow the window back from {two:.0}px"));
     assert!(
         (five - full).abs() < 2.0,
         "five candidates is what the startup measurement sized for, so the two \

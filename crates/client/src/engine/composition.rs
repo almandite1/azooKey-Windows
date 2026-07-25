@@ -798,13 +798,15 @@ impl TextServiceFactory_Impl {
         ipc_service: &mut IPCService,
         selection: &SetSelectionType,
     ) -> Result<()> {
-        let candidates = {
-            let text_service = self.borrow()?;
-            let composition = text_service.borrow_composition()?.clone();
-            composition.candidates.clone()
-        };
-
-        let texts = candidates.texts.clone();
+        // The WORKING COPY's list, not the live composition's. They are the
+        // same today, because the transition table only ever emits
+        // SetSelection on its own — but the moment a batch pairs it with an
+        // action that fetches candidates (predictive conversion is the
+        // obvious one), the live composition still holds the previous list:
+        // the write-back does not happen until the batch ends. Reading it
+        // here would silently highlight an entry of a list that is already
+        // gone.
+        let candidates = edit.candidates.clone();
 
         // clamp lower bound first: on an empty list len() - 1 is -1 and the
         // later `as usize` cast would go out of bounds
@@ -812,7 +814,7 @@ impl TextServiceFactory_Impl {
             SetSelectionType::Up => edit.selection_index - 1,
             SetSelectionType::Down => edit.selection_index + 1,
         }
-        .clamp(0, max(0, texts.len() as i32 - 1));
+        .clamp(0, max(0, candidates.texts.len() as i32 - 1));
 
         self.publish_candidates(
             ipc_service,
