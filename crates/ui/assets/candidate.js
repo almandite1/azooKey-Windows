@@ -12,6 +12,11 @@ function describeCandidate(li, index, total) {
     }
 }
 
+// The tallest the list is allowed to get. Past this the list scrolls, which
+// `updateSelection` implements in groups of exactly this many, so the two
+// numbers have to stay the same one.
+const MAX_VISIBLE_CANDIDATES = 5;
+
 function updateCandidates(candidates) {
     const candidateList = document.getElementById('candidate-list');
 
@@ -32,6 +37,8 @@ function updateCandidates(candidates) {
     while (existingItems.length > candidates.length) {
         candidateList.removeChild(existingItems.pop());
     }
+
+    resizeToCandidates(candidates.length);
 }
 
 function updateSelection(index) {
@@ -78,47 +85,67 @@ function isElementInView(element, container) {
     );
 }
 
-function adjustWindowSize() {
-    const candidateList = document.getElementById('candidate-list');
-
-    // Clear any existing items
-    candidateList.innerHTML = '';
-
-    // Add 5 test items to measure
-    for (let i = 0; i < 5; i++) {
-        const li = document.createElement('li');
-        li.textContent = `Item ${i + 1}`;
-        candidateList.appendChild(li);
-    }
-
-    // Calculate heights
+// Everything the window needs that is not a candidate row: the footer and the
+// paddings around the list.
+function chromeHeight() {
     const footer = document.querySelector('footer');
     const main = document.querySelector('main');
     const body = document.body;
 
-    // Get the height of a single item
-    const itemHeight = candidateList.children[0].offsetHeight;
-
-    // Calculate the height needed for exactly 5 items
-    const candidateListHeight = itemHeight * 5;
-    const footerHeight = footer.offsetHeight;
     const mainPadding = parseInt(window.getComputedStyle(main).paddingTop) +
         parseInt(window.getComputedStyle(main).paddingBottom);
     const bodyPadding = parseInt(window.getComputedStyle(body).paddingTop) +
         parseInt(window.getComputedStyle(body).paddingBottom);
 
-    // Calculate total window height needed
-    const totalHeight = candidateListHeight + footerHeight + mainPadding + bodyPadding;
+    return footer.offsetHeight + mainPadding + bodyPadding;
+}
 
-    // Clear the test items
-    candidateList.innerHTML = '';
+// One row's height, measured from a real row when there is one. The sample row
+// is a fallback for the startup measurement, when the list is still empty.
+function itemHeight() {
+    const candidateList = document.getElementById('candidate-list');
+    if (candidateList.children.length > 0) {
+        return candidateList.children[0].offsetHeight;
+    }
 
+    const sample = document.createElement('li');
+    sample.textContent = 'x';
+    candidateList.appendChild(sample);
+    const height = sample.offsetHeight;
+    candidateList.removeChild(sample);
+    return height;
+}
+
+function postHeight(rows) {
     window.ipc.postMessage(JSON.stringify({
         type: 'resize',
-        height: totalHeight
+        height: itemHeight() * rows + chromeHeight()
     }));
 }
 
+// Sizes the window to the list it is actually showing (issue #81). This used
+// to be measured once at startup for five rows and never again, so a two-item
+// list still occupied five rows' worth of screen. The waste was not the real
+// cost: `clamp_candidate_position` flips the window above the caret whenever
+// it would overrun the work area, so near the bottom of the screen a two-item
+// list jumped a full five rows upward and landed over the host application's
+// title bar.
+//
+// An empty list is left at whatever height it had. It happens when a
+// composition ends (the TIP blanks the list right after hiding the window),
+// and collapsing to a chrome-only sliver there would only be visible as a
+// flicker on the way into the NEXT composition.
+function resizeToCandidates(count) {
+    if (count === 0) {
+        return;
+    }
+    postHeight(Math.min(count, MAX_VISIBLE_CANDIDATES));
+}
+
 window.addEventListener('DOMContentLoaded', () => {
-    setTimeout(adjustWindowSize, 50); // Small delay to ensure rendering is complete
+    // A first measurement before any candidates arrive: ui.exe holds back the
+    // very first Show until the webview has reported a height (issue #59), so
+    // this is what releases it. Full height, since the list it will hold is
+    // not known yet; the first updateCandidates corrects it.
+    setTimeout(() => postHeight(MAX_VISIBLE_CANDIDATES), 50);
 });

@@ -63,15 +63,16 @@ pub struct CandidatePlacement {
     pub caret: Option<CaretRect>,
     /// Whether `caret` belongs to the composition currently being shown.
     fresh: bool,
-    /// Whether the webview has reported its measured height yet.
+    /// Whether the webview has EVER reported a measured height.
     ///
-    /// Deliberately NOT reset by `on_hide`, unlike `fresh`: the candidate
-    /// window's height does not vary with the list. `adjustWindowSize` in
-    /// candidate.js measures five sample rows once, on `DOMContentLoaded`,
-    /// and never runs again — so the height is a property of the *window*,
-    /// settled once per ui.exe lifetime. Clearing it per composition would
-    /// mean waiting out the full grace period on every single one, for a
-    /// measurement that is never coming.
+    /// Deliberately NOT reset by `on_hide`, unlike `fresh`. The height does
+    /// vary with the list (candidate.js re-measures on every
+    /// `updateCandidates` — issue #81), but this gate is not asking "is the
+    /// height current", it is asking "has the window stopped being tao's
+    /// 800x600 default". That happens once per ui.exe lifetime and never
+    /// unhappens. Clearing it per composition would defer every `Show` until
+    /// the grace period expired, waiting on a measurement that only arrives
+    /// once the candidates do.
     height_measured: bool,
     /// A `Show` arrived before both gates were satisfied.
     deferred: bool,
