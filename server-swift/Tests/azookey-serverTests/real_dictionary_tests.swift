@@ -86,4 +86,35 @@ struct RealDictionaryTests {
             }
         }
     }
+
+    /// The dictionary is a submodule and the converter is a pinned package:
+    /// the two have to be a matching pair, and when they are not, the failure
+    /// shows up as conversion that still runs but stops proposing kanji. The
+    /// counts test above cannot see it — every candidate reconstructs the
+    /// reading just fine when the only candidates left are the kana ones.
+    ///
+    /// So assert the thing a user would notice first: typing a word offers
+    /// its kanji. Only containment is checked, never the rank — ranking moves
+    /// with every converter update, but a dictionary that has stopped
+    /// answering drops the word entirely.
+    @Test(
+        "the bundled dictionary offers the kanji for a common word",
+        arguments: [
+            ("nihonngo", "日本語"),
+            ("henkan", "変換"),
+            ("kanji", "漢字")
+        ]
+    )
+    func bundledDictionaryOffersKanji(_ input: String, _ expected: String) {
+        // exactly what GetComposedText does
+        execURL = Self.root.appendingPathComponent("azooKey_emoji_dictionary_storage")
+        let target = conversionTarget(composing(input))
+        let converted = Self.engine.requestCandidates(target, options: getOptions())
+        let candidates = converted.mainResults.map(\.text)
+
+        #expect(
+            candidates.contains(expected),
+            "\(input): the dictionary did not offer \(expected) — got \(candidates.prefix(10))"
+        )
+    }
 }
