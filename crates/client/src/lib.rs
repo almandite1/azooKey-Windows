@@ -6,9 +6,9 @@ mod register;
 mod trace;
 mod tsf;
 
-use std::{ffi::c_void, sync::Mutex};
+use std::ffi::c_void;
 
-use globals::{DLL_INSTANCE, DllModule, GUID_TEXT_SERVICE};
+use globals::{DllModule, GUID_TEXT_SERVICE};
 use register::{CLSIDMgr, CategoryMgr, ProfileMgr};
 use tsf::factory::TextServiceFactory;
 use windows::{
@@ -17,9 +17,8 @@ use windows::{
             CLASS_E_CLASSNOTAVAILABLE, E_INVALIDARG, E_NOINTERFACE, HMODULE, S_FALSE, S_OK,
         },
         System::{
-            Com::IClassFactory,
-            Ole::SELFREG_E_CLASS,
-            SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH},
+            Com::IClassFactory, LibraryLoader::DisableThreadLibraryCalls, Ole::SELFREG_E_CLASS,
+            SystemServices::DLL_PROCESS_ATTACH,
         },
     },
     core::{GUID, HRESULT, IUnknown, Interface as _},
@@ -39,6 +38,20 @@ fn ensure_logger() {
 // -- Dll Export Functions --
 // The IME DLL needs to implement the following four functions to operate as a COM server.
 
+/// Deliberately almost empty.
+///
+/// This runs under the LOADER LOCK, inside every application that has ever
+/// used the IME. Anything that takes a lock, allocates, spawns a thread or
+/// calls back into the loader can deadlock the host — and a TIP is loaded
+/// into Explorer, so "the host" includes the desktop. Logger setup is already
+/// deferred to `DllGetClassObject` (see `ensure_logger`); this leaves only a
+/// relaxed atomic store and one API call that is allowed to fail.
+///
+/// `DLL_PROCESS_DETACH` in particular does NOTHING. It used to take the
+/// `DllModule` mutex and send on a channel, both under that lock. There is
+/// nothing to release: `DllCanUnloadNow` always answers `S_FALSE`, so the DLL
+/// only ever goes away with the process, and the process takes its memory,
+/// handles and threads with it.
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(
     hinst: HMODULE,
@@ -46,35 +59,16 @@ pub extern "system" fn DllMain(
     _lpv_reserved: *mut c_void,
 ) -> bool {
     if fdw_reason == DLL_PROCESS_ATTACH {
-        let result: anyhow::Result<()> = (|| {
-            let mut dll_instance = DllModule::new();
-            dll_instance.hinst = Some(hinst);
-            DLL_INSTANCE
-                .set(Mutex::new(dll_instance))
-                .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))?;
-            Ok(())
-        })();
+        globals::set_dll_hmodule(hinst);
 
-        check_err!(result, true, false)
-    } else if fdw_reason == DLL_PROCESS_DETACH {
-        tracing::debug!("DLL_PROCESS_DETACH");
-
-        let result: anyhow::Result<()> = (|| {
-            let mut dll_instance = DllModule::get()?;
-            dll_instance.hinst = None;
-            // send a signal to the tracing writer thread to exit;
-            // the receiver may already be gone during process teardown
-            if let Some(sender) = dll_instance.sender.take() {
-                let _ = sender.send(true);
-            }
-
-            Ok(())
-        })();
-
-        check_err!(result, true, false)
-    } else {
-        true
+        // Best effort, and the return value is deliberately ignored: it fails
+        // when the DLL has static TLS, in which case the notifications simply
+        // keep coming. We ignore DLL_THREAD_ATTACH/DETACH either way, so this
+        // only saves the host the call.
+        let _ = unsafe { DisableThreadLibraryCalls(hinst) };
     }
+
+    true
 }
 
 #[unsafe(no_mangle)]
