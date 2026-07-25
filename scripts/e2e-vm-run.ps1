@@ -82,7 +82,19 @@ $ErrorActionPreference = 'Stop'
 # Everything the VM side touches lives under one directory, so a failed run
 # can be inspected (and wiped) without guessing where things landed.
 $VmRoot = 'C:\azookey-e2e'
-$VmPayload = "$VmRoot\payload"
+
+# A FRESH directory per run, never a fixed one that gets wiped and refilled.
+# The TIP DLL is registered out of this directory, and a registered TIP is
+# loaded into every process that uses the IME, explorer.exe included. Those
+# processes pin the file for as long as they live, and explorer is not
+# something a test run gets to kill. Deleting the directory therefore fails
+# for reasons that have nothing to do with anything being wrong.
+#
+# Unpacking beside the old copy sidesteps the lock entirely: re-registering
+# points the CLSID at the new path, so every process the harness starts loads
+# the new DLL. Old directories are pruned best-effort at the end; whichever
+# ones are still pinned simply wait for the next reboot.
+$VmPayload = "$VmRoot\payload-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
 $VmLog = "$VmRoot\e2e.log"
 $TaskName = 'azookey-e2e-run'
 $LauncherTaskName = 'azookey-e2e-launcher'
@@ -227,19 +239,15 @@ try {
         if ($armed) { Fail "the hang hook is still armed ('$armed'); the run would cover one scenario only" }
     }
 
-    Write-Step 'Copying the payload into the VM'
-    $cleared = Invoke-Command -Session $session -ScriptBlock {
+    Write-Step "Copying the payload into the VM ($VmPayload)"
+    Invoke-Command -Session $session -ScriptBlock {
         param($root, $payload)
+        $ErrorActionPreference = 'Stop'
         New-Item -ItemType Directory -Force -Path $root | Out-Null
-        Remove-Item $payload -Recurse -Force -ErrorAction SilentlyContinue
-        # Checked rather than assumed: a partially deleted payload is what
-        # produced the confusing Expand-Archive failure, and it is much
-        # clearer to say so here than to fail three steps later.
-        -not (Test-Path $payload)
+        # A directory named for this minute: it cannot already exist with
+        # anything in it, so there is nothing to clear and nothing to lock.
+        New-Item -ItemType Directory -Force -Path $payload | Out-Null
     } -ArgumentList $VmRoot, $VmPayload
-    if (-not $cleared) {
-        Fail "could not clear $VmPayload in the VM; something still holds a file inside it"
-    }
     Copy-Item -Path $zip -Destination "$VmRoot\payload.zip" -ToSession $session -Force
 
     Write-Step 'Unpacking and preparing the IME'
@@ -458,6 +466,21 @@ finally {
     # the VM into a puzzling failure. The next run would clear it anyway;
     # this just means nobody has to run one first.
     if ($session) {
+        # Best effort, never fatal: a directory whose DLL some surviving
+        # process still holds simply stays until the VM reboots. Keeping the
+        # current one means a failed run can still be inspected.
+        $freed = Invoke-Command -Session $session -ScriptBlock {
+            param($root, $keep)
+            $removed = 0
+            foreach ($dir in Get-ChildItem $root -Directory -Filter 'payload-*' -ErrorAction SilentlyContinue) {
+                if ($dir.FullName -eq $keep) { continue }
+                Remove-Item $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path $dir.FullName)) { $removed++ }
+            }
+            $removed
+        } -ArgumentList $VmRoot, $VmPayload -ErrorAction SilentlyContinue
+        if ($freed) { Write-Host "pruned $freed old payload director(ies)" }
+
         if ($Watchdog) {
             Invoke-Command -Session $session -ScriptBlock {
                 [Environment]::SetEnvironmentVariable('AZOOKEY_TEST_HANG_AFTER_SECS', $null, 'Machine')
