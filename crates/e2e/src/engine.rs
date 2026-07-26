@@ -9,10 +9,8 @@
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
+use test_support::process::pid_of;
+pub use test_support::process::pids_of;
 
 use crate::poll_until;
 
@@ -30,47 +28,6 @@ pub fn is_running(image: &str) -> bool {
 /// The pid of the (single) engine process, or `None` if it is not running.
 pub fn server_pid() -> Option<u32> {
     pid_of(SERVER_IMAGE)
-}
-
-/// The pid of the first process with this image name.
-fn pid_of(image: &str) -> Option<u32> {
-    pids_of(image).into_iter().next()
-}
-
-/// Every pid with this image name.
-pub fn pids_of(image: &str) -> Vec<u32> {
-    let wanted = image.to_ascii_lowercase();
-    let mut pids = Vec::new();
-    unsafe {
-        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return pids;
-        };
-
-        let mut entry = PROCESSENTRY32W {
-            dwSize: size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-
-        if Process32FirstW(snapshot, &mut entry).is_ok() {
-            loop {
-                let end = entry
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-                if name.eq_ignore_ascii_case(&wanted) {
-                    pids.push(entry.th32ProcessID);
-                }
-                if Process32NextW(snapshot, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-
-        let _ = CloseHandle(snapshot);
-    }
-    pids
 }
 
 /// Refuses to run against an engine that is missing or duplicated.

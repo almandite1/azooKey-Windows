@@ -9,6 +9,14 @@
 //!
 //! The hook is `WINEVENT_OUTOFCONTEXT`, so its callbacks arrive on a thread
 //! that pumps messages — hence the dedicated thread below.
+//!
+//! Both assertion verbs the two harnesses grew are kept: [`expect_exactly`]
+//! for the display tests, which own the window under test and can demand an
+//! exact sequence, and [`wait_for_event`] for the E2E suite, which watches a
+//! live IME and can only ask whether something happened.
+//!
+//! [`expect_exactly`]: ImeEventLog::expect_exactly
+//! [`wait_for_event`]: ImeEventLog::wait_for_event
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -21,8 +29,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, MSG, PostThreadMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_QUIT,
 };
 
+use crate::{Hwnd, poll_until};
+
 /// Every notification seen, in order, with the window that announced it.
-/// Global because a `WINEVENTPROC` gets no context pointer.
+/// Global because a `WINEVENTPROC` gets no context pointer; entries carry the
+/// hwnd so several harnesses can share one hook.
 static EVENTS: Mutex<Vec<(u32, isize)>> = Mutex::new(Vec::new());
 
 /// One IME notification.
@@ -33,8 +44,8 @@ pub enum ImeEvent {
     Change,
 }
 
-/// Installs the hook once and returns the log.
-pub fn log() -> &'static ImeEventLog {
+/// Installs the hook (once per process) and returns the log.
+pub fn ime_events() -> &'static ImeEventLog {
     static LOG: OnceLock<ImeEventLog> = OnceLock::new();
     LOG.get_or_init(|| {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -44,9 +55,9 @@ pub fn log() -> &'static ImeEventLog {
                 EVENT_OBJECT_IME_CHANGE,
                 None,
                 Some(win_event_proc),
-                // any process: the announcements come from ui.exe, whose pid
-                // is not known when the hook goes in, and entries are filtered
-                // by window afterwards
+                // every process: the announcements come from a ui.exe whose
+                // pid is not known when the hook goes in, and entries are
+                // filtered by window afterwards
                 0,
                 0,
                 WINEVENT_OUTOFCONTEXT,
@@ -74,8 +85,9 @@ pub struct ImeEventLog {
 }
 
 impl ImeEventLog {
-    /// A cursor into the log. Assertions are always about what happened
-    /// *since* a mark, so scenarios do not inherit each other's events.
+    /// A cursor into the log. Everything asserted on is "what happened since
+    /// this mark", so tests do not inherit each other's events — or the live
+    /// IME's.
     pub fn mark(&self) -> usize {
         EVENTS
             .lock()
@@ -83,15 +95,14 @@ impl ImeEventLog {
             .len()
     }
 
-    /// What `window` announced after `mark`.
-    pub fn since(&self, mark: usize, window: HWND) -> Vec<ImeEvent> {
-        let target = window.0 as isize;
+    /// The notifications `window` announced after `mark`.
+    pub fn since(&self, mark: usize, window: Hwnd) -> Vec<ImeEvent> {
         EVENTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .skip(mark)
-            .filter(|(_, hwnd)| *hwnd == target)
+            .filter(|(_, hwnd)| *hwnd == window.0)
             .filter_map(|(event, _)| match *event {
                 EVENT_OBJECT_IME_SHOW => Some(ImeEvent::Show),
                 EVENT_OBJECT_IME_HIDE => Some(ImeEvent::Hide),
@@ -101,16 +112,47 @@ impl ImeEventLog {
             .collect()
     }
 
-    /// Waits (up to `timeout`) for `window` to have announced `event` at least
-    /// once since `mark`, and returns everything seen.
-    pub fn wait_for(
+    /// Waits until `window` has announced `expected` since `mark` — and then
+    /// keeps watching briefly, so a *second* notification for the same
+    /// transition still fails the assertion.
+    pub fn expect_exactly(
         &self,
         mark: usize,
-        window: HWND,
+        window: Hwnd,
+        expected: &[ImeEvent],
+        timeout: Duration,
+    ) {
+        let got = poll_until(timeout, || {
+            let got = self.since(mark, window);
+            (got.len() >= expected.len()).then_some(got)
+        });
+        let Some(got) = got else {
+            panic!(
+                "timed out waiting for {expected:?}; saw {:?}",
+                self.since(mark, window)
+            );
+        };
+        assert_eq!(got, expected, "unexpected IME notifications");
+
+        // a duplicate arrives right behind the real one if it arrives at all
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            self.since(mark, window),
+            expected,
+            "a transition was announced more than once"
+        );
+    }
+
+    /// Waits (up to `timeout`) for `window` to have announced `event` at
+    /// least once since `mark`, and returns everything seen.
+    pub fn wait_for_event(
+        &self,
+        mark: usize,
+        window: Hwnd,
         event: ImeEvent,
         timeout: Duration,
     ) -> Vec<ImeEvent> {
-        crate::poll_until(timeout, || {
+        poll_until(timeout, || {
             let seen = self.since(mark, window);
             seen.contains(&event).then_some(seen)
         })

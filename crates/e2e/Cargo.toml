@@ -14,6 +14,8 @@ anyhow = { workspace = true }
 # only for shared::logs: the harness scans the very directory the components
 # write to, so it must not carry its own copy of that path
 shared = { workspace = true }
+# the Win32 observation helpers this harness shares with the ui display tests
+test-support = { workspace = true }
 
 # the custom host binary (src/bin/azookey-e2e-host.rs) is a Win32 GUI, so it
 # is not a plain console exe — but it is launched by the harness, not
@@ -27,15 +29,10 @@ features = [
     "Win32_Globalization",
     # HBRUSH / COLOR_WINDOW / GetClientRect for the custom host window
     "Win32_Graphics_Gdi",
-    # CoCreateInstance for the TSF profile manager and the UIA client
+    # CoCreateInstance for the TSF profile manager
     "Win32_System_Com",
-    # CreateToolhelp32Snapshot, to check the engine survived a stress scenario
-    "Win32_System_Diagnostics_ToolHelp",
     # GetModuleHandleW, for the custom host's window class
     "Win32_System_LibraryLoader",
-    # QueryFullProcessImageNameW, to tell the host application's windows from
-    # everyone else's
-    "Win32_System_Threading",
     # IUIAutomation: reading back what the host application actually received
     "Win32_UI_Accessibility",
     # SendInput / SetFocus

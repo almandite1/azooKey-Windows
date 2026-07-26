@@ -8,6 +8,7 @@ members = [
   "crates/macros",
   "crates/launcher",
   "crates/e2e",
+  "crates/test-support",
   "frontend/src-tauri"
 ]
 
@@ -27,6 +28,7 @@ version = "0.1.0-beta.alm"
 shared = { path = "crates/shared" }
 macros = { path = "crates/macros" }
 azookey-server = { path = "crates/server" }
+test-support = { path = "crates/test-support" }
 # external — the tonic/prost family must move in lockstep. Since 0.14 the
 # prost codec lives outside tonic itself, so the generated code needs
 # tonic-prost at run time and tonic-prost-build at build time. tonic-build
