@@ -22,23 +22,10 @@ import KanaKanjiConverterModule
 @Suite("real dictionary")
 @MainActor
 struct RealDictionaryTests {
-    /// The package root, from this file's own path — the dictionaries are
-    /// submodules of the repository, so they are always next to it.
-    private static let root = URL(filePath: #filePath)
-        .deletingLastPathComponent()  // azookey-serverTests
-        .deletingLastPathComponent()  // Tests
-        .deletingLastPathComponent()  // server-swift
-
     private static let engine = KanaKanjiConverter(
-        dictionaryURL: root.appendingPathComponent("azooKey_dictionary_storage/Dictionary"),
+        dictionaryURL: packageRoot.appendingPathComponent("azooKey_dictionary_storage/Dictionary"),
         preloadDictionary: true
     )
-
-    private func composing(_ input: String) -> ComposingText {
-        var text = ComposingText()
-        text.insertAtCursorPosition(input, inputStyle: .roman2kana)
-        return text
-    }
 
     @Test(
         "every candidate's counts reconstruct the reading",
@@ -53,8 +40,8 @@ struct RealDictionaryTests {
     )
     func countsReconstructTheReading(_ input: String) {
         // exactly what GetComposedText does
-        execURL = Self.root.appendingPathComponent("azooKey_emoji_dictionary_storage")
-        let target = conversionTarget(composing(input))
+        execURL = packageRoot.appendingPathComponent("azooKey_emoji_dictionary_storage")
+        let target = conversionTarget(romaji(input))
         let reading = kanaReading(target.convertTarget)
         let readings = shrinkReadings(of: target)
         let converted = Self.engine.requestCandidates(target, options: getOptions())
@@ -67,7 +54,7 @@ struct RealDictionaryTests {
             let covered = candidate.data.map(\.ruby).joined().count
 
             // what ShrinkText will actually do with the count we send
-            var session = composing(input)
+            var session = romaji(input)
             session.prefixComplete(composingCount: .surfaceCount(result.surfaceCount))
             #expect(
                 kanaReading(session.convertTarget) == rest,
@@ -107,8 +94,8 @@ struct RealDictionaryTests {
     )
     func bundledDictionaryOffersKanji(_ input: String, _ expected: String) {
         // exactly what GetComposedText does
-        execURL = Self.root.appendingPathComponent("azooKey_emoji_dictionary_storage")
-        let target = conversionTarget(composing(input))
+        execURL = packageRoot.appendingPathComponent("azooKey_emoji_dictionary_storage")
+        let target = conversionTarget(romaji(input))
         let converted = Self.engine.requestCandidates(target, options: getOptions())
         let candidates = converted.mainResults.map(\.text)
 

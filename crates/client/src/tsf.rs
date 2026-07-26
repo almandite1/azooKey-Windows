@@ -2,6 +2,8 @@ pub(super) mod compartment;
 pub(super) mod display_attribute;
 pub(super) mod edit_session;
 pub(super) mod factory;
+#[cfg(test)]
+mod fakes;
 pub(super) mod key_event_sink;
 pub(super) mod language_bar;
 pub(super) mod preserved_key;

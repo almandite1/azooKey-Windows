@@ -149,6 +149,37 @@ if ($null -eq $Credential) {
 }
 $session = New-PSSession -VMName $VMName -Credential $Credential
 
+# Defined ONCE, inside the session, because the two task registrations below
+# were the same six cmdlets with a different action. Functions defined in a
+# PSSession outlive the Invoke-Command that created them, so both call sites
+# get it without a second round trip.
+#
+# Interactive + Highest for both: session 0 cannot receive synthesised keys,
+# and both the launcher and the harness restart the supervised engine.
+Invoke-Command -Session $session -ScriptBlock {
+    function Register-AzookeyTask {
+        param($TaskName, $User, $Action)
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName $TaskName -Action $Action -Principal $principal -Settings $settings | Out-Null
+        Start-ScheduledTask -TaskName $TaskName
+    }
+
+    function Get-AzookeyTaskState {
+        param($TaskName)
+        $info = Get-ScheduledTaskInfo -TaskName $TaskName
+        [pscustomobject]@{
+            # ToString() here, not on the host: State is an enum, and
+            # PowerShell remoting deserializes it to a bare integer. Comparing
+            # that to 'Running' on the host silently misreports the state.
+            State       = (Get-ScheduledTask -TaskName $TaskName).State.ToString()
+            LastResult  = $info.LastTaskResult
+            LastRunTime = $info.LastRunTime
+        }
+    }
+}
+
 try {
     # The precondition that cannot be worked around: somebody has to be logged
     # on to an interactive desktop, or there is nothing to type into.
@@ -186,19 +217,24 @@ try {
     # DLLs inside it, so deleting first left a half-removed tree that
     # Expand-Archive -Force then tripped over on a file it expected to find.
     Write-Step 'Stopping anything left from a previous run'
+    # notepad is in the kill list because the scenarios drive it as a host: a
+    # leftover one still has the TIP DLL loaded and locks the file being
+    # replaced. Killing it is safe here and nowhere else, which is what the
+    # harness's own VM guard is for.
+    $leftovers = @('azookey-e2e', 'azookey-e2e-host', 'launcher', 'azookey-server', 'ui', 'notepad')
+    # passed in rather than re-typed inside the scriptblock: the task names
+    # are already declared at the top of this file, and a copy that drifted
+    # would silently stop nothing
     $stopped = Invoke-Command -Session $session -ScriptBlock {
+        param($tasks, $images)
         # A harness left over from an interrupted run is the dangerous one:
         # two of them synthesise keystrokes into the same desktop at once and
         # every scenario reads the other's typing.
-        foreach ($t in @('azookey-e2e-run', 'azookey-e2e-launcher')) {
+        foreach ($t in $tasks) {
             Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
         }
-        # notepad is in the list because the scenarios drive it as a host: a
-        # leftover one still has the TIP DLL loaded and locks the file being
-        # replaced. Killing it is safe here and nowhere else, which is what
-        # the harness's own VM guard is for.
         $killed = @()
-        foreach ($n in @('azookey-e2e', 'azookey-e2e-host', 'launcher', 'azookey-server', 'ui', 'notepad')) {
+        foreach ($n in $images) {
             $procs = @(Get-Process $n -ErrorAction SilentlyContinue)
             if ($procs.Count -gt 0) {
                 $killed += "$n x$($procs.Count)"
@@ -207,7 +243,7 @@ try {
         }
         Start-Sleep -Seconds 3
         $killed
-    }
+    } -ArgumentList (, @($TaskName, $LauncherTaskName)), (, $leftovers)
     if ($stopped) { Write-Host "stopped: $($stopped -join ', ')" }
     else { Write-Host 'nothing was left running' }
 
@@ -291,15 +327,11 @@ try {
     $engineUp = Invoke-Command -Session $session -ScriptBlock {
         param($payload, $taskName, $user)
         $ErrorActionPreference = 'Stop'
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
+        # the launcher supervises the engine and needs to be able to kill and
+        # restart it, which is also what scenarios 5-7 exercise
         $action = New-ScheduledTaskAction -Execute "$payload\launcher.exe" -WorkingDirectory $payload
-        # Highest: the launcher supervises the engine and needs to be able to
-        # kill and restart it, which is also what scenarios 5-7 exercise.
-        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings | Out-Null
-        Start-ScheduledTask -TaskName $taskName
+        Register-AzookeyTask -TaskName $taskName -User $user -Action $action
 
         # ui.exe stands up a WebView2 stack, far slower than the server, so
         # poll for both rather than sleeping a fixed amount.
@@ -311,15 +343,12 @@ try {
             $ui = @(Get-Process ui -ErrorAction SilentlyContinue).Count
             if ($engine -ge 1 -and $ui -ge 1) { break }
         }
-        $info = Get-ScheduledTaskInfo -TaskName $taskName
+        $state = Get-AzookeyTaskState -TaskName $taskName
         [pscustomobject]@{
             Engine     = $engine
             Ui         = $ui
-            LastResult = $info.LastTaskResult
-            # ToString() here, not on the host: State is an enum, and
-            # PowerShell remoting deserializes it to a bare integer. Comparing
-            # that to 'Running' on the host silently misreports the state.
-            State      = (Get-ScheduledTask -TaskName $taskName).State.ToString()
+            LastResult = $state.LastResult
+            State      = $state.State
         }
     } -ArgumentList $VmPayload, $LauncherTaskName, $desktopUser
 
@@ -338,26 +367,16 @@ try {
         param($payload, $log, $taskName, $user)
         $ErrorActionPreference = 'Stop'
         Remove-Item $log -Force -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
         # cmd.exe only as the redirection wrapper: the harness writes its
         # report to stdout, and a scheduled task has nowhere else to put it.
         $action = New-ScheduledTaskAction -Execute 'cmd.exe' `
             -Argument "/c `"`"$payload\azookey-e2e.exe`" > `"$log`" 2>&1`"" `
             -WorkingDirectory $payload
-        # Interactive + Highest: session 0 cannot receive synthesised keys, and
-        # the harness restarts the supervised engine.
-        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings | Out-Null
-        Start-ScheduledTask -TaskName $taskName
+        Register-AzookeyTask -TaskName $taskName -User $user -Action $action
+
         Start-Sleep -Seconds 2
-        $info = Get-ScheduledTaskInfo -TaskName $taskName
-        [pscustomobject]@{
-            State       = (Get-ScheduledTask -TaskName $taskName).State.ToString()
-            LastResult  = $info.LastTaskResult
-            LastRunTime = $info.LastRunTime
-        }
+        Get-AzookeyTaskState -TaskName $taskName
     } -ArgumentList $VmPayload, $VmLog, $TaskName, $desktopUser | ForEach-Object {
         Write-Host "task state: $($_.State), last result: $($_.LastResult), last run: $($_.LastRunTime)"
     }

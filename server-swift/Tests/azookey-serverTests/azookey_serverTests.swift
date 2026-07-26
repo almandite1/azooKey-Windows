@@ -9,12 +9,6 @@ import KanaKanjiConverterModule
 @Suite("conversionTarget")
 @MainActor
 struct ConversionTargetTests {
-    private func romaji(_ input: String) -> ComposingText {
-        var text = ComposingText()
-        text.insertAtCursorPosition(input, inputStyle: .roman2kana)
-        return text
-    }
-
     @Test("a pending n is completed for the lookup")
     func pendingNIsCompleted() {
         #expect(romaji("nihon").convertTarget == "にほn", "precondition")
@@ -67,12 +61,6 @@ struct ConversionTargetTests {
 /// three keystrokes short.
 @Suite("remainder")
 struct RemainderTests {
-    private func romaji(_ input: String) -> ComposingText {
-        var text = ComposingText()
-        text.insertAtCursorPosition(input, inputStyle: .roman2kana)
-        return text
-    }
-
     @Test("a surface count is translated into keystrokes")
     func surfaceCountBecomesInputCount() {
         // にゅうりょく: 6 kana from 9 romaji letters

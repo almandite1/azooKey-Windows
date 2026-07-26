@@ -54,52 +54,33 @@ pub struct Scenario {
 /// (and this harness) both see the variable. Mixing it with the others is
 /// impossible anyway: an armed server hangs partway through the suite. So:
 /// variable set → only the watchdog scenario; unset → everything else.
+/// Names a scenario after the function that runs it, so the two cannot drift
+/// — every entry used to spell the name twice.
+macro_rules! scenarios {
+    ($($run:ident),* $(,)?) => {
+        vec![$(Scenario {
+            name: stringify!($run),
+            run: $run,
+        }),*]
+    };
+}
+
 pub fn all() -> Vec<Scenario> {
     if hang_after_secs().is_some() {
-        return vec![Scenario {
-            name: "watchdog_restarts_hung_server",
-            run: watchdog_restarts_hung_server,
-        }];
+        return scenarios![watchdog_restarts_hung_server];
     }
 
-    vec![
-        Scenario {
-            name: "basic_conversion",
-            run: basic_conversion,
-        },
-        Scenario {
-            name: "long_input_survives",
-            run: long_input_survives,
-        },
-        Scenario {
-            name: "second_host_converts",
-            run: second_host_converts,
-        },
-        Scenario {
-            name: "password_field_disables_ime",
-            run: password_field_disables_ime,
-        },
-        Scenario {
-            name: "server_kill_recovers",
-            run: server_kill_recovers,
-        },
-        Scenario {
-            name: "mid_composition_kill_resets",
-            run: mid_composition_kill_resets,
-        },
-        Scenario {
-            name: "winevents_fire_once_per_transition",
-            run: winevents_fire_once_per_transition,
-        },
-        Scenario {
-            name: "ime_cycle_keeps_working",
-            run: ime_cycle_keeps_working,
-        },
+    scenarios![
+        basic_conversion,
+        long_input_survives,
+        second_host_converts,
+        password_field_disables_ime,
+        server_kill_recovers,
+        mid_composition_kill_resets,
+        winevents_fire_once_per_transition,
+        ime_cycle_keeps_working,
         // last: it reads the logs everything above produced
-        Scenario {
-            name: "logs_are_clean",
-            run: logs_are_clean,
-        },
+        logs_are_clean,
     ]
 }
 
@@ -112,12 +93,9 @@ pub fn hang_after_secs() -> Option<u64> {
 
 /// Scenario 1: `mizu` + Space + Enter in Notepad commits 水.
 fn basic_conversion(ctx: &Ctx) -> Result<String> {
-    let host = HostApp::launch("notepad.exe", "notepad.exe")?;
-    enter_kana(&host)?;
+    let host = notepad_in_kana()?;
 
-    let before = expected_count(ctx.uia, &host);
-    convert_reading(READING)?;
-    wait_for_new_expected(ctx.uia, &host, before)
+    convert_and_expect(ctx.uia, &host)
 }
 
 /// Scenario 2: a long burst does not kill the engine, and it still converts
@@ -125,8 +103,7 @@ fn basic_conversion(ctx: &Ctx) -> Result<String> {
 /// server used to trap on (see `ipc_smoke`), driven this time through a real
 /// host rather than a raw gRPC call.
 fn long_input_survives(ctx: &Ctx) -> Result<String> {
-    let host = HostApp::launch("notepad.exe", "notepad.exe")?;
-    enter_kana(&host)?;
+    let host = notepad_in_kana()?;
 
     for _ in 0..65 {
         keyboard::type_ascii("ka")?;
@@ -144,9 +121,7 @@ fn long_input_survives(ctx: &Ctx) -> Result<String> {
 
     // and still converts — a live process that no longer answers would pass
     // the check above but fail here
-    let before = expected_count(ctx.uia, &host);
-    convert_reading(READING)?;
-    let text = wait_for_new_expected(ctx.uia, &host, before)
+    let text = convert_and_expect(ctx.uia, &host)
         .context("server は生存しているが変換が返らない（ハング疑い）")?;
     Ok(format!("engine alive; {text:?}"))
 }
@@ -161,9 +136,7 @@ fn second_host_converts(ctx: &Ctx) -> Result<String> {
 
     // this host starts genuinely empty (no session restore), but count anyway
     // so every scenario asserts the same way
-    let before = expected_count(ctx.uia, &host);
-    convert_reading(READING)?;
-    wait_for_new_expected(ctx.uia, &host, before)
+    convert_and_expect(ctx.uia, &host)
 }
 
 /// Scenario 4: the IME disengages in a password field.
@@ -195,9 +168,7 @@ fn password_field_disables_ime(ctx: &Ctx) -> Result<String> {
 
     // the ordinary field, as the positive control: the IME must be genuinely
     // active in this host before "it did not engage" means anything
-    let before = expected_count(ctx.uia, &host);
-    convert_reading(READING)?;
-    wait_for_new_expected(ctx.uia, &host, before)
+    convert_and_expect(ctx.uia, &host)
         .context("通常欄で変換できていないので、パスワード欄の判定材料がありません")?;
 
     // into the password field, and confirm the caret really went there —
@@ -250,8 +221,7 @@ fn password_field_disables_ime(ctx: &Ctx) -> Result<String> {
 /// respawned it. The automatable half of "the IME recovers when the engine
 /// dies" — a kill this test can cause, unlike a real crash.
 fn server_kill_recovers(ctx: &Ctx) -> Result<String> {
-    let host = HostApp::launch("notepad.exe", "notepad.exe")?;
-    enter_kana(&host)?;
+    let host = notepad_in_kana()?;
 
     let pid = engine::server_pid().context("engine を起動してから実行してください")?;
     println!("   killing {} (pid {pid})", engine::SERVER_IMAGE);
@@ -273,8 +243,7 @@ fn server_kill_recovers(ctx: &Ctx) -> Result<String> {
 /// server. The proof it did not splice is that a fresh `mizu` afterwards still
 /// converts to 水 — a spliced reading (にほん + みず) would not.
 fn mid_composition_kill_resets(ctx: &Ctx) -> Result<String> {
-    let host = HostApp::launch("notepad.exe", "notepad.exe")?;
-    enter_kana(&host)?;
+    let host = notepad_in_kana()?;
 
     // a reading left composing, uncommitted
     keyboard::type_ascii("nihon")?;
@@ -306,8 +275,7 @@ fn watchdog_restarts_hung_server(ctx: &Ctx) -> Result<String> {
     let secs = hang_after_secs().expect("only selected when the hang hook is armed");
     println!("   hang hook armed for {secs}s after each server start");
 
-    let host = HostApp::launch("notepad.exe", "notepad.exe")?;
-    enter_kana(&host)?;
+    let host = notepad_in_kana()?;
 
     let pid = engine::server_pid().context("engine を起動してから実行してください")?;
     println!("   waiting for the watchdog to catch the hang and restart pid {pid}");
@@ -330,15 +298,16 @@ fn watchdog_restarts_hung_server(ctx: &Ctx) -> Result<String> {
 /// contract is one announcement per real transition — announcing every request
 /// buried listeners in duplicates — and CHANGE only while the window is up.
 fn winevents_fire_once_per_transition(_ctx: &Ctx) -> Result<String> {
-    let host = HostApp::launch("notepad.exe", "notepad.exe")?;
-    enter_kana(&host)?;
+    // held for the whole scenario: dropping it kills the host, and the
+    // candidate window under observation belongs to its composition
+    let _host = notepad_in_kana()?;
 
     let candidate = overlay::candidate_window()
         .context("ui.exe の候補ウィンドウが見つかりません（ui.exe は動いていますか）")?;
     let events = winevent::log();
 
     keyboard::tap(keyboard::escape())?;
-    wait_for_candidates(false, "開始時に候補ウィンドウが閉じている")?;
+    wait_for_candidates_hidden("開始時に候補ウィンドウが閉じている")?;
 
     // composing brings it up: exactly one SHOW
     let mark = events.mark();
@@ -392,11 +361,9 @@ fn ime_cycle_keeps_working(ctx: &Ctx) -> Result<String> {
 
         // a fresh host, because only processes started after the change pick
         // the default up
-        let host = HostApp::launch("notepad.exe", "notepad.exe")?;
+        let host = notepad()?;
         enter_kana(&host)?;
-        let before = expected_count(ctx.uia, &host);
-        convert_reading(READING)?;
-        wait_for_new_expected(ctx.uia, &host, before)
+        convert_and_expect(ctx.uia, &host)
             .with_context(|| format!("{round} 周目で変換できなくなりました"))?;
     }
 
@@ -430,6 +397,29 @@ fn logs_are_clean(_ctx: &Ctx) -> Result<String> {
 /// The second host's image name; the file sits beside this binary.
 const CUSTOM_HOST_IMAGE: &str = "azookey-e2e-host.exe";
 
+/// A fresh Notepad. Both arguments are the same string, and every scenario
+/// that wanted one repeated it: the command and the image name coincide here,
+/// but `HostApp::launch` takes them apart because for the custom host they
+/// differ (a full path vs a bare image name).
+fn notepad() -> Result<HostApp> {
+    HostApp::launch("notepad.exe", "notepad.exe")
+}
+
+/// The gesture six scenarios open with: a fresh Notepad, focused and in Kana.
+fn notepad_in_kana() -> Result<HostApp> {
+    let host = notepad()?;
+    enter_kana(&host)?;
+    Ok(host)
+}
+
+/// Convert `mizu` in `host` and wait for one MORE 水 than was there before —
+/// the count-before/convert/count-after gesture five scenarios share.
+fn convert_and_expect(uia: &Uia, host: &HostApp) -> Result<String> {
+    let before = expected_count(uia, host);
+    convert_reading(READING)?;
+    wait_for_new_expected(uia, host, before)
+}
+
 /// Focuses a freshly launched host and switches it to Kana. A new azooKey
 /// starts in Latin (`InputMode`'s `#[default]`), so every scenario that
 /// expects conversion has to toggle first — Phase 0 proved the manual spike
@@ -451,10 +441,14 @@ fn convert_reading(reading: &str) -> Result<()> {
     Ok(())
 }
 
-/// Waits for the candidate window to reach `visible`.
-fn wait_for_candidates(visible: bool, what: &str) -> Result<()> {
+/// Waits for the candidate window to be down.
+///
+/// Only this direction: the scenarios establish a clean starting point with
+/// it, and "the window came up" is asserted through the WinEvent log, which
+/// says *how many times* rather than merely *whether*.
+fn wait_for_candidates_hidden(what: &str) -> Result<()> {
     if poll_until(SETTLE_TIMEOUT, || {
-        (overlay::candidates_visible() == visible).then_some(())
+        (!overlay::candidates_visible()).then_some(())
     })
     .is_none()
     {
