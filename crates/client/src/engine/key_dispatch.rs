@@ -110,7 +110,7 @@ impl TextServiceFactory_Impl {
         if VK_CONTROL.is_pressed() || VK_MENU.is_pressed() {
             let state = {
                 let text_service = self.borrow()?;
-                text_service.borrow_composition()?.state.clone()
+                text_service.borrow_composition()?.state().clone()
             };
             return Ok(shortcut_transition(&state, is_modifier_key(wparam.0))
                 .map(|(next_state, actions)| (actions, next_state)));
@@ -127,7 +127,7 @@ impl TextServiceFactory_Impl {
         let text_service = self.borrow()?;
         let composition = text_service.borrow_composition()?;
         Ok(KeystrokeContext {
-            state: composition.state.clone(),
+            state: composition.state().clone(),
             mode: text_service.input_mode.clone(),
             reading_chars: composition.raw_hiragana.chars().count(),
             suffix_is_empty: composition.suffix.is_empty(),

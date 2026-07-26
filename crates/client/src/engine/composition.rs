@@ -36,8 +36,89 @@ pub struct Composition {
     pub selection_index: i32,
     pub candidates: Candidates,
 
-    pub state: CompositionState,
-    pub tip_composition: Option<ITfComposition>,
+    /// PRIVATE, with `tip`, because the two are one fact stated twice: a
+    /// composition is `Composing`/`Previewing` exactly when TSF is holding a
+    /// composition open for us. See the module note on [`Composition`]'s
+    /// invariant.
+    state: CompositionState,
+    tip: Option<ITfComposition>,
+}
+
+// THE INVARIANT: between batches, `state == None` if and only if there is no
+// TSF composition handle.
+//
+// "Between batches" is the honest scope. The two are written by different
+// mechanisms at different moments: `tip` by start/end_composition, the
+// instant TSF hands one over or takes it back, and `state` by
+// `CompositionEdit::commit` when the whole batch is done. Inside a batch they
+// legitimately disagree — `act_start_composition` attaches the handle while
+// the live `state` is still the previous batch's — which is why every reader
+// *during* a batch asks about the handle (the physical truth) and never about
+// `state`.
+//
+// Breaking it has cost this project two bugs, both with the same symptom:
+// typing that goes nowhere. A `Composing` state with no handle sends the next
+// keystroke into the composing arm, where `set_text` finds nothing to write
+// to and no-ops — invisible input with nothing logged. It happened when
+// `Deactivate` left the state behind for the next activation, and again when
+// `start_composition` found a stale handle and returned early.
+//
+// `commit` is the one place both are in scope, so it is where the invariant
+// is enforced rather than assumed.
+impl Composition {
+    /// What the last completed batch left this composition in.
+    pub fn state(&self) -> &CompositionState {
+        &self.state
+    }
+
+    /// The live TSF composition, if TSF is holding one open.
+    ///
+    /// This — not `state` — is what the edit-session paths ask, because they
+    /// run *during* a batch, when only the handle is current.
+    pub fn tip(&self) -> Option<&ITfComposition> {
+        self.tip.as_ref()
+    }
+
+    /// Whether TSF is holding a composition open for us.
+    pub fn has_tip(&self) -> bool {
+        self.tip.is_some()
+    }
+
+    /// Records the handle TSF just gave us. `start_composition` only.
+    pub fn attach_tip(&mut self, tip: Option<ITfComposition>) {
+        self.tip = tip;
+    }
+
+    /// Lets go of the handle. `end_composition` only, and unconditionally —
+    /// keeping a handle to a composition TSF has finished wedges every later
+    /// `start_composition`.
+    pub fn detach_tip(&mut self) {
+        self.tip = None;
+    }
+
+    /// Puts a test's composition into `state` WITH a matching fake handle.
+    ///
+    /// One call rather than two assignments on purpose: a test that set only
+    /// `state` used to build the very inconsistency the invariant forbids,
+    /// and then pass — proving something about a shape production can no
+    /// longer reach.
+    #[cfg(test)]
+    pub fn set_up_for_test(&mut self, state: CompositionState) {
+        self.tip = match state {
+            CompositionState::None => None,
+            _ => Some(crate::tsf::test_support::FakeComposition::new()),
+        };
+        self.state = state;
+    }
+
+    /// The forbidden shape, on purpose: `state` says composing, TSF holds
+    /// nothing. Only the tests that assert the reconciliation repairs it may
+    /// use this.
+    #[cfg(test)]
+    pub fn force_desync_for_test(&mut self, state: CompositionState, tip: bool) {
+        self.tip = tip.then(crate::tsf::test_support::FakeComposition::new);
+        self.state = state;
+    }
 }
 
 /// Backspace shortened the reading: keep only the leading keystrokes the new
@@ -168,11 +249,24 @@ impl CompositionEdit {
         self.candidates = Candidates::default();
     }
 
-    /// Writes the working copy back onto the live composition. Leaves
-    /// `tip_composition` alone — that handle is owned by start/end_composition.
-    pub(super) fn write_back(self, composition: &mut Composition) {
+    /// Writes the working copy back onto the live composition, reconciling
+    /// the state with the TSF handle.
+    ///
+    /// The handle itself is left alone — it belongs to start/end_composition,
+    /// which are the only things that can legitimately obtain or release one.
+    /// What happens here is the other direction: the batch's `state` is
+    /// checked against the handle, because this is the one moment both are in
+    /// scope (see the invariant note on [`Composition`]).
+    ///
+    /// A batch that meant to compose but has no handle is the failure that
+    /// wedges input: the next keystroke lands in the composing arm and
+    /// `set_text` no-ops against nothing. It happens when `start_composition`
+    /// fails and the batch still writes back its intent. Forcing `None` there
+    /// costs that batch's keystroke and lets the NEXT one open a fresh
+    /// composition, instead of every later keystroke disappearing.
+    pub(super) fn commit(self, composition: &mut Composition) {
         composition.preview = self.preview;
-        composition.state = self.state;
+        composition.state = reconcile(self.state, composition.tip.is_some());
         composition.selection_index = self.selection_index;
         composition.raw_input = self.raw_input;
         composition.raw_hiragana = self.raw_hiragana;
@@ -180,6 +274,34 @@ impl CompositionEdit {
         composition.suffix = self.suffix;
         composition.corresponding_count = self.corresponding_count;
         composition.surface_count = self.surface_count;
+    }
+}
+
+/// The state a batch may leave behind, given whether TSF is still holding a
+/// composition open.
+///
+/// Pure, so both directions of the invariant can be pinned by a unit test
+/// rather than only by driving a whole batch.
+fn reconcile(intended: CompositionState, has_tip: bool) -> CompositionState {
+    match (&intended, has_tip) {
+        // The wedge: composing with nothing to compose in. Start over.
+        (CompositionState::Composing | CompositionState::Previewing, false) => {
+            tracing::warn!(
+                "batch ended in {intended:?} with no TSF composition; \
+                 resetting to None so the next keystroke can start one"
+            );
+            CompositionState::None
+        }
+        // The other direction cannot be repaired from here — releasing a TSF
+        // composition needs an edit session, which `commit` has no business
+        // opening. Say so; `start_composition`'s stale check and `Deactivate`
+        // both clean it up, and neither loses input the way the case above
+        // does.
+        (CompositionState::None, true) => {
+            tracing::warn!("batch ended in None while TSF still holds a composition");
+            CompositionState::None
+        }
+        _ => intended,
     }
 }
 
@@ -309,5 +431,53 @@ mod tests {
             ClientAction::StartComposition,
             ClientAction::AppendText("a".to_string()),
         ]));
+    }
+
+    /// A batch that meant to keep composing but has no TSF composition is the
+    /// shape that eats keystrokes: the next one lands in the composing arm
+    /// and `set_text` writes to nothing. Both of the historical bugs (the
+    /// `Deactivate` leftover, the stale handle in `start_composition`) had
+    /// this shape. Resetting to `None` costs that batch and lets the next
+    /// keystroke open a fresh composition.
+    #[test]
+    fn composing_without_a_handle_resets_to_none() {
+        assert_eq!(
+            reconcile(CompositionState::Composing, false),
+            CompositionState::None
+        );
+        assert_eq!(
+            reconcile(CompositionState::Previewing, false),
+            CompositionState::None
+        );
+    }
+
+    /// The ordinary outcomes pass through untouched — the reconciliation is
+    /// a repair, not a policy.
+    #[test]
+    fn a_state_that_matches_the_handle_is_left_alone() {
+        assert_eq!(
+            reconcile(CompositionState::Composing, true),
+            CompositionState::Composing
+        );
+        assert_eq!(
+            reconcile(CompositionState::Previewing, true),
+            CompositionState::Previewing
+        );
+        assert_eq!(
+            reconcile(CompositionState::None, false),
+            CompositionState::None
+        );
+    }
+
+    /// The other direction cannot be repaired here — releasing a TSF
+    /// composition needs an edit session — so `None` stands and the warning
+    /// is the whole remedy. `start_composition`'s stale check and
+    /// `Deactivate` are what actually clean it up.
+    #[test]
+    fn a_leftover_handle_does_not_resurrect_the_state() {
+        assert_eq!(
+            reconcile(CompositionState::None, true),
+            CompositionState::None
+        );
     }
 }

@@ -691,7 +691,13 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
+            // Deliberately the forbidden shape — a Composing state with no
+            // live handle. A batch can no longer produce it (`commit`
+            // reconciles), but `Deactivate` is not a batch: what it has to
+            // reset is whatever the previous activation left, and this
+            // fixture has no context for `end_composition` to release a real
+            // handle through.
+            composition.force_desync_for_test(CompositionState::Composing, false);
             composition.raw_hiragana = "わたし".to_string();
             composition.preview = "わたし".to_string();
         }
@@ -701,7 +707,7 @@ mod tests {
         let text_service = factory.borrow().unwrap();
         let composition = text_service.borrow_composition().unwrap();
         assert_eq!(
-            composition.state,
+            *composition.state(),
             CompositionState::None,
             "the composition state must be reset on Deactivate"
         );

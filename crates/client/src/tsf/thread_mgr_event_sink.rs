@@ -124,14 +124,12 @@ mod tests {
     /// down, and its IPC traffic proves the arm ran.
     fn start_composing(tip: &ITfTextInputProcessor) {
         use crate::engine::composition::CompositionState;
-        use crate::tsf::test_support::FakeComposition;
 
         let factory = factory_of(tip);
         let text_service = factory.borrow().unwrap();
         let mut composition = text_service.borrow_mut_composition().unwrap();
-        composition.state = CompositionState::Composing;
+        composition.set_up_for_test(CompositionState::Composing);
         composition.preview = "みず".to_string();
-        composition.tip_composition = Some(FakeComposition::new());
     }
 
     /// The regression the ordering comment describes: focus is leaving a
