@@ -87,7 +87,16 @@ pub(super) struct CompositionEdit {
     pub(super) surface_count: i32,
     pub(super) candidates: Candidates,
     pub(super) selection_index: i32,
-    /// the state the composition moves to once the batch finishes
+    /// Where the composition actually ENDS UP — the value the write-back
+    /// commits. It starts as the batch's intent and an arm may override it:
+    /// `act_shrink_text` forces `Composing`, because after a commit there is
+    /// a fresh reading to compose whatever the transition table asked for.
+    ///
+    /// Distinct from `handle_action`'s `batch_intent`, which is that same
+    /// starting value kept immutable. Both exist because the recovery path
+    /// has to ask "was this batch tearing the composition down?" — a
+    /// question about the intent — after the arms have already rewritten
+    /// this field.
     pub(super) state: CompositionState,
 }
 
@@ -133,12 +142,22 @@ impl CompositionEdit {
         self.candidates = candidates;
     }
 
-    /// Blanks the composing fields the terminating actions
-    /// (end/cancel/mode-switch/server-loss) all reset: the selection, both
-    /// spent counts, and the preview/suffix/reading strings. Leaves `state`
-    /// and `candidates` to the caller — server-loss also drops the list and
-    /// forces `None`, while end/mode-switch take the state from the write-back.
-    pub(super) fn clear(&mut self) {
+    /// Blanks everything a terminating action (end/cancel/mode-switch/
+    /// server-loss) leaves behind: the selection, both spent counts, the
+    /// preview/suffix/reading strings AND the candidate list.
+    ///
+    /// The list is in here rather than at the call sites because it is dead
+    /// on every one of those paths — the composition it described is over —
+    /// and only one of the three used to drop it. The other two wrote a
+    /// stale list back onto a composition whose `state` was `None`. Nothing
+    /// reads it in that state today (the next batch's `adopt_fresh`
+    /// overwrites it before anything can), which is exactly what made the
+    /// inconsistency survive: it is a trap for the next arm that looks at
+    /// `candidates` without checking `state` first.
+    ///
+    /// `state` is still the caller's: server-loss forces `None` on the spot,
+    /// while end/mode-switch take it from the batch's write-back.
+    pub(super) fn reset_for_teardown(&mut self) {
         self.selection_index = 0;
         self.corresponding_count = 0;
         self.surface_count = 0;
@@ -146,6 +165,7 @@ impl CompositionEdit {
         self.suffix.clear();
         self.raw_input.clear();
         self.raw_hiragana.clear();
+        self.candidates = Candidates::default();
     }
 
     /// Writes the working copy back onto the live composition. Leaves
@@ -172,21 +192,44 @@ impl CompositionEdit {
 /// candidate navigation, the MoveCursor no-op, mode switches, the teardown of
 /// a composition that is already over (issue #36).
 ///
-/// Only the actions that ask the engine to CONVERT can use that context, and
-/// each of them refreshes it in its own batch, so nothing observes a stale
-/// one. `StartComposition` is not in the list because it never arrives alone:
-/// the transition table always pairs it with the keystroke that opened the
+/// Only the actions that rewrite the reading can use that context, and each
+/// of them refreshes it in its own batch, so nothing observes a stale one.
+/// `StartComposition` is not in the list because it never arrives alone: the
+/// transition table always pairs it with the keystroke that opened the
 /// composition (`transition.rs`), and that keystroke is an `AppendText`.
 pub(super) fn needs_context_update(actions: &[ClientAction]) -> bool {
-    actions.iter().any(|action| {
-        matches!(
-            action,
-            ClientAction::AppendText(_)
-                | ClientAction::RemoveText
-                | ClientAction::ShrinkText(_)
-                | ClientAction::SetTextWithType(_)
-        )
-    })
+    actions.iter().any(uses_surrounding_text)
+}
+
+/// Whether this one action's outcome can depend on the text around the
+/// composition.
+///
+/// An exhaustive `match` with NO wildcard, deliberately: the answer for a new
+/// `ClientAction` is a judgement call, and a wildcard would make it silently
+/// "no". Adding a variant is a compile error here until someone decides.
+fn uses_surrounding_text(action: &ClientAction) -> bool {
+    match action {
+        // these rewrite the reading, and the conversion the engine runs for
+        // them is what the left-side context feeds
+        ClientAction::AppendText(_)
+        | ClientAction::RemoveText
+        | ClientAction::ShrinkText(_)
+        // NOTE: SetTextWithType (F6-F10) issues no engine RPC at all — it
+        // transforms `raw_input`/`raw_hiragana` locally. It has always been
+        // in this set, so it stays; dropping it is a behaviour change and
+        // belongs with whoever measures whether the extra edit session per
+        // F-key is worth anything.
+        | ClientAction::SetTextWithType(_) => true,
+
+        // navigation and lifecycle: no conversion happens, so the context
+        // measured for them would be thrown away (issue #36)
+        ClientAction::StartComposition
+        | ClientAction::EndComposition
+        | ClientAction::CancelComposition
+        | ClientAction::MoveCursor(_)
+        | ClientAction::SetSelection(_)
+        | ClientAction::SetIMEMode(_) => false,
+    }
 }
 
 #[cfg(test)]

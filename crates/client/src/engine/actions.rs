@@ -39,10 +39,12 @@ impl TextServiceFactory_Impl {
             (composition, text_service.input_mode.clone())
         };
 
-        // where the batch is headed, kept out of `edit` because the recovery
-        // below has to tell "this batch was still composing" from "this batch
-        // was tearing the composition down" after the arms have run
-        let target_state = transition.clone();
+        // The batch's INTENT, kept immutable and out of `edit`. `edit.state`
+        // starts as this same value but is the OUTCOME: an arm may override
+        // it (act_shrink_text forces Composing). The recovery below has to
+        // ask about the intent — "was this batch tearing the composition
+        // down?" — after the arms have already rewritten the outcome.
+        let batch_intent = transition.clone();
         let mut edit = CompositionEdit::from_composition(&composition, transition);
         // The one call site that cannot degrade: without a service there is
         // no engine to convert with and no window to show, so a batch would
@@ -80,7 +82,7 @@ impl TextServiceFactory_Impl {
                 &mut edit,
                 &ipc_service,
                 &composition,
-                &target_state,
+                &batch_intent,
                 &mode,
             )
         {
@@ -175,7 +177,7 @@ impl TextServiceFactory_Impl {
         // end_composition releases the client-side handle
         edit_result = edit_result.and(self.end_composition());
 
-        edit.clear();
+        edit.reset_for_teardown();
         self.close_candidate_ui(ipc_service);
         let clear_result = ipc_service.clear_text();
 
@@ -255,7 +257,7 @@ impl TextServiceFactory_Impl {
         // (same pattern as act_end_composition).
         let apply_result = self.apply_input_mode(mode.clone(), true);
 
-        edit.clear();
+        edit.reset_for_teardown();
         let clear_result = ipc_service.clear_text();
 
         // surface the first failure only after both the client state and the
@@ -698,6 +700,7 @@ mod tests {
             let mut composition = text_service.borrow_mut_composition().unwrap();
             composition.state = CompositionState::Composing;
             composition.preview = "水".to_string();
+            composition.candidates = scripted(&["水", "未"], "みず", &[4, 4], &[2, 2]);
             composition.tip_composition = Some(FakeComposition::new());
         }
 
@@ -715,6 +718,60 @@ mod tests {
             calls.contains(&IpcCall::ClearText),
             "the server reading must be cleared: {calls:?}"
         );
+
+        // ...and the written-back composition must not keep the list either.
+        // Two of the three teardown paths used to, leaving a `None`-state
+        // composition holding candidates that describe a composition that is
+        // over — an inconsistency nothing read yet, which is what let it
+        // survive.
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(composition.state, CompositionState::None);
+        assert!(
+            composition.candidates.texts.is_empty(),
+            "a finished composition must not keep its candidate list: {:?}",
+            composition.candidates.texts
+        );
+        drop(composition);
+        drop(text_service);
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// The same for the mode switch, which is the other path that used to
+    /// leave the list behind (the server-loss reset already dropped it).
+    #[test]
+    fn a_mode_switch_does_not_keep_the_candidate_list() {
+        let _guard = global_state_lock();
+        let _fake = install_fake_ipc(Candidates::default());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = factory_of(&tip);
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Composing;
+            composition.preview = "わたし".to_string();
+            composition.candidates = scripted(&["私", "渡し"], "わたし", &[7, 7], &[3, 3]);
+            composition.tip_composition = Some(FakeComposition::new());
+        }
+
+        // apply_input_mode fails in this fake environment (no thread
+        // manager); the teardown before it is what is under test
+        let _ = factory.handle_action(
+            &[ClientAction::SetIMEMode(InputMode::Kana)],
+            CompositionState::None,
+        );
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert!(
+            composition.candidates.texts.is_empty(),
+            "a mode switch ends the composition, so its list is dead too: {:?}",
+            composition.candidates.texts
+        );
+        drop(composition);
+        drop(text_service);
 
         IMEState::get().unwrap().ipc_service = None;
     }

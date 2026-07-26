@@ -13,7 +13,7 @@ use crate::tsf::factory::TextServiceFactory_Impl;
 use super::{
     composition::{Composition, CompositionEdit, CompositionState, keystrokes},
     input_mode::InputMode,
-    ipc_service::{Candidates, IPCService},
+    ipc_service::IPCService,
 };
 
 impl TextServiceFactory_Impl {
@@ -45,7 +45,7 @@ impl TextServiceFactory_Impl {
         edit: &mut CompositionEdit,
         ipc_service: &IPCService,
         snapshot: &Composition,
-        target_state: &CompositionState,
+        batch_intent: &CompositionState,
         mode: &InputMode,
     ) -> bool {
         // A batch that was ending the composition (Enter, Escape, a mode
@@ -53,7 +53,7 @@ impl TextServiceFactory_Impl {
         // Rebuilding the reading would resurrect a composition the user
         // finished, so those go straight to the teardown, which is what they
         // were doing anyway.
-        if *target_state == CompositionState::None
+        if *batch_intent == CompositionState::None
             || snapshot.state == CompositionState::None
             || snapshot.raw_input.is_empty()
         {
@@ -100,9 +100,8 @@ impl TextServiceFactory_Impl {
         }
         self.close_candidate_ui(ipc_service);
 
-        edit.clear();
+        edit.reset_for_teardown();
         edit.state = CompositionState::None;
-        edit.candidates = Candidates::default();
     }
 }
 
@@ -111,7 +110,7 @@ impl TextServiceFactory_Impl {
 mod tests {
     use super::*;
     use crate::engine::client_action::ClientAction;
-    use crate::engine::ipc_service::IpcCall;
+    use crate::engine::ipc_service::{Candidates, IpcCall};
     use crate::engine::state::IMEState;
     use crate::engine::test_util::{install_fake_ipc, recorded_calls, scripted};
     use crate::tsf::test_support::{
