@@ -7,23 +7,24 @@
 //! expose Value and document surfaces expose Text.
 
 use anyhow::{Context as _, Result};
+use test_support::Hwnd;
+use test_support::uia::{Apartment, UiaBase};
 use windows::Win32::Foundation::HWND;
-use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern,
-    IUIAutomationValuePattern, TreeScope_Descendants, UIA_TextPatternId, UIA_ValuePatternId,
+    IUIAutomationElement, IUIAutomationTextPattern, IUIAutomationValuePattern, UIA_TextPatternId,
+    UIA_ValuePatternId,
 };
 
 pub struct Uia {
-    automation: IUIAutomation,
+    base: UiaBase,
 }
 
 impl Uia {
     pub fn new() -> Result<Self> {
-        let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL) }
-                .context("failed to create the UI Automation client")?;
-        Ok(Self { automation })
+        // Inherit: this harness runs on `main`'s STA, unlike the display
+        // tests, which stand up an MTA of their own.
+        let base = UiaBase::new(Apartment::Inherit)?;
+        Ok(Self { base })
     }
 
     /// The text content of `window`, as an assistive technology would read it.
@@ -112,23 +113,17 @@ impl Uia {
     /// caret moved" from "it did not".
     pub fn focused_automation_id(&self) -> Option<String> {
         unsafe {
-            let element = self.automation.GetFocusedElement().ok()?;
+            let element = self.base.automation().GetFocusedElement().ok()?;
             Some(element.CurrentAutomationId().ok()?.to_string())
         }
     }
 
+    /// `None` rather than an empty vec when the window exposes no tree at
+    /// all, because several callers here distinguish "no tree" (a diagnostic
+    /// worth printing) from "a tree with nothing in it".
     fn descendants(&self, window: HWND) -> Option<Vec<IUIAutomationElement>> {
-        unsafe {
-            let root = self.automation.ElementFromHandle(window).ok()?;
-            let condition = self.automation.CreateTrueCondition().ok()?;
-            let found = root.FindAll(TreeScope_Descendants, &condition).ok()?;
-            let count = found.Length().ok()?;
-            Some(
-                (0..count)
-                    .filter_map(|i| found.GetElement(i).ok())
-                    .collect(),
-            )
-        }
+        let elements = self.base.descendants(Hwnd::from(window));
+        (!elements.is_empty()).then_some(elements)
     }
 }
 

@@ -12,7 +12,9 @@ tonic = { workspace = true }
 tonic-prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["net", "time"] }
+# rt-multi-thread: `pipe::blocking_channels` builds the runtime its callers
+# (the TIP, the settings app) block on
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "time"] }
 tower = "0.5.1"
 hyper-util = { version = "0.1.9", features = ["tokio"] }
 

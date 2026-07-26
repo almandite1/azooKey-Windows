@@ -20,33 +20,29 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use shared::proto::window_service_client::WindowServiceClient;
+// The Win32 observation layer is shared with the E2E harness; only what is
+// specific to driving an isolated ui.exe lives here.
+pub use test_support::win_events::{ImeEvent, ImeEventLog, ime_events};
+use test_support::{
+    CANDIDATE_TITLE, INDICATOR_TITLE,
+    process::process_tree,
+    uia::{Apartment, UiaBase},
+    windows_enum::find_window,
+};
+pub use test_support::{Hwnd, poll_until, wait_for};
 use tonic::transport::Channel;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::System::Com::{
-    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
-};
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, HWINEVENTHOOK, IUIAutomation, IUIAutomationElement,
-    IUIAutomationSelectionItemPattern, SetWinEventHook, TreeScope_Descendants, UIA_CONTROLTYPE_ID,
-    UIA_ListControlTypeId, UIA_ListItemControlTypeId, UIA_SelectionItemPatternId, UnhookWinEvent,
+    IUIAutomationElement, IUIAutomationSelectionItemPattern, UIA_CONTROLTYPE_ID,
+    UIA_ListControlTypeId, UIA_ListItemControlTypeId, UIA_SelectionItemPatternId,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EVENT_OBJECT_IME_CHANGE, EVENT_OBJECT_IME_HIDE, EVENT_OBJECT_IME_SHOW,
-    EnumWindows, GWL_EXSTYLE, GetMessageW, GetWindowLongW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, MSG, PostThreadMessageW, TranslateMessage,
-    WINEVENT_OUTOFCONTEXT, WM_QUIT,
-};
+use windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, GetWindowLongW};
 
 /// How long anything the spawned process does asynchronously gets before the
 /// test calls it a failure. Generous: the first WebView2 start on a cold
@@ -55,36 +51,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a single on-screen effect (a show, a resize, a repaint) gets.
 pub const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
-
-const CANDIDATE_TITLE: &str = "CandidateList";
-const INDICATOR_TITLE: &str = "Indicator";
-
-// ---------------------------------------------------------------------------
-// polling
-// ---------------------------------------------------------------------------
-
-/// Waits for `probe` to produce a value, polling instead of sleeping a fixed
-/// amount: every effect here is asynchronous (RPC → event loop → win32 →
-/// webview), and a fixed sleep either flakes or wastes the difference.
-pub fn poll_until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(value) = probe() {
-            return Some(value);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
-/// `poll_until` with a message instead of an `Option`.
-pub fn wait_for(timeout: Duration, what: &str, mut condition: impl FnMut() -> bool) {
-    if poll_until(timeout, || condition().then_some(())).is_none() {
-        panic!("timed out after {timeout:?} waiting for {what}");
-    }
-}
 
 // ---------------------------------------------------------------------------
 // the process under test
@@ -103,55 +69,49 @@ pub struct UiProcess {
     pub indicator: Hwnd,
 }
 
-/// A window handle, carried as an integer so it can cross threads.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Hwnd(pub isize);
+/// The measurements the display tests take of a window, on top of
+/// `test_support::Hwnd`. An extension trait rather than a wrapper so the
+/// shared helpers keep taking the shared type.
+pub trait HwndExt {
+    fn width(self) -> i32;
+    fn height(self) -> i32;
+    fn extended_style(self) -> u32;
+    fn logical_width(self) -> f64;
+    fn logical_height(self) -> f64;
+    fn dpi(self) -> u32;
+}
 
-impl Hwnd {
-    fn raw(self) -> HWND {
-        HWND(self.0 as *mut std::ffi::c_void)
-    }
-
-    pub fn is_visible(self) -> bool {
-        unsafe { IsWindowVisible(self.raw()) }.as_bool()
-    }
-
-    pub fn rect(self) -> RECT {
-        let mut rect = RECT::default();
-        unsafe { GetWindowRect(self.raw(), &mut rect) }.expect("GetWindowRect failed");
-        rect
-    }
-
-    pub fn width(self) -> i32 {
+impl HwndExt for Hwnd {
+    fn width(self) -> i32 {
         let rect = self.rect();
         rect.right - rect.left
     }
 
-    pub fn height(self) -> i32 {
+    fn height(self) -> i32 {
         let rect = self.rect();
         rect.bottom - rect.top
     }
 
-    pub fn extended_style(self) -> u32 {
+    fn extended_style(self) -> u32 {
         unsafe { GetWindowLongW(self.raw(), GWL_EXSTYLE) as u32 }
     }
 
     /// The window's width in CSS px — the unit every sizing decision in
-    /// `utils` is expressed in. Sizes are applied as `LogicalSize` precisely
-    /// so the physical result follows the monitor's scale factor, so a test
-    /// that asserted physical px would only hold at 100%.
-    pub fn logical_width(self) -> f64 {
+    /// `geometry` is expressed in. Sizes are applied as `LogicalSize`
+    /// precisely so the physical result follows the monitor's scale factor,
+    /// so a test that asserted physical px would only hold at 100%.
+    fn logical_width(self) -> f64 {
         f64::from(self.width()) * 96.0 / f64::from(self.dpi())
     }
 
     /// The window's height in CSS px, for the same reason as
     /// [`Self::logical_width`] — the height the webview reports is a count of
     /// rows plus chrome, all in CSS px.
-    pub fn logical_height(self) -> f64 {
+    fn logical_height(self) -> f64 {
         f64::from(self.height()) * 96.0 / f64::from(self.dpi())
     }
 
-    pub fn dpi(self) -> u32 {
+    fn dpi(self) -> u32 {
         match unsafe { GetDpiForWindow(self.raw()) } {
             0 => 96, // an invalid window; the caller's assertion will say so
             dpi => dpi,
@@ -258,7 +218,9 @@ impl UiProcess {
     }
 
     fn wait_for_window(&self, title: &str) -> Hwnd {
-        let found = poll_until(READY_TIMEOUT, || find_window(title, &self.pids));
+        let found = poll_until(READY_TIMEOUT, || {
+            find_window(title, |pid| self.pids.contains(&pid))
+        });
         match found {
             Some(hwnd) => hwnd,
             None => panic!(
@@ -518,228 +480,6 @@ fn ui_exe_path() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// window lookup
-// ---------------------------------------------------------------------------
-
-struct Search<'a> {
-    title: &'a str,
-    pids: &'a HashSet<u32>,
-    found: Option<Hwnd>,
-}
-
-/// The first top-level window with this title owned by one of `pids`. The
-/// titles are fixed strings the installed ui.exe uses too, hence the pid
-/// filter.
-fn find_window(title: &str, pids: &HashSet<u32>) -> Option<Hwnd> {
-    let mut search = Search {
-        title,
-        pids,
-        found: None,
-    };
-    // EnumWindows returns Err when the callback stops the enumeration, which
-    // is exactly what a hit does here — the result is in `search`.
-    let _ = unsafe {
-        EnumWindows(
-            Some(enum_windows_proc),
-            LPARAM(&mut search as *mut Search as isize),
-        )
-    };
-    search.found
-}
-
-unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
-    let search = unsafe { &mut *(lparam.0 as *mut Search) };
-
-    let mut pid = 0u32;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    if !search.pids.contains(&pid) {
-        return windows::core::BOOL(1);
-    }
-
-    let mut text = [0u16; 64];
-    let len = unsafe { GetWindowTextW(hwnd, &mut text) };
-    if String::from_utf16_lossy(&text[..len as usize]) != search.title {
-        return windows::core::BOOL(1);
-    }
-
-    search.found = Some(Hwnd(hwnd.0 as isize));
-    windows::core::BOOL(0) // stop enumerating
-}
-
-/// `root` and every process descended from it.
-fn process_tree(root: u32) -> HashSet<u32> {
-    let mut parents: Vec<(u32, u32)> = Vec::new();
-
-    unsafe {
-        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return HashSet::from([root]);
-        };
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        if Process32FirstW(snapshot, &mut entry).is_ok() {
-            loop {
-                parents.push((entry.th32ProcessID, entry.th32ParentProcessID));
-                if Process32NextW(snapshot, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = windows::Win32::Foundation::CloseHandle(snapshot);
-    }
-
-    let mut tree = HashSet::from([root]);
-    // one pass per generation; the tree is two deep at most (shim -> ui)
-    for _ in 0..4 {
-        let before = tree.len();
-        for (pid, parent) in &parents {
-            if tree.contains(parent) {
-                tree.insert(*pid);
-            }
-        }
-        if tree.len() == before {
-            break;
-        }
-    }
-    tree
-}
-
-// ---------------------------------------------------------------------------
-// WinEvent recording
-// ---------------------------------------------------------------------------
-
-/// The IME notifications the candidate window announces, in the order they
-/// arrived. Global because a `WINEVENTPROC` gets no context pointer; entries
-/// carry the hwnd so several harnesses can share it.
-static EVENTS: Mutex<Vec<(u32, isize)>> = Mutex::new(Vec::new());
-
-/// One IME notification.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ImeEvent {
-    Show,
-    Hide,
-    Change,
-}
-
-/// Installs the out-of-context hook (once per test binary) on a thread of its
-/// own with a message loop, which is how `WINEVENT_OUTOFCONTEXT` callbacks are
-/// delivered.
-pub fn ime_events() -> &'static ImeEventLog {
-    static LOG: OnceLock<ImeEventLog> = OnceLock::new();
-    LOG.get_or_init(|| {
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || unsafe {
-            let hook = SetWinEventHook(
-                EVENT_OBJECT_IME_SHOW,
-                EVENT_OBJECT_IME_CHANGE,
-                None,
-                Some(win_event_proc),
-                // every process: the events are announced by the ui.exe under
-                // test, whose pid is not known when the hook goes in, and the
-                // log is filtered by hwnd anyway
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT,
-            );
-            let _ = ready_tx.send(GetCurrentThreadId());
-
-            let mut message = MSG::default();
-            while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
-            let _ = UnhookWinEvent(hook);
-        });
-
-        ImeEventLog {
-            thread: ready_rx
-                .recv()
-                .expect("the WinEvent hook thread died on startup"),
-        }
-    })
-}
-
-pub struct ImeEventLog {
-    thread: u32,
-}
-
-impl ImeEventLog {
-    /// A cursor into the log. Everything asserted on is "what happened since
-    /// this mark", so the tests do not depend on each other or on the live
-    /// IME's own notifications.
-    pub fn mark(&self) -> usize {
-        EVENTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
-    }
-
-    /// The notifications `window` announced after `mark`.
-    pub fn since(&self, mark: usize, window: Hwnd) -> Vec<ImeEvent> {
-        EVENTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .skip(mark)
-            .filter(|(_, hwnd)| *hwnd == window.0)
-            .filter_map(|(event, _)| match *event {
-                EVENT_OBJECT_IME_SHOW => Some(ImeEvent::Show),
-                EVENT_OBJECT_IME_HIDE => Some(ImeEvent::Hide),
-                EVENT_OBJECT_IME_CHANGE => Some(ImeEvent::Change),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Waits until `window` has announced `expected` since `mark` — and then
-    /// keeps watching briefly, so a *second* notification for the same
-    /// transition still fails the assertion.
-    pub fn expect_exactly(&self, mark: usize, window: Hwnd, expected: &[ImeEvent]) {
-        let got = poll_until(SETTLE_TIMEOUT, || {
-            let got = self.since(mark, window);
-            (got.len() >= expected.len()).then_some(got)
-        });
-        let Some(got) = got else {
-            panic!(
-                "timed out waiting for {expected:?}; saw {:?}",
-                self.since(mark, window)
-            );
-        };
-        assert_eq!(got, expected, "unexpected IME notifications");
-
-        // a duplicate arrives right behind the real one if it arrives at all
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            self.since(mark, window),
-            expected,
-            "a transition was announced more than once"
-        );
-    }
-}
-
-impl Drop for ImeEventLog {
-    fn drop(&mut self) {
-        let _ = unsafe { PostThreadMessageW(self.thread, WM_QUIT, WPARAM(0), LPARAM(0)) };
-    }
-}
-
-unsafe extern "system" fn win_event_proc(
-    _hook: HWINEVENTHOOK,
-    event: u32,
-    hwnd: HWND,
-    _object_id: i32,
-    _child_id: i32,
-    _thread: u32,
-    _time: u32,
-) {
-    EVENTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((event, hwnd.0 as isize));
-}
-
-// ---------------------------------------------------------------------------
 // UI Automation read-back
 // ---------------------------------------------------------------------------
 
@@ -749,38 +489,21 @@ unsafe extern "system" fn win_event_proc(
 /// have unit tests already, but nothing proved the candidates ever reach the
 /// webview, or that they arrive as an accessible list.
 pub struct Uia {
-    automation: IUIAutomation,
+    base: UiaBase,
 }
 
 impl Uia {
     pub fn new() -> Self {
-        unsafe {
-            // MTA: this thread does not pump messages, and UIA is happy to be
-            // called from a multithreaded apartment. Already-initialised is
-            // not an error here.
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL)
-                .expect("failed to create the UI Automation client");
-            Self { automation }
-        }
+        // MTA: this thread does not pump messages, and UIA is happy to be
+        // called from a multithreaded apartment. (The E2E harness inherits
+        // main's STA instead — hence the explicit choice.)
+        let base = UiaBase::new(Apartment::InitMultiThreaded)
+            .expect("failed to create the UI Automation client");
+        Self { base }
     }
 
     fn descendants(&self, window: Hwnd) -> Vec<IUIAutomationElement> {
-        unsafe {
-            let Ok(root) = self.automation.ElementFromHandle(window.raw()) else {
-                return Vec::new();
-            };
-            let Ok(condition) = self.automation.CreateTrueCondition() else {
-                return Vec::new();
-            };
-            let Ok(found) = root.FindAll(TreeScope_Descendants, &condition) else {
-                return Vec::new();
-            };
-            let count = found.Length().unwrap_or(0);
-            (0..count)
-                .filter_map(|i| found.GetElement(i).ok())
-                .collect()
-        }
+        self.base.descendants(window)
     }
 
     fn elements_of_type(&self, window: Hwnd, control_type: UIA_CONTROLTYPE_ID) -> Vec<Element> {

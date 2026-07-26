@@ -1,0 +1,40 @@
+[package]
+name = "test-support"
+version.workspace = true
+edition = "2024"
+
+# Win32 observation helpers for the two harnesses that watch the IME from
+# outside: the ui.exe display tests (crates/ui/tests) and the E2E suite
+# (crates/e2e). They had forked ~300 lines of this between them — the WinEvent
+# recorder, the UIA base layer, EnumWindows, the Toolhelp walk, poll_until and
+# an Hwnd newtype — and a fix to one copy never reached the other.
+#
+# Deliberately NOT part of `shared`: these are Win32 test bindings and must
+# never be linked into the shipped binaries. `ui` takes it as a
+# dev-dependency; `azookey-e2e` is itself a test harness and takes it
+# normally.
+#
+# It is a LIBRARY, which is the point: `pub` items are not dead code, so
+# nothing here needs the blanket `#![allow(dead_code)]` the forked test module
+# carried.
+
+[dependencies]
+anyhow = { workspace = true }
+
+[dependencies.windows]
+workspace = true
+features = [
+    # HWND / RECT / CloseHandle
+    "Win32_Foundation",
+    # CoCreateInstance / CoInitializeEx for the UI Automation client
+    "Win32_System_Com",
+    # CreateToolhelp32Snapshot, for walking process trees by image name
+    "Win32_System_Diagnostics_ToolHelp",
+    # GetCurrentThreadId (the hook thread), OpenProcess +
+    # QueryFullProcessImageNameW (which image owns a window)
+    "Win32_System_Threading",
+    # IUIAutomation, and SetWinEventHook for the IME notifications
+    "Win32_UI_Accessibility",
+    # EnumWindows / GetWindowTextW / the hook thread's message loop
+    "Win32_UI_WindowsAndMessaging",
+]

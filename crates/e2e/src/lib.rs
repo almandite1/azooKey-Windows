@@ -16,26 +16,25 @@ pub mod overlay;
 pub mod profile;
 pub mod scenarios;
 pub mod uia;
-pub mod winevent;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// Waits for `probe` to produce a value. Everything here is asynchronous —
-/// keystroke to TIP to engine to host application to accessibility tree — so
-/// the harness polls rather than sleeping a fixed amount. Deliberately no
-/// retries around a whole scenario: a flake that a retry hides stops being a
-/// substitute for the manual checklist.
-pub fn poll_until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(value) = probe() {
-            return Some(value);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+/// How often the harness re-checks an asynchronous effect. Slower than the
+/// display tests' tick because every step here crosses a keystroke, the TIP,
+/// the engine, the host application and the accessibility tree.
+const POLL_TICK: Duration = Duration::from_millis(50);
+
+/// Waits for `probe` to produce a value, on this harness's tick. Deliberately
+/// no retries around a whole scenario: a flake that a retry hides stops being
+/// a substitute for the manual checklist.
+pub fn poll_until<T>(timeout: Duration, probe: impl FnMut() -> Option<T>) -> Option<T> {
+    test_support::poll_until_tick(timeout, POLL_TICK, probe)
+}
+
+/// The IME notifications recorder, re-exported so scenarios keep saying
+/// `winevent::…`.
+pub mod winevent {
+    pub use test_support::win_events::{ImeEvent, ImeEventLog, ime_events as log};
 }
 
 /// The stage a run reached, so a failure says *where* it broke rather than

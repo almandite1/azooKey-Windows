@@ -343,7 +343,7 @@ fn winevents_fire_once_per_transition(_ctx: &Ctx) -> Result<String> {
     // composing brings it up: exactly one SHOW
     let mark = events.mark();
     keyboard::type_ascii(READING)?;
-    let seen = events.wait_for(mark, candidate, ImeEvent::Show, SETTLE_TIMEOUT);
+    let seen = events.wait_for_event(mark, candidate, ImeEvent::Show, SETTLE_TIMEOUT);
     let shows = seen.iter().filter(|e| **e == ImeEvent::Show).count();
     if shows != 1 {
         bail!("SHOW が {shows} 回（1 回であるべき）: {seen:?}");
@@ -352,7 +352,7 @@ fn winevents_fire_once_per_transition(_ctx: &Ctx) -> Result<String> {
     // cancelling takes it down: exactly one HIDE, and nothing after it
     let mark = events.mark();
     keyboard::tap(keyboard::escape())?;
-    let seen = events.wait_for(mark, candidate, ImeEvent::Hide, SETTLE_TIMEOUT);
+    let seen = events.wait_for_event(mark, candidate, ImeEvent::Hide, SETTLE_TIMEOUT);
     let hides = seen.iter().filter(|e| **e == ImeEvent::Hide).count();
     if hides != 1 {
         bail!("HIDE が {hides} 回（1 回であるべき）: {seen:?}");

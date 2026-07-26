@@ -23,7 +23,7 @@
 
 mod support;
 
-use support::{ImeEvent, SETTLE_TIMEOUT, Ui, poll_until, wait_for};
+use support::{HwndExt as _, ImeEvent, SETTLE_TIMEOUT, Ui, poll_until, wait_for};
 
 use std::time::Duration;
 use windows::Win32::Foundation::RECT;
@@ -70,14 +70,16 @@ async fn showing_and_hiding_announces_one_transition_each() {
 
     let mark = ui.events.mark();
     ui.show_at(caret_with_room()).await;
-    ui.events.expect_exactly(mark, candidate, &[ImeEvent::Show]);
+    ui.events
+        .expect_exactly(mark, candidate, &[ImeEvent::Show], SETTLE_TIMEOUT);
 
     let mark = ui.events.mark();
     ui.hide().await;
     wait_for(SETTLE_TIMEOUT, "the candidate window to disappear", || {
         !candidate.is_visible()
     });
-    ui.events.expect_exactly(mark, candidate, &[ImeEvent::Hide]);
+    ui.events
+        .expect_exactly(mark, candidate, &[ImeEvent::Hide], SETTLE_TIMEOUT);
 
     // a second Hide is not a transition and must announce nothing
     let mark = ui.events.mark();
@@ -252,7 +254,7 @@ async fn only_a_visible_window_announces_content_changes() {
     let mark = ui.events.mark();
     ui.set_candidates(&["水", "みず"]).await;
     ui.events
-        .expect_exactly(mark, candidate, &[ImeEvent::Change]);
+        .expect_exactly(mark, candidate, &[ImeEvent::Change], SETTLE_TIMEOUT);
 
     ui.hide_and_wait().await;
 
