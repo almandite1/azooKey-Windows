@@ -50,7 +50,7 @@ script_runner = "powershell"
 script_extension = "ps1"
 script = """
 $ErrorActionPreference = "Stop"
-$flags = @($args | Where-Object { $_ -and $_ -ne '--debug' })
+. ./scripts/build-flags.ps1 @args
 # ui.exe must exist next to the test binary; the harness runs the build it
 # was compiled alongside (override with AZOOKEY_UI_EXE)
 cargo build -p ui @flags
@@ -61,18 +61,16 @@ if ($LASTEXITCODE -ne 0) { throw "the display tests failed with exit code $LASTE
 """
 args = ["${@}"]
 
-# `cargo make build --debug` is documented (README) and the rest of the flow
-# accepts it — post_build maps `--debug`/`--release`/nothing onto the target
-# subdirectory. cargo itself has no `--debug` flag though (debug IS its
-# default), so forwarding the argument verbatim made the documented command
-# fail outright. cargo-make's command+args form cannot branch on an argument,
-# hence the script (issue #5).
+# cargo-make's command+args form cannot branch on an argument, hence a script
+# per task. `scripts/build-flags.ps1` is the argument handling all of them
+# share — including why `--debug` must be dropped rather than forwarded
+# (issue #5).
 [tasks.build_x64]
 script_runner = "powershell"
 script_extension = "ps1"
 script = """
 $ErrorActionPreference = "Stop"
-$flags = @($args | Where-Object { $_ -and $_ -ne '--debug' })
+. ./scripts/build-flags.ps1 @args
 cargo build @flags
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
 """
@@ -83,7 +81,7 @@ script_runner = "powershell"
 script_extension = "ps1"
 script = """
 $ErrorActionPreference = "Stop"
-$flags = @($args | Where-Object { $_ -and $_ -ne '--debug' })
+. ./scripts/build-flags.ps1 @args
 cargo build -p azookey-windows --target=i686-pc-windows-msvc @flags
 if ($LASTEXITCODE -ne 0) { throw "cargo build (i686) failed with exit code $LASTEXITCODE" }
 """
@@ -104,8 +102,7 @@ script_runner = "powershell"
 script_extension = "ps1"
 script = """
 $ErrorActionPreference = "Stop"
-$flags = @($args | Where-Object { $_ -and $_ -ne '--debug' })
-$profileDir = if ($flags -contains '--release') { 'release' } else { 'debug' }
+. ./scripts/build-flags.ps1 @args
 
 cargo build -p azookey-e2e @flags
 if ($LASTEXITCODE -ne 0) { throw "cargo build -p azookey-e2e failed with exit code $LASTEXITCODE" }
@@ -198,14 +195,9 @@ script  = """
 # fail fast: a missing artifact must fail the build, not ship a broken
 # installer (previously the exit code was whatever the last icacls returned)
 $ErrorActionPreference = "Stop"
-
-$str=$args[0]
-if ([string]::IsNullOrEmpty($str)) {
-    $str = "debug"
-} else {
-    $str=$str.Substring(2)
-}
-
+. ./scripts/build-flags.ps1 @args
+# post_build takes the same --debug/--release as the build tasks
+$str = $profileDir
 
 mkdir build/x86 -Force | Out-Null
 

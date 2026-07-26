@@ -20,13 +20,9 @@ import ffi
 struct DefensiveTests {
     /// Same layout as `RealDictionaryTests`: the dictionaries are submodules
     /// sitting next to this file, so derive their path from `#filePath`.
-    private static let root = URL(filePath: #filePath)
-        .deletingLastPathComponent()  // azookey-serverTests
-        .deletingLastPathComponent()  // Tests
-        .deletingLastPathComponent()  // server-swift
 
     private static let engine = KanaKanjiConverter(
-        dictionaryURL: root.appendingPathComponent("azooKey_dictionary_storage/Dictionary"),
+        dictionaryURL: packageRoot.appendingPathComponent("azooKey_dictionary_storage/Dictionary"),
         preloadDictionary: true
     )
 
@@ -137,7 +133,7 @@ struct DefensiveTests {
     /// Exercises `to_list_pointer` with `length > 0` end to end.
     @Test("AppendText → GetComposedText → FreeComposedText round-trips a real conversion")
     func ffiRoundTripThroughConverter() {
-        execURL = Self.root.appendingPathComponent("azooKey_emoji_dictionary_storage")
+        execURL = packageRoot.appendingPathComponent("azooKey_emoji_dictionary_storage")
         converter = Self.engine
         let session: Int64 = 0x7000_0005
         defer { remove_session(session: session); converter = nil }

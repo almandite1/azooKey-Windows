@@ -21,18 +21,6 @@ struct SessionTests {
         sessions[session]?.composingText.convertTarget ?? ""
     }
 
-    @discardableResult
-    private func append(_ input: String, to session: Int64) -> String {
-        var cursor: Int32 = -1
-        let reading = input.withCString { text in
-            withUnsafeMutablePointer(to: &cursor) {
-                append_text(session: session, input: text, cursorPtr: $0)
-            }
-        }
-        defer { free_string(ptr: reading) }
-        return reading.map { String(cString: $0) } ?? ""
-    }
-
     /// Two applications typing at the same time. Interleaved on purpose: a
     /// shared `ComposingText` would splice the two readings together.
     @Test("two sessions compose independently")
@@ -134,18 +122,6 @@ struct SessionTests {
 @Suite("composition editing exports")
 @MainActor
 struct CompositionEditingTests {
-    @discardableResult
-    private func append(_ input: String, to session: Int64) -> String {
-        var cursor: Int32 = -1
-        let reading = input.withCString { text in
-            withUnsafeMutablePointer(to: &cursor) {
-                append_text(session: session, input: text, cursorPtr: $0)
-            }
-        }
-        defer { free_string(ptr: reading) }
-        return reading.map { String(cString: $0) } ?? ""
-    }
-
     private func removeText(_ session: Int64) -> (reading: String, cursor: Int32) {
         var cursor: Int32 = -1
         let reading = withUnsafeMutablePointer(to: &cursor) {
