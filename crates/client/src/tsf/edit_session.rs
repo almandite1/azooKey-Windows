@@ -261,7 +261,7 @@ impl TextServiceFactory_Impl {
         ) -> Result<Rc<dyn Fn(u32) -> Result<()>>>,
     ) -> Result<()> {
         let text_service = self.borrow()?;
-        let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() else {
+        let Some(composition) = text_service.borrow_composition()?.tip().cloned() else {
             tracing::warn!("Composition is not started");
             return Ok(());
         };
@@ -279,7 +279,7 @@ impl TextServiceFactory_Impl {
         // service: end_composition borrows it again
         let tip_exists = {
             let text_service = self.borrow()?;
-            text_service.borrow_composition()?.tip_composition.is_some()
+            text_service.borrow_composition()?.has_tip()
         };
 
         if tip_exists {
@@ -317,7 +317,9 @@ impl TextServiceFactory_Impl {
         )?;
 
         tracing::debug!("Composition started {composition:?}");
-        text_service.borrow_mut_composition()?.tip_composition = composition;
+        text_service
+            .borrow_mut_composition()?
+            .attach_tip(composition);
 
         Ok(())
     }
@@ -351,7 +353,7 @@ impl TextServiceFactory_Impl {
         // whether or not the TSF side could be ended, the client must let
         // go: keeping a handle to a dead composition wedges every later
         // start_composition
-        self.borrow()?.borrow_mut_composition()?.tip_composition = None;
+        self.borrow()?.borrow_mut_composition()?.detach_tip();
 
         result
     }
@@ -501,7 +503,7 @@ impl TextServiceFactory_Impl {
         let anchor: Result<Option<(u32, ITfContext, ITfComposition)>> = (|| {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?;
-            let Some(tip_composition) = composition.tip_composition.clone() else {
+            let Some(tip_composition) = composition.tip().cloned() else {
                 return Ok(None);
             };
             Ok(Some((
@@ -563,7 +565,7 @@ impl TextServiceFactory_Impl {
             // While composing, the composition range is the better anchor and
             // update_pos already keeps it current — measuring the selection
             // instead would fight it.
-            if composition.tip_composition.is_some() {
+            if composition.has_tip() {
                 return Ok(None);
             }
             Ok(Some((text_service.tid, context)))
@@ -608,7 +610,7 @@ mod tests {
             .unwrap()
             .borrow_mut_composition()
             .unwrap()
-            .tip_composition = Some(FakeComposition::with_log(log.clone()));
+            .attach_tip(Some(FakeComposition::with_log(log.clone())));
         (tip, log)
     }
 
@@ -656,7 +658,7 @@ mod tests {
             .unwrap()
             .borrow_mut_composition()
             .unwrap()
-            .tip_composition = Some(FakeComposition::with_log(log.clone()));
+            .attach_tip(Some(FakeComposition::with_log(log.clone())));
         // the rect is only measured when there is an IPC service to report
         // it to; the send itself may fail (no UI process) and is logged only
         IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
@@ -718,7 +720,7 @@ mod tests {
             .unwrap()
             .borrow_mut_composition()
             .unwrap()
-            .tip_composition = Some(FakeComposition::with_log(log.clone()));
+            .attach_tip(Some(FakeComposition::with_log(log.clone())));
         IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
 
         factory.update_pos_from_selection();
@@ -809,7 +811,7 @@ mod tests {
             .unwrap()
             .borrow_mut_composition()
             .unwrap()
-            .tip_composition = Some(FakeComposition::with_log(log.clone()));
+            .attach_tip(Some(FakeComposition::with_log(log.clone())));
         IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
 
         let view = unsafe { fake_context_of(&context) }.view_log();
@@ -873,7 +875,7 @@ mod tests {
             .unwrap()
             .borrow_mut_composition()
             .unwrap()
-            .tip_composition = Some(FakeComposition::new());
+            .attach_tip(Some(FakeComposition::new()));
         let result = factory.start_composition();
         assert!(
             result.is_ok(),
@@ -885,8 +887,7 @@ mod tests {
                 .unwrap()
                 .borrow_composition()
                 .unwrap()
-                .tip_composition
-                .is_some(),
+                .has_tip(),
             "recovery must leave a fresh live composition, not return early \
              with none (which made the next set_text a silent no-op)"
         );
@@ -903,16 +904,15 @@ mod tests {
             .unwrap()
             .borrow_mut_composition()
             .unwrap()
-            .tip_composition = Some(FakeComposition::new());
+            .attach_tip(Some(FakeComposition::new()));
         let _ = factory.end_composition();
         assert!(
-            factory
+            !factory
                 .borrow()
                 .unwrap()
                 .borrow_composition()
                 .unwrap()
-                .tip_composition
-                .is_none(),
+                .has_tip(),
             "the client must let go of a composition it cannot end"
         );
     }
@@ -1037,7 +1037,7 @@ mod tests {
                 .unwrap()
                 .borrow_mut_composition()
                 .unwrap()
-                .tip_composition = Some(FakeComposition::with_log(log));
+                .attach_tip(Some(FakeComposition::with_log(log)));
         }
         drop(context);
         drop(tip); // the host's last Release

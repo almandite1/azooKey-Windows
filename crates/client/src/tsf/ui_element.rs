@@ -228,14 +228,18 @@ impl ITfUIElement_Impl for TextServiceFactory_Impl {
             text_service.ui_element.show = show;
         }
 
-        // honour a host that flips visibility mid-composition. Advisory: with
+        // Honour a host that flips visibility mid-composition. Advisory: with
         // no service there is no window of ours to flip.
+        //
+        // Through `command_candidate_window` rather than the RPCs directly:
+        // this and the composition lifecycle (engine/candidate_ui.rs) are the
+        // only two things that move our window, and they used to send from
+        // two places that could drift apart. Deliberately NOT the full
+        // `close_candidate_ui` on `FALSE` — the composition is still live and
+        // its candidate list with it; this is a visibility toggle, not a
+        // teardown.
         if let Some(ipc_service) = crate::engine::state::IMEState::ipc()? {
-            if show {
-                ipc_service.show_window();
-            } else {
-                ipc_service.hide_window();
-            }
+            self.command_candidate_window(&ipc_service, show);
         }
 
         Ok(())
@@ -422,6 +426,44 @@ mod tests {
         assert!(factory.ui_should_show());
 
         let _ = unsafe { tip.Deactivate() };
+    }
+
+    /// A host flipping visibility mid-composition must move our window — and
+    /// must do it through the same sender the composition lifecycle uses, so
+    /// ui.exe's placement bookkeeping sees every transition from one path.
+    ///
+    /// Also pins what this path deliberately does NOT do: `Show(FALSE)` is a
+    /// visibility toggle on a live composition, so it must not blank the
+    /// candidate list the way ending the composition does.
+    #[test]
+    fn the_hosts_show_toggle_moves_the_window_without_dropping_the_list() {
+        use crate::engine::ipc_service::{IPCService, IpcCall};
+        use windows::Win32::UI::TextServices::ITfUIElement;
+
+        let _guard = global_state_lock();
+        let tip = activate_with(Rc::new(UiElementLog::default()));
+        // after Activate, which installs a real service of its own
+        let (service, fake) = IPCService::new_fake().unwrap();
+        crate::engine::state::IMEState::get().unwrap().ipc_service = Some(service);
+
+        let element: ITfUIElement = windows::core::Interface::cast(&tip).unwrap();
+
+        unsafe { element.Show(false) }.unwrap();
+        unsafe { element.Show(true) }.unwrap();
+
+        let calls = fake.lock().unwrap().calls.clone();
+        assert_eq!(
+            calls,
+            vec![IpcCall::HideWindow, IpcCall::ShowWindow],
+            "each toggle must reach the window, in order"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, IpcCall::SetCandidates(_))),
+            "a visibility toggle must not blank a live composition's list: {calls:?}"
+        );
+
+        let _ = unsafe { tip.Deactivate() };
+        crate::engine::state::IMEState::get().unwrap().ipc_service = None;
     }
 
     /// The point of UILess mode: a host that draws the candidates itself

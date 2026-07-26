@@ -13,7 +13,7 @@ use crate::tsf::factory::TextServiceFactory_Impl;
 use super::{
     composition::{Composition, CompositionEdit, CompositionState, keystrokes},
     input_mode::InputMode,
-    ipc_service::{Candidates, IPCService},
+    ipc_service::IPCService,
 };
 
 impl TextServiceFactory_Impl {
@@ -45,7 +45,7 @@ impl TextServiceFactory_Impl {
         edit: &mut CompositionEdit,
         ipc_service: &IPCService,
         snapshot: &Composition,
-        target_state: &CompositionState,
+        batch_intent: &CompositionState,
         mode: &InputMode,
     ) -> bool {
         // A batch that was ending the composition (Enter, Escape, a mode
@@ -53,8 +53,8 @@ impl TextServiceFactory_Impl {
         // Rebuilding the reading would resurrect a composition the user
         // finished, so those go straight to the teardown, which is what they
         // were doing anyway.
-        if *target_state == CompositionState::None
-            || snapshot.state == CompositionState::None
+        if *batch_intent == CompositionState::None
+            || *snapshot.state() == CompositionState::None
             || snapshot.raw_input.is_empty()
         {
             return false;
@@ -75,7 +75,7 @@ impl TextServiceFactory_Impl {
         // and keep the one already on screen: the reading is the same, the
         // document was never touched, and redrawing would make a recovered
         // stall look like a candidate list that jumped on its own.
-        *edit = CompositionEdit::from_composition(snapshot, snapshot.state.clone());
+        *edit = CompositionEdit::from_composition(snapshot, snapshot.state().clone());
         tracing::info!(
             "rebuilt the server composition after a stall; kept {} keystrokes",
             snapshot.raw_input.chars().count()
@@ -100,9 +100,8 @@ impl TextServiceFactory_Impl {
         }
         self.close_candidate_ui(ipc_service);
 
-        edit.clear();
+        edit.reset_for_teardown();
         edit.state = CompositionState::None;
-        edit.candidates = Candidates::default();
     }
 }
 
@@ -111,12 +110,11 @@ impl TextServiceFactory_Impl {
 mod tests {
     use super::*;
     use crate::engine::client_action::ClientAction;
-    use crate::engine::ipc_service::IpcCall;
+    use crate::engine::ipc_service::{Candidates, IpcCall};
     use crate::engine::state::IMEState;
     use crate::engine::test_util::{install_fake_ipc, recorded_calls, scripted};
     use crate::tsf::test_support::{
-        EditSessionBehavior, FakeComposition, factory_of, factory_with_fake_context,
-        global_state_lock,
+        EditSessionBehavior, factory_of, factory_with_fake_context, global_state_lock,
     };
 
     /// A server that stalls for one call and then answers again must cost the
@@ -138,14 +136,13 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
+            composition.set_up_for_test(CompositionState::Composing);
             composition.preview = "水".to_string();
             composition.raw_input = "mizu".to_string();
             composition.raw_hiragana = "みず".to_string();
             composition.corresponding_count = 4;
             composition.surface_count = 2;
             composition.candidates = scripted(&["水"], "みず", &[4], &[2]);
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         factory
@@ -158,7 +155,7 @@ mod tests {
         let text_service = factory.borrow().unwrap();
         let composition = text_service.borrow_composition().unwrap();
         assert_eq!(
-            composition.state,
+            *composition.state(),
             CompositionState::Composing,
             "a recoverable stall must not throw the composition away"
         );
@@ -169,10 +166,7 @@ mod tests {
         );
         assert_eq!(composition.raw_hiragana, "みず");
         assert_eq!(composition.preview, "水");
-        assert!(
-            composition.tip_composition.is_some(),
-            "the TSF composition must stay open"
-        );
+        assert!(composition.has_tip(), "the TSF composition must stay open");
         drop(composition);
         drop(text_service);
 
@@ -212,11 +206,10 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
+            composition.set_up_for_test(CompositionState::Previewing);
             composition.preview = "水".to_string();
             composition.raw_input = "mizu".to_string();
             composition.raw_hiragana = "みず".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         factory
@@ -225,7 +218,7 @@ mod tests {
 
         let text_service = factory.borrow().unwrap();
         let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(composition.state, CompositionState::None);
+        assert_eq!(*composition.state(), CompositionState::None);
         assert!(
             composition.raw_input.is_empty() && composition.preview.is_empty(),
             "the finished composition must stay finished"
@@ -262,12 +255,11 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
+            composition.set_up_for_test(CompositionState::Composing);
             composition.preview = "水".to_string();
             composition.raw_input = "mizu".to_string();
             composition.raw_hiragana = "みず".to_string();
             composition.corresponding_count = 4;
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         // the crashing keystroke is swallowed, not surfaced as an error
@@ -281,7 +273,7 @@ mod tests {
         let text_service = factory.borrow().unwrap();
         let composition = text_service.borrow_composition().unwrap();
         assert_eq!(
-            composition.state,
+            *composition.state(),
             CompositionState::None,
             "the composition must reset to None after the server was lost"
         );
@@ -293,7 +285,7 @@ mod tests {
             "the stale reading must be cleared so the next keystroke starts fresh"
         );
         assert!(
-            composition.tip_composition.is_none(),
+            !composition.has_tip(),
             "the TSF composition handle must be released"
         );
         drop(composition);

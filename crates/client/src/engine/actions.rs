@@ -39,10 +39,12 @@ impl TextServiceFactory_Impl {
             (composition, text_service.input_mode.clone())
         };
 
-        // where the batch is headed, kept out of `edit` because the recovery
-        // below has to tell "this batch was still composing" from "this batch
-        // was tearing the composition down" after the arms have run
-        let target_state = transition.clone();
+        // The batch's INTENT, kept immutable and out of `edit`. `edit.state`
+        // starts as this same value but is the OUTCOME: an arm may override
+        // it (act_shrink_text forces Composing). The recovery below has to
+        // ask about the intent — "was this batch tearing the composition
+        // down?" — after the arms have already rewritten the outcome.
+        let batch_intent = transition.clone();
         let mut edit = CompositionEdit::from_composition(&composition, transition);
         // The one call site that cannot degrade: without a service there is
         // no engine to convert with and no window to show, so a batch would
@@ -80,7 +82,7 @@ impl TextServiceFactory_Impl {
                 &mut edit,
                 &ipc_service,
                 &composition,
-                &target_state,
+                &batch_intent,
                 &mode,
             )
         {
@@ -91,7 +93,7 @@ impl TextServiceFactory_Impl {
         // later action failed, keeping the client consistent with the server
         let text_service = self.borrow()?;
         let mut composition = text_service.borrow_mut_composition()?;
-        edit.write_back(&mut composition);
+        edit.commit(&mut composition);
         drop(composition);
         drop(text_service);
 
@@ -175,7 +177,7 @@ impl TextServiceFactory_Impl {
         // end_composition releases the client-side handle
         edit_result = edit_result.and(self.end_composition());
 
-        edit.clear();
+        edit.reset_for_teardown();
         self.close_candidate_ui(ipc_service);
         let clear_result = ipc_service.clear_text();
 
@@ -255,7 +257,7 @@ impl TextServiceFactory_Impl {
         // (same pattern as act_end_composition).
         let apply_result = self.apply_input_mode(mode.clone(), true);
 
-        edit.clear();
+        edit.reset_for_teardown();
         let clear_result = ipc_service.clear_text();
 
         // surface the first failure only after both the client state and the
@@ -389,8 +391,8 @@ mod tests {
     use crate::engine::ipc_service::{Candidates, FakeIpc, IpcCall};
     use crate::engine::test_util::{install_fake_ipc, recorded_calls, scripted};
     use crate::tsf::test_support::{
-        EditSessionBehavior, FakeComposition, FakeContext, RangeLog, factory_of,
-        factory_with_context, factory_with_fake_context, global_state_lock,
+        EditSessionBehavior, FakeContext, RangeLog, factory_of, factory_with_context,
+        factory_with_fake_context, global_state_lock,
     };
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
@@ -408,8 +410,7 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
-            composition.tip_composition = Some(FakeComposition::new());
+            composition.set_up_for_test(CompositionState::Composing);
         }
 
         factory
@@ -458,10 +459,9 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
+            composition.set_up_for_test(CompositionState::Previewing);
             composition.selection_index = 3;
             composition.preview = "水".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         // the left arrow: Previewing + MoveCursor transitions to Composing,
@@ -520,10 +520,9 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
+            composition.set_up_for_test(CompositionState::Previewing);
             composition.selection_index = 3;
             composition.raw_input = "mizuu".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         factory
@@ -561,12 +560,11 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
+            composition.set_up_for_test(CompositionState::Previewing);
             composition.preview = "水".to_string();
             composition.raw_input = "mizu".to_string();
             composition.corresponding_count = 4;
             composition.surface_count = 2; // みず — two kana, four keystrokes
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         factory
@@ -579,7 +577,7 @@ mod tests {
         let text_service = factory.borrow().unwrap();
         let composition = text_service.borrow_composition().unwrap();
         assert_eq!(
-            composition.state,
+            *composition.state(),
             CompositionState::Composing,
             "the arm must force Composing for the fresh reading"
         );
@@ -621,10 +619,9 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
+            composition.set_up_for_test(CompositionState::Previewing);
             composition.candidates = scripted(&["a", "b", "c"], "あ", &[1, 1, 1], &[1, 1, 1]);
             composition.selection_index = 2;
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         // Down at the last candidate must stay clamped there
@@ -696,9 +693,9 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
+            composition.set_up_for_test(CompositionState::Composing);
             composition.preview = "水".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
+            composition.candidates = scripted(&["水", "未"], "みず", &[4, 4], &[2, 2]);
         }
 
         factory
@@ -715,6 +712,59 @@ mod tests {
             calls.contains(&IpcCall::ClearText),
             "the server reading must be cleared: {calls:?}"
         );
+
+        // ...and the written-back composition must not keep the list either.
+        // Two of the three teardown paths used to, leaving a `None`-state
+        // composition holding candidates that describe a composition that is
+        // over — an inconsistency nothing read yet, which is what let it
+        // survive.
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(*composition.state(), CompositionState::None);
+        assert!(
+            composition.candidates.texts.is_empty(),
+            "a finished composition must not keep its candidate list: {:?}",
+            composition.candidates.texts
+        );
+        drop(composition);
+        drop(text_service);
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// The same for the mode switch, which is the other path that used to
+    /// leave the list behind (the server-loss reset already dropped it).
+    #[test]
+    fn a_mode_switch_does_not_keep_the_candidate_list() {
+        let _guard = global_state_lock();
+        let _fake = install_fake_ipc(Candidates::default());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = factory_of(&tip);
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.set_up_for_test(CompositionState::Composing);
+            composition.preview = "わたし".to_string();
+            composition.candidates = scripted(&["私", "渡し"], "わたし", &[7, 7], &[3, 3]);
+        }
+
+        // apply_input_mode fails in this fake environment (no thread
+        // manager); the teardown before it is what is under test
+        let _ = factory.handle_action(
+            &[ClientAction::SetIMEMode(InputMode::Kana)],
+            CompositionState::None,
+        );
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert!(
+            composition.candidates.texts.is_empty(),
+            "a mode switch ends the composition, so its list is dead too: {:?}",
+            composition.candidates.texts
+        );
+        drop(composition);
+        drop(text_service);
 
         IMEState::get().unwrap().ipc_service = None;
     }
@@ -738,9 +788,8 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
+            composition.set_up_for_test(CompositionState::Composing);
             composition.preview = "わたし".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         let _ = factory.handle_action(
@@ -779,14 +828,13 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
+            composition.set_up_for_test(CompositionState::Composing);
             composition.selection_index = 2;
             composition.corresponding_count = 7;
             composition.preview = "わたし".to_string();
             composition.suffix = "は".to_string();
             composition.raw_input = "watashiha".to_string();
             composition.raw_hiragana = "わたしは".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         let result = factory.handle_action(
@@ -834,10 +882,9 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
+            composition.set_up_for_test(CompositionState::Composing);
             composition.preview = "水".to_string();
             composition.suffix = "うみ".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         // A converting batch, not an empty one: only those measure the
@@ -904,7 +951,7 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
+            composition.set_up_for_test(CompositionState::Previewing);
             composition.preview = "私".to_string(); // the selected candidate
             composition.suffix = "の".to_string(); // unconverted remainder
             composition.raw_input = "watashino".to_string();
@@ -960,10 +1007,9 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
+            composition.set_up_for_test(CompositionState::Previewing);
             composition.preview = "水".to_string();
             composition.candidates = scripted(&["水", "見ず"], "みず", &[4, 4], &[2, 2]);
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         let context_calls = |fake: &Arc<Mutex<FakeIpc>>| {
@@ -1034,10 +1080,9 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
+            composition.set_up_for_test(CompositionState::Composing);
             composition.raw_input = "mizu".to_string();
             composition.raw_hiragana = "みず".to_string();
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         let result = factory.handle_action(
@@ -1074,12 +1119,11 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Previewing;
+            composition.set_up_for_test(CompositionState::Previewing);
             composition.preview = "水".to_string();
             composition.raw_input = "mizu".to_string();
             composition.corresponding_count = 4;
             composition.surface_count = 2;
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         let result = factory.handle_action(
@@ -1119,12 +1163,11 @@ mod tests {
         {
             let text_service = factory.borrow().unwrap();
             let mut composition = text_service.borrow_mut_composition().unwrap();
-            composition.state = CompositionState::Composing;
+            composition.set_up_for_test(CompositionState::Composing);
             composition.preview = "わたし".to_string();
             composition.raw_input = "watashi".to_string();
             composition.raw_hiragana = "わたし".to_string();
             composition.corresponding_count = 7;
-            composition.tip_composition = Some(FakeComposition::new());
         }
 
         // the arm still surfaces the edit-session error...
@@ -1138,7 +1181,7 @@ mod tests {
         // ...but only after the teardown ran
         let text_service = factory.borrow().unwrap();
         let composition = text_service.borrow_composition().unwrap();
-        assert_eq!(composition.state, CompositionState::None);
+        assert_eq!(*composition.state(), CompositionState::None);
         assert!(
             composition.raw_hiragana.is_empty()
                 && composition.raw_input.is_empty()
@@ -1147,7 +1190,7 @@ mod tests {
              a stale reading made the next keystroke resurrect the old text"
         );
         assert!(
-            composition.tip_composition.is_none(),
+            !composition.has_tip(),
             "the dead composition handle must be released"
         );
 

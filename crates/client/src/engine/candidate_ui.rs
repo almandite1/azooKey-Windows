@@ -81,22 +81,51 @@ impl TextServiceFactory_Impl {
         Ok(())
     }
 
+    /// THE place our own candidate window's visibility is commanded.
+    ///
+    /// Two callers reach it for unrelated reasons and each used to send the
+    /// RPC itself: the composition lifecycle below, and the host flipping
+    /// visibility mid-composition through `ITfUIElement::Show`
+    /// (`tsf/ui_element.rs`). Two senders meant ui.exe's placement
+    /// bookkeeping — the gates that hold a `Show` back until it has a
+    /// position and a measured size (issue #59) — could be driven from a path
+    /// that knew nothing about it.
+    ///
+    /// Deliberately holds NO "is it up" flag. Nothing on this side reads
+    /// that, and the answer lives in ui.exe anyway; a field here would be
+    /// write-only state pretending to be a source of truth. What is worth
+    /// having is the single sender.
+    ///
+    /// Deliberately does NOT deduplicate either: a redundant `Hide` still has
+    /// to reach ui.exe, because `CandidatePlacement::on_hide` is what marks
+    /// the caret rect stale so the NEXT composition waits for one of its own.
+    /// Swallowing it would show the next composition at this one's caret.
+    pub(crate) fn command_candidate_window(&self, ipc_service: &IPCService, visible: bool) {
+        if visible {
+            ipc_service.show_window();
+        } else {
+            ipc_service.hide_window();
+        }
+    }
+
     /// Opens the candidate UI for a new composition: asks the host first
     /// (UILess), and shows our own window only when the host does not draw
     /// the candidates itself. Advisory throughout — a host-side element
     /// problem must not break typing, so on failure we fall back to our own
     /// window (the pre-UILess behaviour).
     ///
-    /// Counterpart of `close_candidate_ui`; the visibility transitions live
-    /// in this pair (and host-driven `ITfUIElement::Show`) only, so an arm
-    /// cannot forget one half of the teardown again (issue #21).
+    /// Counterpart of `close_candidate_ui`; between them they own the
+    /// COMPOSITION's half of the visibility, so an arm cannot forget one half
+    /// of the teardown again (issue #21). The host's half is
+    /// `ITfUIElement::Show`, and both now go out through
+    /// [`Self::command_candidate_window`].
     pub(super) fn open_candidate_ui(&self, ipc_service: &IPCService) {
         let show = self.ui_begin().unwrap_or_else(|error| {
             tracing::warn!("ui_begin failed (non-fatal): {error:?}");
             true
         });
         if show {
-            ipc_service.show_window();
+            self.command_candidate_window(ipc_service, true);
         }
     }
 
@@ -104,11 +133,16 @@ impl TextServiceFactory_Impl {
     /// hides our own window, blanking the now-stale list. Everything here is
     /// unconditional and advisory: hiding is safe even if we never showed,
     /// and ui_end is a no-op with no live element.
+    ///
+    /// Blanking the list is what makes this more than a hide, and why the
+    /// host-driven `Show(FALSE)` does not share it: that one is a visibility
+    /// toggle in the middle of a composition whose candidates are still live,
+    /// while this is the composition ending.
     pub(super) fn close_candidate_ui(&self, ipc_service: &IPCService) {
         if let Err(error) = self.ui_end() {
             tracing::warn!("ui_end failed (non-fatal): {error:?}");
         }
-        ipc_service.hide_window();
+        self.command_candidate_window(ipc_service, false);
         ipc_service.set_candidates(vec![]);
     }
 }
