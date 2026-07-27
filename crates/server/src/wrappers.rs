@@ -13,14 +13,23 @@ use crate::ffi::{
 
 pub(crate) struct RawComposingText {
     pub(crate) text: String,
-    // Absolute cursor position in the reading, in kana from its start — the
-    // same meaning for every call that fills it, MoveCursor included (#82).
-    // Provided by the engine but not yet exposed over gRPC, because the
-    // client-side MoveCursor wiring is deferred (see ClientAction::MoveCursor
-    // in crates/client for the whole story). Until then there is no proto
-    // field to carry the contract; it lives here and in ffi.h.
+    /// Absolute cursor position in the reading, in kana from its start — the
+    /// same meaning for every call that fills it, MoveCursor included (#82).
+    ///
+    /// `None` for the one export that has no cursor out-parameter
+    /// (`ShrinkText`). It used to be a plain `i32` left at 0 there, which
+    /// under the absolute-position contract is not "no answer" but a
+    /// perfectly well-formed lie: it reads as "the cursor is at the start of
+    /// the reading". Nothing consumes this yet, so the lie has never been
+    /// told to anyone — which is exactly why it was worth fixing before
+    /// something starts listening.
+    ///
+    /// Provided by the engine but not yet exposed over gRPC, because the
+    /// client-side MoveCursor wiring is deferred (see ClientAction::MoveCursor
+    /// in crates/client for the whole story). Until then there is no proto
+    /// field to carry the contract; it lives here and in ffi.h.
     #[allow(dead_code)]
-    pub(crate) cursor: i32,
+    pub(crate) cursor: Option<i32>,
 }
 
 /// Builds a CString from possibly untrusted input. Interior NUL bytes cannot
@@ -58,14 +67,29 @@ unsafe fn cstr_or_empty(ptr: *const c_char) -> String {
     }
 }
 
-/// Shared shape of the composing-text calls: the callee may write the
-/// cursor position through the out-parameter and returns a string it owns
+/// Shared shape of the composing-text calls that REPORT A CURSOR: the callee
+/// writes the position through the out-parameter and returns a string it owns
 /// (consumed and freed here). Callers wrap exactly one FFI call in the
 /// closure.
 fn composing_call(call: impl FnOnce(*mut c_int) -> *mut c_char) -> RawComposingText {
     let mut cursor: c_int = 0;
     let text = unsafe { consume_cstr(call(&mut cursor)) };
-    RawComposingText { text, cursor }
+    RawComposingText {
+        text,
+        cursor: Some(cursor),
+    }
+}
+
+/// The same, for an export that has no cursor out-parameter.
+///
+/// A separate function rather than a flag: the closure it takes cannot be
+/// handed a cursor pointer at all, so a call that does not report one cannot
+/// accidentally claim it did.
+fn composing_call_without_cursor(call: impl FnOnce() -> *mut c_char) -> RawComposingText {
+    RawComposingText {
+        text: unsafe { consume_cstr(call()) },
+        cursor: None,
+    }
 }
 
 pub(crate) fn initialize(path: &str) {
@@ -94,9 +118,11 @@ pub(crate) fn clear_text(session: i64) {
 // reading and can exceed 127 in a long composition. Truncating it (a former
 // `as i8`) wrapped it negative, and a negative count makes the Swift engine
 // trap in dropFirst, killing the whole server.
-// ShrinkText has no cursor out-parameter, so the cursor stays 0.
+//
+// The one export with no cursor out-parameter (see ffi.h), hence the
+// cursor-less variant: it reports `None` rather than a plausible-looking 0.
 pub(crate) fn shrink_text(session: i64, surface_offset: i32) -> RawComposingText {
-    composing_call(|_cursor| unsafe { ShrinkText(session, surface_offset) })
+    composing_call_without_cursor(|| unsafe { ShrinkText(session, surface_offset) })
 }
 
 pub(crate) fn set_context(session: i64, context: &str) {
