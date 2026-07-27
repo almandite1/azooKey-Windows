@@ -4,6 +4,7 @@
 use std::{ffi::c_void, ptr::addr_of_mut};
 
 use anyhow::Result;
+use shared::job::KillOnCloseJob;
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
@@ -20,11 +21,6 @@ use windows::{
                 TH32CS_SNAPPROCESS,
             },
             Environment::GetCommandLineW,
-            JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                JobObjectExtendedLimitInformation, SetInformationJobObject,
-            },
             SystemServices::PRIVILEGE_SET_ALL_NECESSARY,
             Threading::{
                 CREATE_SUSPENDED, CreateProcessAsUserW, ExitProcess, GetCurrentProcess,
@@ -352,12 +348,13 @@ unsafe fn run_as_supervision_shim(process_info: PROCESS_INFORMATION) -> Result<(
         // not fatal — supervision still works via the exit-code mirror; only the
         // die-with-the-shim guarantee is lost (same policy as the launcher's own
         // job setup).
-        match create_kill_on_close_job() {
-            // the job handle is deliberately never closed: closing the last
-            // handle kills the child, so it must live exactly as long as this
-            // process
+        match KillOnCloseJob::create() {
+            // The handle must outlive the child, and it does: `KillOnCloseJob`
+            // has no `Drop` precisely because closing the last handle is what
+            // kills the members. Letting `job` go out of scope here leaks it
+            // into the process, which ends at the ExitProcess below.
             Ok(job) => {
-                if let Err(e) = AssignProcessToJobObject(job, process_info.hProcess) {
+                if let Err(e) = job.assign(process_info.hProcess) {
                     eprintln!(
                         "UIAccess child could not be tied to the shim ({e}); it won't die with it"
                     );
@@ -388,32 +385,5 @@ unsafe fn run_as_supervision_shim(process_info: PROCESS_INFORMATION) -> Result<(
         }
         let _ = CloseHandle(process_info.hProcess);
         ExitProcess(code);
-    }
-}
-
-/// A job object that kills its members when the last handle closes, exactly
-/// like the launcher's `CHILD_JOB`.
-unsafe fn create_kill_on_close_job() -> Result<HANDLE> {
-    unsafe {
-        let job = CreateJobObjectW(None, windows::core::PCWSTR::null())?;
-
-        let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
-                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        if let Err(e) = SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ) {
-            let _ = CloseHandle(job);
-            return Err(e.into());
-        }
-
-        Ok(job)
     }
 }

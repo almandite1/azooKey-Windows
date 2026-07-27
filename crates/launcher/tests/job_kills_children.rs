@@ -2,24 +2,21 @@
 //! children to (orphan prevention).
 //!
 //! This is the guarantee the whole scheme rests on: when the launcher
-//! process ends — crash included — closing its last job handle must take
-//! the children down with it, so no orphaned server/ui keeps the
-//! machine-global pipe names open. A bin crate's tests can't call the
-//! launcher's own helpers, so this reproduces the same API sequence
-//! (CreateJobObject → KILL_ON_JOB_CLOSE → AssignProcessToJobObject → close)
-//! and proves the child actually dies.
+//! process ends — crash included — closing its last job handle must take the
+//! children down with it, so no orphaned server/ui keeps the machine-global
+//! pipe names open.
+//!
+//! It drives `shared::job::KillOnCloseJob`, the same type the launcher and
+//! `ui` use. It used to reproduce the API sequence by hand, because a bin
+//! crate's integration test cannot call the crate's own helpers — so what it
+//! proved was that the sequence works, not that the shipped code uses it.
 
 use std::os::windows::io::AsRawHandle;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use shared::job::KillOnCloseJob;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectExtendedLimitInformation, SetInformationJobObject,
-};
-use windows::core::PCWSTR;
 
 #[test]
 fn closing_the_job_kills_assigned_children() {
@@ -31,29 +28,9 @@ fn closing_the_job_kills_assigned_children() {
         .spawn()
         .expect("failed to spawn the test child");
 
-    let job = unsafe {
-        let job = CreateJobObjectW(None, PCWSTR::null()).expect("CreateJobObject failed");
-
-        let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
-                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const std::ffi::c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-        .expect("SetInformationJobObject failed");
-
-        AssignProcessToJobObject(job, HANDLE(child.as_raw_handle()))
-            .expect("AssignProcessToJobObject failed");
-
-        job
-    };
+    let job = KillOnCloseJob::create().expect("creating the job failed");
+    // SAFETY: a live handle to a child this test just spawned.
+    unsafe { job.assign(HANDLE(child.as_raw_handle())) }.expect("assigning the child failed");
 
     // sanity: the child is alive while the job handle is still open
     assert!(
@@ -61,9 +38,10 @@ fn closing_the_job_kills_assigned_children() {
         "child should still be running before the job handle is closed"
     );
 
-    // dropping the launcher's last job handle is what happens when the
-    // launcher process ends; KILL_ON_JOB_CLOSE must reap the child
-    unsafe { CloseHandle(job).expect("CloseHandle failed") };
+    // Closing the last job handle is what happens when the launcher process
+    // ends. The type does not do this on drop — on purpose, since it would
+    // kill the children — so the test takes the raw handle to close it.
+    unsafe { CloseHandle(job.into_raw()).expect("CloseHandle failed") };
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
