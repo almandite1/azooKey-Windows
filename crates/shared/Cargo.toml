@@ -22,6 +22,8 @@ hyper-util = { version = "0.1.9", features = ["tokio"] }
 workspace = true
 features = [
     "Win32_Foundation",
+    # kill-on-close job objects (job.rs), shared by launcher and ui
+    "Win32_System_JobObjects",
     "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
