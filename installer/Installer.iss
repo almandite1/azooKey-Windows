@@ -92,14 +92,30 @@ Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDum
 Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\azookey-server.exe"; ValueType: dword; ValueName: "DumpCount"; ValueData: "5"
 
 [Run]
+; Let AppContainer hosts (Start menu search, Store apps) read the TIP. Without
+; this ACE they cannot load it, and the symptom is not an error: picking
+; azooKey in such a host silently does nothing and the tray falls back to
+; another IME.
+;
+; The path MUST be quoted. {app} defaults to "C:\Program Files\Azookey", and
+; unquoted, icacls saw "C:\Program" and failed every install with exit code 87
+; (ERROR_INVALID_PARAMETER). That went unnoticed because Program Files already
+; hands this same right down by inheritance, so the default install looked
+; right while the explicit grant had never once been applied - a directory the
+; user picks that does not inherit it would have had no grant at all.
+;
+; Not postinstall: that turns the grant into a finish-page checkbox the user
+; can clear, and it is not optional. Not runascurrentuser either: that
+; de-elevates the child, and only Setup's own elevated token may rewrite an
+; ACL under Program Files.
 Filename: "icacls"; \
-  Parameters: "{app}\azookey.dll /grant ""*S-1-15-2-1:(RX)"""; \
-  Description: "Grant Permission"; \
-  Flags: runhidden postinstall runascurrentuser
+  Parameters: """{app}\azookey.dll"" /grant ""*S-1-15-2-1:(RX)"""; \
+  StatusMsg: "Granting read access to sandboxed applications..."; \
+  Flags: runhidden
 Filename: "icacls"; \
-  Parameters: "{app}\azookey32.dll /grant ""*S-1-15-2-1:(RX)"""; \
-  Description: "Grant Permission"; \
-  Flags: runhidden postinstall runascurrentuser
+  Parameters: """{app}\azookey32.dll"" /grant ""*S-1-15-2-1:(RX)"""; \
+  StatusMsg: "Granting read access to sandboxed applications..."; \
+  Flags: runhidden
 
 [UninstallDelete]
 ; launch.vbs is created at post-install by [Code], so Setup does not track
