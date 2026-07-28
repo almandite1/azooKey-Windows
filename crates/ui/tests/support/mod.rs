@@ -299,26 +299,23 @@ impl Ui {
             .expect("HideWindow failed");
     }
 
-    pub async fn set_candidates(&mut self, candidates: &[&str]) {
+    /// One `UpdateCandidateView` with whichever parts the caller has news
+    /// about. The helpers below are the three combinations the tests use; the
+    /// TIP's own keystroke path sends list and selection together, which
+    /// `update_view` covers directly.
+    pub async fn update_view(
+        &mut self,
+        candidates: Option<&[&str]>,
+        selection: Option<i32>,
+        position: Option<RECT>,
+    ) {
         self.client
-            .set_candidate(shared::proto::SetCandidateRequest {
-                candidates: candidates.iter().map(|s| s.to_string()).collect(),
-            })
-            .await
-            .expect("SetCandidate failed");
-    }
-
-    pub async fn select(&mut self, index: i32) {
-        self.client
-            .set_selection(shared::proto::SetSelectionRequest { index })
-            .await
-            .expect("SetSelection failed");
-    }
-
-    pub async fn set_position(&mut self, caret: RECT) {
-        self.client
-            .set_window_position(shared::proto::SetPositionRequest {
-                position: Some(shared::proto::WindowPosition {
+            .update_candidate_view(shared::proto::UpdateCandidateViewRequest {
+                candidates: candidates.map(|texts| shared::proto::CandidateList {
+                    texts: texts.iter().map(|s| s.to_string()).collect(),
+                }),
+                selection,
+                position: position.map(|caret| shared::proto::WindowPosition {
                     top: caret.top,
                     left: caret.left,
                     bottom: caret.bottom,
@@ -326,7 +323,19 @@ impl Ui {
                 }),
             })
             .await
-            .expect("SetWindowPosition failed");
+            .expect("UpdateCandidateView failed");
+    }
+
+    pub async fn set_candidates(&mut self, candidates: &[&str]) {
+        self.update_view(Some(candidates), None, None).await;
+    }
+
+    pub async fn select(&mut self, index: i32) {
+        self.update_view(None, Some(index), None).await;
+    }
+
+    pub async fn set_position(&mut self, caret: RECT) {
+        self.update_view(None, None, Some(caret)).await;
     }
 
     pub async fn set_input_mode(&mut self, mode: &str) {

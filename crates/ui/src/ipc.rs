@@ -2,9 +2,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use azookey_server::PipeConnectInfo;
 use shared::proto::{
-    EmptyResponse, SetCandidateRequest, SetInputModeRequest, SetPositionRequest,
-    SetSelectionRequest, window_service_server::WindowService as WindowServiceProto,
+    EmptyResponse, SetInputModeRequest, UpdateCandidateViewRequest,
+    window_service_server::WindowService as WindowServiceProto,
 };
+
+use crate::geometry::CaretRect;
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
@@ -37,17 +39,13 @@ impl WindowController {
 pub enum WindowAction {
     Show,
     Hide,
-    SetPosition {
-        top: i32,
-        left: i32,
-        bottom: i32,
-        right: i32,
-    },
-    SetSelection {
-        index: i32,
-    },
-    SetCandidate {
-        candidates: Vec<String>,
+    /// One update to what the window shows. Each field is `None` when the TIP
+    /// left it out, meaning "keep what is there" — see
+    /// `UpdateCandidateViewRequest` in window.proto.
+    Update {
+        position: Option<CaretRect>,
+        candidates: Option<Vec<String>>,
+        selection: Option<i32>,
     },
     SetInputMode(String),
 }
@@ -94,48 +92,29 @@ impl WindowServiceProto for WindowService {
         self.controller.dispatch(WindowAction::Hide).await?;
         Ok(Response::new(EmptyResponse {}))
     }
-    async fn set_window_position(
+    /// The list, the highlight and the caret rect, in whatever combination
+    /// the TIP had news about. An update with nothing set is legal and does
+    /// nothing; it is not worth an error, and refusing it would make the
+    /// caller's life harder for no gain.
+    async fn update_candidate_view(
         &self,
-        request: Request<SetPositionRequest>,
+        request: Request<UpdateCandidateViewRequest>,
     ) -> Result<Response<EmptyResponse>, Status> {
-        let position = request
-            .into_inner()
-            .position
-            .ok_or_else(|| Status::invalid_argument("position is required"))?;
+        let update = request.into_inner();
+
         self.controller
-            .dispatch(WindowAction::SetPosition {
-                top: position.top,
-                left: position.left,
-                bottom: position.bottom,
-                right: position.right,
+            .dispatch(WindowAction::Update {
+                position: update.position.map(|position| CaretRect {
+                    top: position.top,
+                    left: position.left,
+                    bottom: position.bottom,
+                    right: position.right,
+                }),
+                // the wrapper message is what distinguishes "no news about
+                // the list" from "the list is now empty"
+                candidates: update.candidates.map(|list| list.texts),
+                selection: update.selection,
             })
-            .await?;
-
-        Ok(Response::new(EmptyResponse {}))
-    }
-
-    async fn set_candidate(
-        &self,
-        request: Request<SetCandidateRequest>,
-    ) -> Result<Response<EmptyResponse>, Status> {
-        let candidate = request.into_inner().candidates;
-
-        self.controller
-            .dispatch(WindowAction::SetCandidate {
-                candidates: candidate,
-            })
-            .await?;
-
-        Ok(Response::new(EmptyResponse {}))
-    }
-
-    async fn set_selection(
-        &self,
-        request: Request<SetSelectionRequest>,
-    ) -> Result<Response<EmptyResponse>, Status> {
-        let index = request.into_inner().index;
-        self.controller
-            .dispatch(WindowAction::SetSelection { index })
             .await?;
 
         Ok(Response::new(EmptyResponse {}))

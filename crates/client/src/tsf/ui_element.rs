@@ -458,7 +458,10 @@ mod tests {
             "each toggle must reach the window, in order"
         );
         assert!(
-            !calls.iter().any(|c| matches!(c, IpcCall::SetCandidates(_))),
+            !calls.iter().any(|c| matches!(
+                c,
+                IpcCall::UpdateCandidateView(view) if view.candidates.is_some()
+            )),
             "a visibility toggle must not blank a live composition's list: {calls:?}"
         );
 

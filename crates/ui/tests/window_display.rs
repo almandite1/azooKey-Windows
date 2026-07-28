@@ -208,6 +208,60 @@ async fn the_highlight_follows_the_selection() {
     ui.assert_no_errors();
 }
 
+/// What a keystroke actually sends: the fresh list and the highlight that goes
+/// with it, in ONE update. Both halves have to land — and land as one content
+/// change, not two.
+#[tokio::test]
+#[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]
+async fn a_combined_update_applies_the_list_and_the_highlight_together() {
+    let mut ui = Ui::start().await;
+    let candidate = ui.candidate();
+    ui.show_at(caret_with_room()).await;
+
+    let mark = ui.events.mark();
+    ui.update_view(Some(&["水", "みず", "ミズ"]), Some(2), None)
+        .await;
+
+    let rendered = ui.uia.wait_for(
+        "the candidates to be rendered",
+        |uia| uia.candidates(candidate),
+        |candidates| candidates.len() == 3,
+    );
+    assert_eq!(rendered, ["水", "みず", "ミズ"]);
+    ui.uia.wait_for(
+        "the highlight that came with them",
+        |uia| uia.selected_index(candidate),
+        |selected| *selected == Some(2),
+    );
+
+    ui.events
+        .expect_exactly(mark, candidate, &[ImeEvent::Change], SETTLE_TIMEOUT);
+
+    // ...and the highlight alone moves through the list already on screen,
+    // without the list being resent (the traffic this replaced) and without a
+    // content change being announced for it
+    let mark = ui.events.mark();
+    ui.update_view(None, Some(0), None).await;
+    ui.uia.wait_for(
+        "the highlight to move on its own",
+        |uia| uia.selected_index(candidate),
+        |selected| *selected == Some(0),
+    );
+    assert_eq!(
+        ui.uia.candidates(candidate),
+        ["水", "みず", "ミズ"],
+        "a selection-only update must leave the list exactly as it was"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        ui.events.since(mark, candidate),
+        &[],
+        "moving the highlight is not a content change"
+    );
+
+    ui.assert_no_errors();
+}
+
 /// The window follows the reported caret: 15px left of it, directly below.
 #[tokio::test]
 #[ignore = "spawns ui.exe (needs a desktop and the WebView2 runtime)"]

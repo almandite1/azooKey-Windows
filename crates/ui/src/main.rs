@@ -31,8 +31,10 @@ pub mod window_actions;
 #[derive(Debug)]
 pub enum UserEvent {
     UpdateHeight(i32),
-    UpdateCandidates(String),
-    UpdateSelection(i32),
+    /// One serialized [`webview::CandidateUpdate`]: the list, the highlight,
+    /// or both. One event rather than two so a keystroke costs the webview a
+    /// single script evaluation.
+    ApplyCandidateUpdate(String),
     UpdateInputMethod(String),
     WindowAction(WindowAction),
     /// liveness probe: proves the event loop is still processing events
@@ -75,13 +77,10 @@ fn handle_user_event(
     last_beat: &std::sync::Mutex<Instant>,
 ) {
     match event {
-        UserEvent::UpdateCandidates(candidates) => eval(
+        UserEvent::ApplyCandidateUpdate(payload) => eval(
             candidate_webview,
-            &webview::update_candidates_script(&candidates),
+            &webview::apply_candidate_update_script(&payload),
         ),
-        UserEvent::UpdateSelection(index) => {
-            eval(candidate_webview, &webview::update_selection_script(index))
-        }
         UserEvent::UpdateInputMethod(input_method) => eval(
             indicator_webview,
             &webview::update_input_method_script(&input_method),

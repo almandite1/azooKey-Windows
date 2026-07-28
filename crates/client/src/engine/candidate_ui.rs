@@ -15,7 +15,7 @@ use crate::tsf::factory::TextServiceFactory_Impl;
 
 use super::{
     composition::CompositionEdit,
-    ipc_service::{Candidates, IPCService},
+    ipc_service::{CandidateView, Candidates, IPCService},
 };
 
 /// Flags for `ui_update` when the whole candidate list was replaced.
@@ -53,10 +53,16 @@ impl TextServiceFactory_Impl {
         }
 
         if self.ui_should_show() {
-            if updated_flags & TF_CLUIE_STRING != 0 {
-                ipc_service.set_candidates(candidates.texts.clone());
-            }
-            ipc_service.set_selection(selection_index);
+            // One RPC for both halves. The list is sent only when it actually
+            // changed — an arrow key moves the highlight through a list the
+            // window already has — which is why the two cases build different
+            // views rather than one view with an always-present list.
+            let view = if updated_flags & TF_CLUIE_STRING != 0 {
+                CandidateView::list_and_selection(candidates.texts.clone(), selection_index)
+            } else {
+                CandidateView::selection(selection_index)
+            };
+            ipc_service.update_candidate_view(view);
         }
     }
 

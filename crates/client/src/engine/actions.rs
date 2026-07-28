@@ -400,7 +400,7 @@ impl TextServiceFactory_Impl {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::engine::ipc_service::{Candidates, FakeIpc, IpcCall};
+    use crate::engine::ipc_service::{CandidateView, Candidates, FakeIpc, IpcCall};
     use crate::engine::test_util::{install_fake_ipc, recorded_calls, scripted};
     use crate::tsf::test_support::{
         EditSessionBehavior, FakeContext, RangeLog, factory_of, factory_with_context,
@@ -445,13 +445,11 @@ mod tests {
         let calls = recorded_calls(&fake);
         assert!(calls.contains(&IpcCall::AppendText("mi".to_string())));
         assert!(
-            calls.contains(&IpcCall::SetCandidates(vec![
-                "水".to_string(),
-                "未".to_string()
-            ])),
-            "a CANDIDATES_CHANGED update must push the new list to the window: {calls:?}"
+            calls.contains(&IpcCall::UpdateCandidateView(
+                CandidateView::list_and_selection(vec!["水".to_string(), "未".to_string()], 0)
+            )),
+            "a CANDIDATES_CHANGED update must push the new list AND its              selection to the window in one call: {calls:?}"
         );
-        assert!(calls.contains(&IpcCall::SetSelection(0)));
 
         IMEState::get().unwrap().ipc_service = None;
     }
@@ -511,7 +509,10 @@ mod tests {
         drop(text_service);
 
         assert!(
-            recorded_calls(&fake).contains(&IpcCall::SetSelection(0)),
+            recorded_calls(&fake).iter().any(|call| matches!(
+                call,
+                IpcCall::UpdateCandidateView(view) if view.selection == Some(0)
+            )),
             "the window must be told the selection went back to the top"
         );
 
@@ -665,9 +666,12 @@ mod tests {
         }
 
         let calls = recorded_calls(&fake);
-        assert!(calls.contains(&IpcCall::SetSelection(2)));
+        assert!(calls.contains(&IpcCall::UpdateCandidateView(CandidateView::selection(2))));
         assert!(
-            !calls.iter().any(|c| matches!(c, IpcCall::SetCandidates(_))),
+            !calls.iter().any(|c| matches!(
+                c,
+                IpcCall::UpdateCandidateView(view) if view.candidates.is_some()
+            )),
             "SELECTION_CHANGED must not re-send the candidate list: {calls:?}"
         );
 
@@ -717,7 +721,7 @@ mod tests {
         let calls = recorded_calls(&fake);
         assert!(calls.contains(&IpcCall::HideWindow), "{calls:?}");
         assert!(
-            calls.contains(&IpcCall::SetCandidates(vec![])),
+            calls.contains(&IpcCall::UpdateCandidateView(CandidateView::list(vec![]))),
             "the stale list must be blanked: {calls:?}"
         );
         assert!(
@@ -815,7 +819,7 @@ mod tests {
             "a mode switch must hide the candidate window (issue #21): {calls:?}"
         );
         assert!(
-            calls.contains(&IpcCall::SetCandidates(vec![])),
+            calls.contains(&IpcCall::UpdateCandidateView(CandidateView::list(vec![]))),
             "the stale list must be blanked on a mode switch: {calls:?}"
         );
 
