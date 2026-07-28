@@ -179,31 +179,20 @@ impl Drop for ComposedTextList {
     }
 }
 
+/// Returns the engine's candidate list as-is — duplicates included. All
+/// post-processing (dedup and whatever comes after it) belongs to
+/// candidate_pipeline.rs, which service.rs runs on this raw list.
 pub(crate) fn get_composed_text(session: i64) -> Vec<Suggestion> {
     let list = ComposedTextList::fetch(session);
 
-    let mut suggestions: Vec<Suggestion> = Vec::with_capacity(list.length as usize);
-    // The engine can propose the same surface text more than once and only
-    // the first (highest-ranked) occurrence is kept. A HashSet of what has
-    // been seen rather than a scan of `suggestions` per candidate: the list
-    // is rebuilt on every keystroke, and the scan made that quadratic in a
-    // long candidate list for no reason.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for candidate in list.candidates() {
-        let suggestion = Suggestion {
+    list.candidates()
+        .map(|candidate| Suggestion {
             text: unsafe { cstr_or_empty(candidate.text) },
             subtext: unsafe { cstr_or_empty(candidate.subtext) },
             corresponding_count: candidate.corresponding_count,
             surface_count: candidate.surface_count,
-        };
-
-        if !seen.insert(suggestion.text.clone()) {
-            continue;
-        }
-        suggestions.push(suggestion);
-    }
-
-    suggestions
+        })
+        .collect()
 }
 
 #[cfg(test)]

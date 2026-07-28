@@ -1,3 +1,4 @@
+mod candidate_pipeline;
 mod ffi;
 mod service;
 mod session;
