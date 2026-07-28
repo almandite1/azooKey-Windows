@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package plugin;
+
+// A candidate as it crosses the plugin boundary.
+//
+// Structurally the same as azookey.Suggestion, and deliberately not that
+// message. service.proto is internal: it changes whenever the engine and
+// the TIP need it to. This one becomes a PUBLIC contract that third-party
+// plugins compile against and that we promise to evolve additively only
+// (see docs). Sharing the type would make every internal change a public
+// break, and would silently hand plugins any field a future Suggestion
+// grows — the boundary exists to pass the reading and the candidates, and
+// nothing else.
+//
+// What is deliberately NOT in this message, or anywhere in this file:
+//
+//   * no session id, application name, or surrounding text context. A
+//     plugin learns what is being converted, never who is typing it or
+//     where.
+//   * no rank, priority, or position field. Where an added candidate
+//     lands is core policy (candidate_pipeline.rs::insert_added: fixed
+//     rank, capped count, index 0 untouchable). A plugin that could ask
+//     for a rank would compete with the next plugin for the top of the
+//     list, and the user would end up arbitrating a fight they never
+//     asked to have.
+message PluginCandidate {
+  // What the user sees and what gets committed.
+  string text = 1;
+  // Annotation shown beside it; may be empty.
+  string subtext = 2;
+  // Romaji keystrokes this candidate covers, for the client's own raw
+  // input. A plugin CANNOT compute this: the same reading can be typed
+  // kyou or kilyou and only the engine tracked which. A candidate the
+  // plugin invents must copy both counts from one it was given for the
+  // same span; the server validates that and drops what does not match,
+  // because a wrong count here shows up as stale romaji after a commit
+  // rather than as a bad candidate.
+  int32 corresponding_count = 3;
+  // Kana of the reading this candidate covers. This is the count
+  // ShrinkText takes, and the two differ when a clause boundary falls
+  // inside a romaji cluster (kanshi|ya).
+  int32 surface_count = 4;
+}
+
+message ProcessCandidatesRequest {
+  // What the caller speaks. The host answers a version it does not know
+  // by returning the candidates unchanged rather than by failing: the
+  // whole path is fail-open, so a version skew degrades to "no plugins"
+  // instead of to "no conversion".
+  uint32 api_version = 1;
+  // The hiragana reading being converted.
+  string reading = 2;
+  // The candidate list as the core built it, in rank order.
+  repeated PluginCandidate candidates = 3;
+}
+
+message ProcessCandidatesResponse {
+  // The list to use instead. The core validates every entry and falls
+  // back to what it sent on anything it does not like, so a plugin
+  // cannot break conversion by answering badly — only by answering
+  // slowly, which the timeout covers.
+  repeated PluginCandidate candidates = 1;
+}
+
+// Runs in its own process (crates/plugin-host), never in the TIP DLL and
+// never in the engine: a plugin that hangs must not be able to stall the
+// single-threaded server, and one that crashes must not take a host
+// application down with it.
+service PluginHostService {
+  rpc ProcessCandidates (ProcessCandidatesRequest) returns (ProcessCandidatesResponse);
+}

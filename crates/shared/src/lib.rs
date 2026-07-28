@@ -5,9 +5,16 @@ pub mod job;
 pub mod logs;
 pub mod pipe;
 
+/// The three proto packages are included flat into one module, so a
+/// message name has to be unique across ALL of them — `plugin.proto` says
+/// `PluginCandidate` rather than `Candidate` for that reason. It is also
+/// why plugin.proto does not import service.proto: prost resolves a
+/// cross-package reference to `super::azookey::Suggestion`, a path this
+/// layout does not have.
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/azookey.rs"));
     include!(concat!(env!("OUT_DIR"), "/window.rs"));
+    include!(concat!(env!("OUT_DIR"), "/plugin.rs"));
     pub const FILE_DESCRIPTOR_SET: &[u8] =
         tonic::include_file_descriptor_set!("azookey_service_descriptor");
 }
@@ -356,6 +363,34 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Nothing links against the plugin API yet — the host that serves it
+    /// and the client that calls it are still to come — so a build.rs that
+    /// quietly stopped compiling plugin.proto would break nothing until
+    /// then. Naming the generated types here is what makes that a build
+    /// failure now rather than a puzzle later.
+    #[test]
+    fn the_plugin_api_surface_is_generated() {
+        use crate::proto::plugin_host_service_client::PluginHostServiceClient;
+        use crate::proto::plugin_host_service_server::PluginHostServiceServer;
+
+        let request = crate::proto::ProcessCandidatesRequest {
+            api_version: 1,
+            reading: "きょう".to_string(),
+            candidates: vec![crate::proto::PluginCandidate {
+                text: "今日".to_string(),
+                subtext: String::new(),
+                corresponding_count: 4,
+                surface_count: 3,
+            }],
+        };
+
+        assert_eq!(request.candidates[0].surface_count, 3);
+        // the client and server halves both exist; `_` because naming the
+        // types is the whole assertion
+        let _: Option<PluginHostServiceClient<tonic::transport::Channel>> = None;
+        let _ = std::any::type_name::<PluginHostServiceServer<()>>();
     }
 
     #[test]
