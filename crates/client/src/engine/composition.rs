@@ -334,7 +334,7 @@ fn uses_surrounding_text(action: &ClientAction) -> bool {
         // these rewrite the reading, and the conversion the engine runs for
         // them is what the left-side context feeds
         ClientAction::AppendText(_)
-        | ClientAction::RemoveText
+        | ClientAction::RemoveText(_)
         | ClientAction::ShrinkText(_)
         // NOTE: SetTextWithType (F6-F10) issues no engine RPC at all — it
         // transforms `raw_input`/`raw_hiragana` locally. It has always been
@@ -411,7 +411,7 @@ mod tests {
         assert!(needs_context_update(&[ClientAction::AppendText(
             "a".to_string()
         )]));
-        assert!(needs_context_update(&[ClientAction::RemoveText]));
+        assert!(needs_context_update(&[ClientAction::RemoveText(1)]));
         assert!(needs_context_update(&[ClientAction::ShrinkText(
             "a".to_string()
         )]));

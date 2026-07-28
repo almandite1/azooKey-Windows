@@ -30,7 +30,18 @@ message AppendTextResponse {
 }
 
 // Request message for RemoveText.
-message RemoveTextRequest {}
+message RemoveTextRequest {
+  // How many kana to delete from the end of the reading. Held Backspace
+  // autorepeats at ~30 Hz and the host coalesces the presses into one message;
+  // sending them one at a time meant one full reconversion (neural inference
+  // included) per kana, which is what made a long press lag. The server
+  // deletes `count` kana and converts once.
+  //
+  // Field 1 was free: this message was empty before. A TIP from before the
+  // change sends nothing, so the server reads 0 and clamps it back up to 1 —
+  // the old one-kana-per-call behaviour, which is exactly right for it.
+  int32 count = 1;
+}
 
 // Response message for RemoveText.
 message RemoveTextResponse {

@@ -144,6 +144,20 @@ pub struct TextService {
     /// `OnChange` that TSF dispatches synchronously from inside `SetValue`
     /// does not bounce straight back into another write.
     pub suppress_compartment_echo: bool,
+    /// Armed when a Backspace ended the composition, so the rest of that
+    /// key's autorepeat can be thrown away.
+    ///
+    /// Holding Backspace deletes the reading kana by kana and then the
+    /// composition is gone — but the key is still down, and the presses that
+    /// keep arriving pass through to the host, which deletes the text the
+    /// user just committed. The window is small and the damage is not: it is
+    /// the document, not the composition.
+    ///
+    /// Only autorepeat is discarded. A fresh press with the key released in
+    /// between is the user asking to delete their own text, and must reach the
+    /// host untouched — which is also what disarms this, along with any other
+    /// key and the Backspace key-up.
+    pub discard_backspace_repeat: bool,
     /// UILess-mode state for the candidate list.
     pub ui_element: UiElementState,
     // NOTE: no `this` self-reference here. The COM object is reachable from
