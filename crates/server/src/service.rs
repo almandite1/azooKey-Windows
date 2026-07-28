@@ -19,6 +19,16 @@ use crate::wrappers::{
 #[derive(Debug, Default)]
 pub struct MyAzookeyService;
 
+/// Ceiling on one `RemoveText` batch.
+///
+/// The client already clamps the count to the reading it can see, so a batch
+/// this large means the two sides disagree — a stale TIP, or a repeat count a
+/// host inflated. Deleting from an empty reading is harmless on the engine
+/// side, so the cap is not about correctness; it bounds how long one FFI call
+/// can hold the single-threaded runtime, which is what a health ping and every
+/// other application's keystrokes are waiting on.
+const MAX_REMOVE_TEXT_COUNT: i32 = 512;
+
 /// Builds the ComposingText payload every composing-text RPC returns: the
 /// current hiragana plus a fresh candidate fetch for the session.
 fn composed(session: i64, composing_text: RawComposingText) -> ComposingText {
@@ -58,9 +68,20 @@ impl AzookeyService for MyAzookeyService {
         request: Request<RemoveTextRequest>,
     ) -> Result<Response<RemoveTextResponse>, Status> {
         let session = session_of(&request);
+        let count = request.into_inner().count.clamp(1, MAX_REMOVE_TEXT_COUNT);
+
+        // The loop is the cheap half: RemoveText drops one kana from the
+        // reading and does no conversion. `composed` is the expensive one — it
+        // reconverts the whole reading, Zenzai inference included — so it runs
+        // once for the batch rather than once per kana. That is the entire
+        // point of the count.
+        let mut composing_text = remove_text(session);
+        for _ in 1..count {
+            composing_text = remove_text(session);
+        }
 
         Ok(Response::new(RemoveTextResponse {
-            composing_text: Some(composed(session, remove_text(session))),
+            composing_text: Some(composed(session, composing_text)),
         }))
     }
 

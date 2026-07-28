@@ -71,8 +71,13 @@ async fn type_keys(client: &mut Client, keys: &str) -> ComposingText {
 }
 
 async fn remove(client: &mut Client) -> ComposingText {
+    remove_many(client, 1).await
+}
+
+/// One RemoveText standing for `count` presses of a held Backspace.
+async fn remove_many(client: &mut Client, count: i32) -> ComposingText {
     client
-        .remove_text(shared::proto::RemoveTextRequest {})
+        .remove_text(shared::proto::RemoveTextRequest { count })
         .await
         .expect("remove_text failed")
         .into_inner()
@@ -370,6 +375,62 @@ async fn remove_text_drains_the_reading_one_kana_per_call() {
             "each RemoveText must delete exactly one kana (got {hiragana:?})"
         );
     }
+
+    clear(&mut client).await;
+}
+
+/// A held Backspace arrives as ONE keydown standing for several presses, and
+/// the count is what spares the engine a full reconversion per kana. The
+/// contract the client relies on: `count` kana go, and the answer is the
+/// conversion of what is left — indistinguishable from `count` separate calls,
+/// which is what makes the batching safe.
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment"]
+async fn remove_text_deletes_a_whole_batch_of_kana_at_once() {
+    let mut client = connect().await;
+
+    clear(&mut client).await;
+
+    let reading = type_keys(&mut client, "saigentejun").await.hiragana;
+    assert_eq!(reading, "さいげんてじゅん");
+
+    assert_eq!(
+        remove_many(&mut client, 2).await.hiragana,
+        "さいげんてじ",
+        "count=2 must delete two kana in one call"
+    );
+    assert_eq!(
+        remove_many(&mut client, 3).await.hiragana,
+        "さいげ",
+        "and the reading must keep shrinking by exactly the count"
+    );
+
+    // A count past the end empties the reading rather than failing: the
+    // client clamps to the reading it can see, but the two sides can disagree
+    // for one keystroke (the engine holds a trailing ん unresolved), and a
+    // panic here would take the whole server down.
+    assert_eq!(remove_many(&mut client, 99).await.hiragana, "");
+
+    // ...and the session still works afterwards
+    assert_eq!(type_keys(&mut client, "a").await.hiragana, "あ");
+
+    clear(&mut client).await;
+}
+
+/// Zero and negative counts are what a TIP older than the count field sends
+/// (it sends nothing, which decodes to 0). Deleting nothing would strand the
+/// old client in a composition it cannot back out of, so the server clamps up
+/// to the one-kana behaviour that client was built for.
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment"]
+async fn a_count_below_one_still_deletes_one_kana() {
+    let mut client = connect().await;
+
+    clear(&mut client).await;
+    assert_eq!(type_keys(&mut client, "mizu").await.hiragana, "みず");
+
+    assert_eq!(remove_many(&mut client, 0).await.hiragana, "み");
+    assert_eq!(remove_many(&mut client, -5).await.hiragana, "");
 
     clear(&mut client).await;
 }

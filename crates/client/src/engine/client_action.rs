@@ -10,7 +10,12 @@ pub enum ClientAction {
     CancelComposition,
 
     AppendText(String),
-    RemoveText,
+    /// Delete this many kana from the end of the reading, in one RPC.
+    ///
+    /// Always >= 1, and already clamped to the reading by the transition
+    /// table — the same number that decided whether the composition survives
+    /// (see the Backspace arm there).
+    RemoveText(u32),
     ShrinkText(String),
 
     SetTextWithType(SetTextType),

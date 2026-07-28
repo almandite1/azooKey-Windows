@@ -68,13 +68,66 @@ pub fn is_ime_toggle_key(key_code: usize) -> bool {
     u32::try_from(key_code).is_ok_and(|vk| VK_IME_TOGGLE.contains(&vk))
 }
 
+/// What the `lparam` of a WM_KEYDOWN says about autorepeat.
+///
+/// Two independent facts, both needed: `count` is how many presses this one
+/// message stands for, and `is_repeat` says whether the key was already down
+/// — a held key rather than a fresh press. The distinction matters because a
+/// fresh press is always the user's intent, while a repeat may have to be
+/// discarded once the composition it was deleting is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyRepeat {
+    pub count: u32,
+    pub is_repeat: bool,
+}
+
+impl KeyRepeat {
+    /// One deliberate press, no autorepeat.
+    ///
+    /// Test-only: in production every decode starts from a real `lparam`, and
+    /// a constant standing in for one would be a way to lose the repeat
+    /// information without noticing.
+    #[cfg(test)]
+    pub const SINGLE: Self = Self {
+        count: 1,
+        is_repeat: false,
+    };
+}
+
+/// Decodes the autorepeat fields of a keydown `lparam`.
+///
+/// Bits 0–15 are the repeat count: the host's message pump coalesces presses
+/// that arrived while it was busy, so one WM_KEYDOWN can stand for several.
+/// Bit 30 is the previous key state — set when the key was already down, i.e.
+/// this is autorepeat rather than a fresh press.
+///
+/// A count of zero is not something Windows sends, but it is what a synthetic
+/// or forwarded event can carry, and zero presses would be a keystroke that
+/// does nothing; it is raised to one. Whether the batch is worth batching is
+/// the caller's decision, not this one's.
+pub fn key_repeat(lparam: isize) -> KeyRepeat {
+    KeyRepeat {
+        count: ((lparam as u32) & 0xFFFF).max(1),
+        // bit 30: 1 = the key was down before this message
+        is_repeat: (lparam as u32) & (1 << 30) != 0,
+    }
+}
+
 #[derive(Debug)]
 pub enum UserAction {
     /// The text this keystroke produced. A `String` rather than a `char`
     /// because one keystroke can yield several characters, and because a
     /// non-BMP character arrives as two UTF-16 units.
     Input(String),
-    Backspace,
+    /// `count` presses' worth of Backspace in one keystroke — see
+    /// [`key_repeat`]. Only Backspace carries it: it is the only key whose
+    /// autorepeat costs a full reconversion per press, and the only one where
+    /// N presses provably mean the same thing as one press repeated N times
+    /// (a held あ key still has to go through the engine one keystroke at a
+    /// time, because each one can change the reading's romaji state).
+    Backspace {
+        count: u32,
+    },
     Enter,
     Space,
     Tab,
@@ -103,15 +156,21 @@ pub enum Navigation {
     Right,
 }
 
-impl TryFrom<usize> for UserAction {
-    type Error = anyhow::Error;
-    fn try_from(key_code: usize) -> Result<UserAction> {
+impl UserAction {
+    /// Decodes a virtual key into the action it means.
+    ///
+    /// `repeat` is what the keydown's lparam said (see [`key_repeat`]); it
+    /// only reaches Backspace, and callers that have no lparam — or no
+    /// interest in one — pass [`KeyRepeat::SINGLE`].
+    pub fn decode(key_code: usize, repeat: KeyRepeat) -> Result<UserAction> {
         let action = match key_code {
-            0x08 => UserAction::Backspace, // VK_BACK
-            0x09 => UserAction::Tab,       // VK_TAB
-            0x0D => UserAction::Enter,     // VK_RETURN
-            0x20 => UserAction::Space,     // VK_SPACE
-            0x1B => UserAction::Escape,    // VK_ESCAPE
+            0x08 => UserAction::Backspace {
+                count: repeat.count,
+            }, // VK_BACK
+            0x09 => UserAction::Tab,    // VK_TAB
+            0x0D => UserAction::Enter,  // VK_RETURN
+            0x20 => UserAction::Space,  // VK_SPACE
+            0x1B => UserAction::Escape, // VK_ESCAPE
 
             // VK_PRIOR, VK_NEXT, VK_END, VK_HOME, VK_INSERT, VK_DELETE
             0x21..=0x24 | 0x2D | 0x2E => UserAction::EditingKey,
@@ -188,6 +247,80 @@ impl TryFrom<usize> for UserAction {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// One lparam's worth of bits as the platform's `isize`.
+    ///
+    /// The cast chain matters: `lparam` is 32 bits wide in the x86 TIP, where
+    /// a value with bit 31 set is a NEGATIVE isize. Writing the literal
+    /// directly is a compile error there, and dropping the top bit instead
+    /// would test something other than what Windows sends.
+    fn lparam(bits: u32) -> isize {
+        bits as i32 as isize
+    }
+
+    /// The two fields live in one 32-bit word and are read from opposite
+    /// ends of it, so a mask that was one bit off would still look plausible
+    /// on a fresh press.
+    #[test]
+    fn a_fresh_press_carries_one_press_and_no_repeat_flag() {
+        let repeat = key_repeat(lparam(0x0001_0001));
+        assert_eq!(repeat.count, 1);
+        assert!(!repeat.is_repeat, "bit 30 is clear on the first press");
+    }
+
+    /// What a held key looks like: bit 30 set, and a count the host's message
+    /// pump inflated while it was busy. Both halves matter — the count is the
+    /// batching, the flag is the discard guard.
+    #[test]
+    fn a_held_key_carries_the_coalesced_count_and_the_repeat_flag() {
+        // bit 30 (previous state) + bit 29..24 scan-code noise + count 5
+        let repeat = key_repeat(lparam(0x4001_0005));
+        assert_eq!(repeat.count, 5, "only the low word is the count");
+        assert!(repeat.is_repeat);
+    }
+
+    /// Bit 31 is the transition state (set on key-UP) and bit 29 is the
+    /// context code (Alt). Neither says anything about autorepeat, and reading
+    /// one of them as bit 30 would discard keystrokes the user meant.
+    #[test]
+    fn the_neighbouring_lparam_bits_are_not_the_repeat_flag() {
+        assert!(
+            !key_repeat(lparam(0x8000_0001)).is_repeat,
+            "bit 31 is key-up"
+        );
+        assert!(
+            !key_repeat(lparam(0x2000_0001)).is_repeat,
+            "bit 29 is the Alt context"
+        );
+    }
+
+    /// Zero presses would be a keystroke that does nothing at all. Windows
+    /// does not send it, but a synthetic or forwarded event can.
+    #[test]
+    fn a_zero_count_is_raised_to_one() {
+        assert_eq!(key_repeat(lparam(0)).count, 1);
+        assert_eq!(key_repeat(lparam(0x4000_0000)).count, 1);
+    }
+
+    /// Only Backspace carries the count; every other key would be wrong to
+    /// collapse presses (each あ keystroke can change the reading's romaji
+    /// state on its own).
+    #[test]
+    fn only_backspace_carries_the_repeat_count() {
+        let held = KeyRepeat {
+            count: 7,
+            is_repeat: true,
+        };
+
+        assert!(matches!(
+            UserAction::decode(0x08, held).unwrap(),
+            UserAction::Backspace { count: 7 }
+        ));
+        assert!(matches!(
+            UserAction::decode(0x0D, held).unwrap(),
+            UserAction::Enter
+        ));
+    }
 
     /// A dead key (US-International `^`, `¨`, …) leaves the bare accent in
     /// the buffer and reports it with a negative count. Reading the buffer
@@ -304,7 +437,7 @@ mod tests {
             assert!(is_ime_toggle_key(vk), "0x{vk:02X} switches the IME");
             assert!(
                 matches!(
-                    UserAction::try_from(vk).unwrap(),
+                    UserAction::decode(vk, KeyRepeat::SINGLE).unwrap(),
                     UserAction::ToggleInputMode
                 ),
                 "0x{vk:02X} must decode to ToggleInputMode"
@@ -329,7 +462,10 @@ mod tests {
         // VK_PRIOR, VK_NEXT, VK_END, VK_HOME, VK_INSERT, VK_DELETE
         for vk in [0x21usize, 0x22, 0x23, 0x24, 0x2D, 0x2E] {
             assert!(
-                matches!(UserAction::try_from(vk).unwrap(), UserAction::EditingKey),
+                matches!(
+                    UserAction::decode(vk, KeyRepeat::SINGLE).unwrap(),
+                    UserAction::EditingKey
+                ),
                 "0x{vk:02X} must decode to EditingKey"
             );
         }

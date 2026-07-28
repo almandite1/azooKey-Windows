@@ -125,7 +125,9 @@ impl TextServiceFactory_Impl {
                 ClientAction::AppendText(text) => {
                     self.act_append_text(edit, ipc_service, mode, text)?
                 }
-                ClientAction::RemoveText => self.act_remove_text(edit, ipc_service)?,
+                ClientAction::RemoveText(count) => {
+                    self.act_remove_text(edit, ipc_service, *count)?
+                }
                 // deliberate no-op; see ClientAction::MoveCursor
                 ClientAction::MoveCursor(_offset) => {}
                 ClientAction::SetIMEMode(mode) => self.act_set_ime_mode(edit, ipc_service, mode)?,
@@ -217,8 +219,18 @@ impl TextServiceFactory_Impl {
     /// carried over from Previewing would point past the new list (blanking
     /// the preview via the `entry()` fallback) or at the wrong candidate, so
     /// reset to the top and shrink `raw_input` to what the new top covers.
-    fn act_remove_text(&self, edit: &mut CompositionEdit, ipc_service: &IPCService) -> Result<()> {
-        let candidates = ipc_service.remove_text()?;
+    ///
+    /// `count` kana go in one call. Nothing below it needs to know: the
+    /// truncation is driven by the new top candidate's `corresponding_count`,
+    /// which the engine reports for the reading that is left — however many
+    /// kana it took to get there.
+    fn act_remove_text(
+        &self,
+        edit: &mut CompositionEdit,
+        ipc_service: &IPCService,
+        count: u32,
+    ) -> Result<()> {
+        let candidates = ipc_service.remove_text(count)?;
         edit.adopt_fresh(candidates);
 
         edit.raw_input = raw_input_kept_for_count(&edit.raw_input, edit.corresponding_count);
@@ -526,7 +538,7 @@ mod tests {
         }
 
         factory
-            .handle_action(&[ClientAction::RemoveText], CompositionState::Composing)
+            .handle_action(&[ClientAction::RemoveText(1)], CompositionState::Composing)
             .unwrap();
 
         let text_service = factory.borrow().unwrap();
@@ -542,7 +554,7 @@ mod tests {
         drop(composition);
         drop(text_service);
 
-        assert!(recorded_calls(&fake).contains(&IpcCall::RemoveText));
+        assert!(recorded_calls(&fake).contains(&IpcCall::RemoveText(1)));
         IMEState::get().unwrap().ipc_service = None;
     }
 
@@ -892,7 +904,7 @@ mod tests {
         // actions, so the FIRST range request is the one under test — the
         // rendering that follows makes requests of its own.
         factory
-            .handle_action(&[ClientAction::RemoveText], CompositionState::Composing)
+            .handle_action(&[ClientAction::RemoveText(1)], CompositionState::Composing)
             .unwrap();
 
         assert_eq!(

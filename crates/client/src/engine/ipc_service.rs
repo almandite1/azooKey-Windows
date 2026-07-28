@@ -321,7 +321,7 @@ pub struct FakeIpc {
 #[derive(Debug, Clone, PartialEq)]
 pub enum IpcCall {
     AppendText(String),
-    RemoveText,
+    RemoveText(i32),
     ClearText,
     ShrinkText(i32),
     SetContext(String),
@@ -391,17 +391,28 @@ impl IPCService {
         candidates_or_missing(response.composing_text)
     }
 
+    /// Deletes `count` kana from the end of the reading in one call. The
+    /// server converts once for the batch, which is what makes a held
+    /// Backspace cheap; see `RemoveTextRequest.count` in service.proto.
     #[tracing::instrument(skip(self))]
-    pub fn remove_text(&self) -> anyhow::Result<Candidates> {
+    pub fn remove_text(&self, count: u32) -> anyhow::Result<Candidates> {
+        // Saturating rather than wrapping: the wire field is int32 and a
+        // count this large is already nonsense, but a negative one would make
+        // the server clamp it back to 1 and silently delete the wrong amount.
+        let count = i32::try_from(count).unwrap_or(i32::MAX);
+
         #[cfg(test)]
-        if let Some(result) = self.fake_call(|fake| fake.engine_answer(IpcCall::RemoveText)) {
+        if let Some(result) = self.fake_call(|fake| fake.engine_answer(IpcCall::RemoveText(count)))
+        {
             return result;
         }
 
         let mut client = self.azookey_client.clone();
         let response = self.engine_exec(CONVERSION_TIMEOUT, async move {
             client
-                .remove_text(tonic::Request::new(shared::proto::RemoveTextRequest {}))
+                .remove_text(tonic::Request::new(shared::proto::RemoveTextRequest {
+                    count,
+                }))
                 .await
         })?;
 

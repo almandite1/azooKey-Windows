@@ -21,14 +21,18 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         &self,
         pic: windows_core::Ref<'_, ITfContext>,
         wparam: WPARAM,
-        _lparam: LPARAM,
+        lparam: LPARAM,
     ) -> Result<BOOL> {
         // TRUE = we will handle this key in OnKeyDown. A pure query, as the
         // contract requires (issue #26): a Ctrl/Alt chord during a
         // composition answers TRUE, and the cancel runs in OnKeyDown when
         // the host delivers the key — never here, so a speculative probe
         // cannot discard the user's composition.
-        let result = self.test_key(pic.as_ref(), wparam)?;
+        //
+        // lparam carries the autorepeat fields, which decide whether a held
+        // Backspace is ours to eat; the answer has to match what OnKeyDown
+        // will do, so it is the same input to the same function.
+        let result = self.test_key(pic.as_ref(), wparam, lparam)?;
 
         Ok(result.into())
     }
@@ -39,11 +43,13 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         &self,
         pic: windows_core::Ref<'_, ITfContext>,
         wparam: WPARAM,
-        _lparam: LPARAM,
+        lparam: LPARAM,
     ) -> Result<BOOL> {
         // this function is called when a key is pressed
-        // we can handle key events here
-        let result = self.handle_key(pic.as_ref(), wparam)?;
+        // we can handle key events here. lparam says whether the key is
+        // being held and how many presses this message stands for — see
+        // engine::user_action::key_repeat.
+        let result = self.handle_key(pic.as_ref(), wparam, lparam)?;
 
         Ok(result.into())
     }
@@ -63,12 +69,14 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     fn OnKeyUp(
         &self,
         _pic: windows_core::Ref<'_, ITfContext>,
-        _wparam: WPARAM,
+        wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<BOOL> {
-        // this function is called when a key is released
-        // but we handle key events in OnKeyDown function
-        // so just return S_OK
+        // Key events are handled in OnKeyDown, so this answers FALSE either
+        // way. The one thing it is good for: letting go of Backspace ends the
+        // autorepeat the composition-end guard is discarding, and the release
+        // is the earliest and most direct place to say so.
+        self.note_key_up(wparam);
         Ok(false.into())
     }
 

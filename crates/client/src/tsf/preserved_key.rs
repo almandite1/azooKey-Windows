@@ -220,7 +220,7 @@ mod tests {
     use super::*;
 
     use std::rc::Rc;
-    use windows::Win32::Foundation::WPARAM;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
     use windows::Win32::UI::TextServices::{ITfContext, ITfKeyEventSink, ITfTextInputProcessor};
 
@@ -368,7 +368,9 @@ mod tests {
             "this host accepts the reservations"
         );
         assert!(
-            factory.test_key(Some(&context), WPARAM(0xF3)).unwrap(),
+            factory
+                .test_key(Some(&context), WPARAM(0xF3), LPARAM(0))
+                .unwrap(),
             "the raw VK must still be handled — its arrival proves TSF did \
              not route it as a preserved key"
         );
@@ -394,7 +396,9 @@ mod tests {
             "a key arriving 5ms after the last toggle is the same press"
         );
         assert!(
-            !factory.test_key(Some(&context), WPARAM(0xF3)).unwrap(),
+            !factory
+                .test_key(Some(&context), WPARAM(0xF3), LPARAM(0))
+                .unwrap(),
             "so it must not toggle a second time"
         );
         teardown(&tip);
@@ -418,17 +422,23 @@ mod tests {
         );
 
         assert!(
-            factory.test_key(Some(&context), WPARAM(0xF3)).unwrap(),
+            factory
+                .test_key(Some(&context), WPARAM(0xF3), LPARAM(0))
+                .unwrap(),
             "the first delivery toggles"
         );
-        factory.handle_key(Some(&context), WPARAM(0xF3)).unwrap();
+        factory
+            .handle_key(Some(&context), WPARAM(0xF3), LPARAM(0))
+            .unwrap();
 
         assert!(
             factory.toggle_is_duplicate().unwrap(),
             "and arms the guard for the second delivery of the same press"
         );
         assert!(
-            !factory.test_key(Some(&context), WPARAM(0xF3)).unwrap(),
+            !factory
+                .test_key(Some(&context), WPARAM(0xF3), LPARAM(0))
+                .unwrap(),
             "which is then ignored instead of cancelling the first"
         );
         teardown(&tip);
@@ -473,7 +483,9 @@ mod tests {
             "only reservations that took may be recorded"
         );
         assert!(
-            factory.test_key(Some(&context), WPARAM(0xF3)).unwrap(),
+            factory
+                .test_key(Some(&context), WPARAM(0xF3), LPARAM(0))
+                .unwrap(),
             "without a reservation the raw Zenkaku/Hankaku VK must still toggle"
         );
         teardown(&tip);

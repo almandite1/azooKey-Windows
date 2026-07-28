@@ -120,16 +120,33 @@ pub fn transition(
                     CompositionState::Composing,
                     vec![input_action(number.to_string())],
                 ),
-                UserAction::Backspace => {
+                UserAction::Backspace { count } => {
+                    // The count is what one autorepeating keydown stands for.
+                    // It is clamped HERE, against the reading this side can
+                    // see, rather than left to the server: the composition
+                    // ends when the reading runs out, and that decision needs
+                    // the same number the delete uses. Deleting more than the
+                    // reading holds would be harmless on the engine side and
+                    // wrong here — the state machine would still be Composing
+                    // over nothing.
+                    let requested = count.max(1);
+                    let reading = u32::try_from(ctx.reading_chars).unwrap_or(u32::MAX);
+
                     // <=: an empty reading (nothing left to remove) must
                     // also end rather than loop in Composing forever
-                    if ctx.reading_chars <= 1 {
+                    if reading <= requested {
                         (
                             CompositionState::None,
-                            vec![ClientAction::RemoveText, ClientAction::EndComposition],
+                            vec![
+                                ClientAction::RemoveText(reading.max(1)),
+                                ClientAction::EndComposition,
+                            ],
                         )
                     } else {
-                        (CompositionState::Composing, vec![ClientAction::RemoveText])
+                        (
+                            CompositionState::Composing,
+                            vec![ClientAction::RemoveText(requested)],
+                        )
                     }
                 }
                 UserAction::Enter => {
@@ -268,7 +285,7 @@ mod tests {
     #[test]
     fn idle_ignores_editing_keys() {
         for action in [
-            UserAction::Backspace,
+            UserAction::Backspace { count: 1 },
             UserAction::Enter,
             UserAction::Escape,
             UserAction::Space,
@@ -308,20 +325,23 @@ mod tests {
     fn backspace_on_the_last_kana_ends_the_composition() {
         let mut context = kana(CompositionState::Composing);
         context.reading_chars = 1;
-        let (next, actions) = transition(&context, UserAction::Backspace).unwrap();
+        let (next, actions) = transition(&context, UserAction::Backspace { count: 1 }).unwrap();
         assert_eq!(next, CompositionState::None);
         assert_eq!(
             actions,
-            vec![ClientAction::RemoveText, ClientAction::EndComposition]
+            vec![ClientAction::RemoveText(1), ClientAction::EndComposition]
         );
     }
 
     #[test]
     fn backspace_with_more_text_just_removes() {
-        let (next, actions) =
-            transition(&kana(CompositionState::Composing), UserAction::Backspace).unwrap();
+        let (next, actions) = transition(
+            &kana(CompositionState::Composing),
+            UserAction::Backspace { count: 1 },
+        )
+        .unwrap();
         assert_eq!(next, CompositionState::Composing);
-        assert_eq!(actions, vec![ClientAction::RemoveText]);
+        assert_eq!(actions, vec![ClientAction::RemoveText(1)]);
     }
 
     /// Upstream issue #35: さい converts to the single-char candidate 際,
@@ -333,13 +353,76 @@ mod tests {
     fn backspace_judges_by_the_reading_not_the_converted_preview() {
         let mut context = kana(CompositionState::Previewing);
         context.reading_chars = 2; // さい — even though the preview 際 is 1 char
-        let (next, actions) = transition(&context, UserAction::Backspace).unwrap();
+        let (next, actions) = transition(&context, UserAction::Backspace { count: 1 }).unwrap();
         assert_eq!(next, CompositionState::Composing);
         assert_eq!(
             actions,
-            vec![ClientAction::RemoveText],
+            vec![ClientAction::RemoveText(1)],
             "the composition must keep going while the reading has kana left"
         );
+    }
+
+    /// A held Backspace arrives as one keydown standing for several presses.
+    /// The whole batch goes in one RemoveText — the point of the count — as
+    /// long as the reading outlives it.
+    #[test]
+    fn a_repeat_batch_shorter_than_the_reading_removes_the_whole_batch() {
+        let mut context = kana(CompositionState::Composing);
+        context.reading_chars = 5;
+        let (next, actions) = transition(&context, UserAction::Backspace { count: 3 }).unwrap();
+        assert_eq!(next, CompositionState::Composing);
+        assert_eq!(actions, vec![ClientAction::RemoveText(3)]);
+    }
+
+    /// The batch is clamped to the reading, not sent as-is: the count that
+    /// deletes and the count that decides "the composition is over" have to
+    /// be the same number, or the state machine ends up Composing over an
+    /// empty reading (or the engine is asked to delete text that is not
+    /// there).
+    #[test]
+    fn a_repeat_batch_longer_than_the_reading_is_clamped_and_ends_the_composition() {
+        let mut context = kana(CompositionState::Composing);
+        context.reading_chars = 2;
+        let (next, actions) = transition(&context, UserAction::Backspace { count: 9 }).unwrap();
+        assert_eq!(next, CompositionState::None);
+        assert_eq!(
+            actions,
+            vec![ClientAction::RemoveText(2), ClientAction::EndComposition],
+            "exactly the reading is removed — no more, and not one call per kana"
+        );
+    }
+
+    /// The boundary: a batch that exactly drains the reading still ends the
+    /// composition, the same as a single press on the last kana.
+    #[test]
+    fn a_repeat_batch_that_exactly_drains_the_reading_ends_the_composition() {
+        let mut context = kana(CompositionState::Composing);
+        context.reading_chars = 4;
+        let (next, actions) = transition(&context, UserAction::Backspace { count: 4 }).unwrap();
+        assert_eq!(next, CompositionState::None);
+        assert_eq!(
+            actions,
+            vec![ClientAction::RemoveText(4), ClientAction::EndComposition]
+        );
+    }
+
+    /// An empty reading has nothing to remove, but the composition must still
+    /// end — and the RemoveText must not be a zero, which the server would
+    /// clamp back up to one anyway. Zero counts are raised in `key_repeat`;
+    /// this pins the table's own floor so the two cannot drift apart.
+    #[test]
+    fn an_empty_reading_still_removes_one_and_ends() {
+        let mut context = kana(CompositionState::Composing);
+        context.reading_chars = 0;
+        for count in [0, 1, 8] {
+            let (next, actions) = transition(&context, UserAction::Backspace { count }).unwrap();
+            assert_eq!(next, CompositionState::None);
+            assert_eq!(
+                actions,
+                vec![ClientAction::RemoveText(1), ClientAction::EndComposition],
+                "count {count} on an empty reading"
+            );
+        }
     }
 
     #[test]
