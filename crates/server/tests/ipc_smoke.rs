@@ -213,6 +213,45 @@ async fn long_composition_shrink_does_not_kill_the_server() {
 
 #[tokio::test]
 #[ignore = "requires a running azookey-server with its DLL environment"]
+async fn a_day_reading_gains_the_calendar_date() {
+    // The candidate pipeline's unit tests pin what the stage does with a
+    // list; only a live engine can show it running on the list the engine
+    // actually produces — and, more to the point, that the span the added
+    // candidate claims matches what the engine reported for the same
+    // reading. `kyou` is four keystrokes and three kana; a date candidate
+    // that disagreed would desync the client's raw input on commit.
+    let mut client = connect().await;
+    clear(&mut client).await;
+
+    let composing = type_keys(&mut client, "kyou").await;
+    assert_eq!(composing.hiragana, "きょう");
+
+    let today = chrono::Local::now().date_naive();
+    let expected = format!(
+        "{:04}/{:02}/{:02}",
+        chrono::Datelike::year(&today),
+        chrono::Datelike::month(&today),
+        chrono::Datelike::day(&today)
+    );
+    let dated = composing
+        .suggestions
+        .iter()
+        .find(|s| s.text == expected)
+        .unwrap_or_else(|| {
+            let candidates: Vec<&str> =
+                composing.suggestions.iter().map(|s| s.text.as_str()).collect();
+            panic!("{expected} should be among the candidates for きょう, got {candidates:?}")
+        });
+
+    assert_eq!(dated.surface_count, 3, "きょう is three kana");
+    assert_eq!(dated.corresponding_count, 4, "kyou is four keystrokes");
+    assert_eq!(dated.subtext, "日付");
+
+    clear(&mut client).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment"]
 async fn conversion_yields_the_expected_candidate() {
     // The canonical end-to-end proof: the whole pipe -> gRPC -> Swift FFI ->
     // kana-kanji conversion path is alive and returns real candidates. This
