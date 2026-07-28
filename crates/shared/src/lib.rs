@@ -112,11 +112,43 @@ impl Default for ZenzaiConfig {
     }
 }
 
+/// One add-on the user has installed. Deliberately the smallest thing that
+/// can identify a plugin and say whether it runs: anything a plugin
+/// declares about itself (name, version, capabilities) belongs to its own
+/// manifest, not to the user's settings file, so that installing a plugin
+/// does not mean rewriting settings.json.
+///
+/// Per-field `#[serde(default)]` for the same reason as everything else
+/// here: a hand-edited entry missing a key degrades to that key's default
+/// rather than failing the whole file.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct PluginEntry {
+    pub id: String,
+    pub enabled: bool,
+}
+
+/// Add-on settings. Nothing reads these yet — the plugin host does not
+/// exist in this build — but the schema lands first so a settings.json
+/// written from here on already has the section, and the opt-in it
+/// describes is off by default.
+///
+/// `enable` is the master switch, separate from the per-entry `enabled`:
+/// turning the feature off must not require the user to disable every
+/// plugin individually, and must not lose which ones they had on.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct PluginsConfig {
+    pub enable: bool,
+    pub entries: Vec<PluginEntry>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct AppConfig {
     pub version: String,
     pub zenzai: ZenzaiConfig,
+    pub plugins: PluginsConfig,
 }
 
 impl Default for AppConfig {
@@ -124,6 +156,7 @@ impl Default for AppConfig {
         AppConfig {
             version: CONFIG_VERSION.to_string(),
             zenzai: ZenzaiConfig::default(),
+            plugins: PluginsConfig::default(),
         }
     }
 }
@@ -371,16 +404,23 @@ mod tests {
         assert_eq!(root.read_settings(), original, "file must be left alone");
     }
 
+    /// The unknown keys here are the whole point: serde drops what it does
+    /// not know on the way back out, so the ONLY thing protecting a future
+    /// build's settings — a key inside `plugins` as much as a top-level one
+    /// — is that this build refuses to write the file at all.
     #[test]
     fn newer_version_is_read_only() {
         let root = TempConfigRoot::new();
-        let original = r#"{"version":"99.0.0","zenzai":{"enable":true,"profile":"p","backend":"cuda"},"future_field":123}"#;
+        let original = r#"{"version":"99.0.0","zenzai":{"enable":true,"profile":"p","backend":"cuda"},"plugins":{"enable":true,"entries":[{"id":"future","enabled":true,"future_key":"x"}]},"future_field":123}"#;
         root.write_settings(original);
 
         let config = AppConfig::new_in(root.path());
 
         assert!(config.zenzai.enable, "known fields are still readable");
         assert_eq!(config.zenzai.backend, "cuda");
+        assert!(config.plugins.enable);
+        assert_eq!(config.plugins.entries.len(), 1);
+        assert_eq!(config.plugins.entries[0].id, "future");
         assert_eq!(config.version, "99.0.0", "version must not be stamped down");
         assert_eq!(
             root.read_settings(),
@@ -446,12 +486,14 @@ mod tests {
     fn a_utf8_bom_is_tolerated() {
         let root = TempConfigRoot::new();
         root.write_settings(
-            "\u{feff}{\"version\":\"0.1.0\",\"zenzai\":{\"enable\":true,\"profile\":\"p\",\"backend\":\"cpu\"}}",
+            "\u{feff}{\"version\":\"0.1.0\",\"zenzai\":{\"enable\":true,\"profile\":\"p\",\"backend\":\"cpu\"},\"plugins\":{\"enable\":true,\"entries\":[{\"id\":\"dates\",\"enabled\":true}]}}",
         );
 
         let config = AppConfig::new_in(root.path());
 
         assert!(config.zenzai.enable, "a BOM is not corruption");
+        assert!(config.plugins.enable, "the BOM strip covers the whole file");
+        assert_eq!(config.plugins.entries[0].id, "dates");
         assert!(
             !root.path().join(SETTINGS_BACKUP_FILENAME).exists(),
             "a BOM must not trigger the malformed path"
@@ -547,6 +589,113 @@ mod tests {
         assert_eq!(config.zenzai.enable, defaults.enable);
         assert_eq!(config.zenzai.profile, defaults.profile);
         assert_eq!(config.zenzai.backend, defaults.backend);
+        assert!(
+            !root.path().join(SETTINGS_BACKUP_FILENAME).exists(),
+            "a partial file is not corruption"
+        );
+    }
+
+    /// Every settings.json that exists today predates the plugins section,
+    /// so "the section is absent" is the normal case, not an edge one: it
+    /// must read as the feature being off rather than as a broken file.
+    #[test]
+    fn an_absent_plugins_section_reads_as_off() {
+        let root = TempConfigRoot::new();
+        root.write_settings(
+            r#"{"version":"0.0.1","zenzai":{"enable":true,"profile":"p","backend":"cuda"}}"#,
+        );
+
+        let config = AppConfig::new_in(root.path());
+
+        assert!(!config.plugins.enable, "the opt-in defaults to off");
+        assert!(config.plugins.entries.is_empty());
+        assert!(config.zenzai.enable, "the existing section is untouched");
+        assert_eq!(config.zenzai.backend, "cuda");
+        assert!(
+            !root.path().join(SETTINGS_BACKUP_FILENAME).exists(),
+            "a file from before the section is not corruption"
+        );
+    }
+
+    /// The migration write must not be able to lose what it just read: a
+    /// file stamped up to the current version is rewritten in full, so the
+    /// plugins it carried have to come back out of the serializer.
+    #[test]
+    fn plugins_survive_the_migration_rewrite() {
+        let root = TempConfigRoot::new();
+        root.write_settings(
+            r#"{"version":"0.0.1","zenzai":{},"plugins":{"enable":true,"entries":[{"id":"a","enabled":true},{"id":"b","enabled":false}]}}"#,
+        );
+
+        let config = AppConfig::new_in(root.path());
+        assert_eq!(config.version, CONFIG_VERSION, "this file is rewritten");
+
+        let reloaded = AppConfig::new_in(root.path());
+        assert!(reloaded.plugins.enable);
+        assert_eq!(
+            reloaded.plugins.entries,
+            vec![
+                PluginEntry {
+                    id: "a".to_string(),
+                    enabled: true
+                },
+                PluginEntry {
+                    id: "b".to_string(),
+                    enabled: false
+                },
+            ],
+            "order and per-entry state both survive the round trip"
+        );
+    }
+
+    #[test]
+    fn plugin_entries_survive_an_explicit_write() {
+        let root = TempConfigRoot::new();
+        let config = AppConfig {
+            plugins: PluginsConfig {
+                enable: true,
+                entries: vec![PluginEntry {
+                    id: "dates".to_string(),
+                    enabled: true,
+                }],
+            },
+            ..AppConfig::default()
+        };
+
+        config.write_to(root.path()).expect("write");
+
+        let reloaded = AppConfig::new_in(root.path());
+        assert_eq!(reloaded.plugins, config.plugins);
+    }
+
+    /// Same per-field rule as zenzai, one level deeper: a hand-written
+    /// entry that only names an id is a valid entry, and the master switch
+    /// it sits under is independent of it.
+    #[test]
+    fn a_partial_plugins_object_keeps_the_keys_it_has() {
+        let root = TempConfigRoot::new();
+        root.write_settings(r#"{"version":"0.0.1","plugins":{"entries":[{"id":"dates"}]}}"#);
+
+        let config = AppConfig::new_in(root.path());
+
+        assert!(!config.plugins.enable, "missing field gets a default");
+        assert_eq!(config.plugins.entries.len(), 1);
+        assert_eq!(config.plugins.entries[0].id, "dates");
+        assert!(
+            !config.plugins.entries[0].enabled,
+            "an entry defaults to not running"
+        );
+    }
+
+    /// The degenerate end, mirroring `an_empty_zenzai_object_yields_the_defaults`.
+    #[test]
+    fn an_empty_plugins_object_yields_the_defaults() {
+        let root = TempConfigRoot::new();
+        root.write_settings(r#"{"version":"0.0.1","plugins":{}}"#);
+
+        let config = AppConfig::new_in(root.path());
+
+        assert_eq!(config.plugins, PluginsConfig::default());
         assert!(
             !root.path().join(SETTINGS_BACKUP_FILENAME).exists(),
             "a partial file is not corruption"
