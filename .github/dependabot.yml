@@ -45,6 +45,31 @@ updates:
       prefix: chore
       include: scope
 
+  # The Swift package behind the conversion engine. Added with the SBOM work:
+  # until then Swift was the one ecosystem here with no version updates and no
+  # security alerts at all, because GitHub's dependency graph does not read
+  # server-swift/Package.resolved. Dependabot resolves the package graph
+  # itself rather than reading the graph, so it covers what the graph misses.
+  #
+  # Two of the pins are revision pins on a branch (AzooKeyKanaKanjiConverter,
+  # swift-tokenizers); Dependabot leaves those alone, which is correct -- they
+  # move when the engine is deliberately moved, not on a schedule.
+  - package-ecosystem: swift
+    directory: /server-swift
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      swift:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: chore
+      include: scope
+
   # The Tauri settings app. Its lockfile is separate from the Rust one, so it
   # gets its own entry and its own PR.
   - package-ecosystem: npm
