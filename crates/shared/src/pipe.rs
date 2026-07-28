@@ -49,6 +49,19 @@ pub fn ui_pipe_base() -> String {
     base_for("azookey_ui", current_session_id())
 }
 
+/// Base name of the plugin host's pipe for this session.
+///
+/// A third pipe, derived the same way as the other two so it is
+/// session-local for the same reason. The host serves it with the SAME
+/// DACL string as the existing pipes: adding a pipe must not mean writing
+/// a new one, and the property that earns that string its place — a
+/// sandboxed principal can connect but cannot create an instance, so it
+/// cannot stand in front of the real host and see keystrokes — is exactly
+/// the property this pipe needs too.
+pub fn plugin_pipe_base() -> String {
+    base_for("azookey_plugin", current_session_id())
+}
+
 /// Full pipe path of the conversion server for this session (client side).
 pub fn server_pipe() -> String {
     format!(r"\\.\pipe\{}", server_pipe_base())
@@ -57,6 +70,11 @@ pub fn server_pipe() -> String {
 /// Full pipe path of the UI process for this session (client side).
 pub fn ui_pipe() -> String {
     format!(r"\\.\pipe\{}", ui_pipe_base())
+}
+
+/// Full pipe path of the plugin host for this session (client side).
+pub fn plugin_pipe() -> String {
+    format!(r"\\.\pipe\{}", plugin_pipe_base())
 }
 
 fn base_for(name: &str, session_id: u32) -> String {
@@ -230,8 +248,20 @@ mod tests {
     fn full_paths_carry_the_pipe_prefix_and_session() {
         assert!(server_pipe().starts_with(r"\\.\pipe\azookey_server_"));
         assert!(ui_pipe().starts_with(r"\\.\pipe\azookey_ui_"));
+        assert!(plugin_pipe().starts_with(r"\\.\pipe\azookey_plugin_"));
         // base and full path must agree on the session id
         assert!(server_pipe().ends_with(&server_pipe_base()));
+        assert!(plugin_pipe().ends_with(&plugin_pipe_base()));
+    }
+
+    /// Three pipes, three names. A collision would put two servers on one
+    /// name, and whichever started first would answer the other's calls.
+    #[test]
+    fn the_three_pipes_do_not_share_a_name() {
+        let names = [server_pipe_base(), ui_pipe_base(), plugin_pipe_base()];
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+
+        assert_eq!(unique.len(), names.len(), "{names:?}");
     }
 
     /// A status the server produced is an answer, not a transport failure:
