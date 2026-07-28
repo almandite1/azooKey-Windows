@@ -238,8 +238,11 @@ async fn a_day_reading_gains_the_calendar_date() {
         .iter()
         .find(|s| s.text == expected)
         .unwrap_or_else(|| {
-            let candidates: Vec<&str> =
-                composing.suggestions.iter().map(|s| s.text.as_str()).collect();
+            let candidates: Vec<&str> = composing
+                .suggestions
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect();
             panic!("{expected} should be among the candidates for きょう, got {candidates:?}")
         });
 

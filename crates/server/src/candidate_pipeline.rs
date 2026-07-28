@@ -23,10 +23,14 @@ pub(crate) enum CandidateStage {
     Dedup,
 }
 
-/// The fixed order every candidate list goes through. Dedup runs LAST so
-/// that a stage which adds a candidate the engine already proposed does
-/// not have to check for that itself.
-const STAGES: &[CandidateStage] = &[CandidateStage::CalendarDate, CandidateStage::Dedup];
+/// The fixed order every candidate list goes through.
+///
+/// Dedup runs FIRST, and that is load-bearing rather than tidy: a rank
+/// means a position in the list the user actually sees, and the engine's
+/// raw list repeats itself near the top. Inserting at index 4 before
+/// deduplicating put the date at index 2 on a live engine — the rank was
+/// measured against rows that were about to be removed.
+const STAGES: &[CandidateStage] = &[CandidateStage::Dedup, CandidateStage::CalendarDate];
 
 /// Everything a stage may need besides the candidate list.
 ///
@@ -69,6 +73,57 @@ fn run_with(input: &StageInput, candidates: Vec<Suggestion>) -> Vec<Suggestion> 
     })
 }
 
+/// Where a candidate the pipeline INVENTED goes in the list.
+///
+/// The candidate window shows five at a time and pages by five
+/// (`MAX_VISIBLE_CANDIDATES` in crates/ui/assets/candidate.js), so index 4
+/// is the last slot a user sees without paging. Appending instead put the
+/// date at position 331 of 334 for きょう — correct, and unreachable.
+///
+/// Revisit this if the window's page size changes; the two numbers are
+/// related by "the last visible slot", not by coincidence.
+const ADDED_CANDIDATE_RANK: usize = 4;
+
+/// How many invented candidates the pipeline will place, in total, per
+/// list. A bound on how far the engine's own ranking can be pushed down,
+/// and the number a plugin must not be able to raise (see the policy note
+/// on `insert_added`).
+const MAX_ADDED_CANDIDATES: usize = 3;
+
+/// Places candidates that no conversion produced.
+///
+/// THE POLICY, which stages and (later) plugins do not get a say in:
+///
+/// - index 0 is never displaced. It is what Enter commits, so moving it
+///   would change what typing does — the one thing none of this may do.
+///   With a non-empty list the clamp below cannot reach 0.
+/// - everything else added goes at one fixed rank, decided here. A stage
+///   that could ask for a rank would be a stage that competes with the
+///   next stage for the top of the list, and the user would arbitrate a
+///   fight they never asked to have.
+/// - at most `MAX_ADDED_CANDIDATES` survive, so the bound holds however
+///   many stages want in.
+/// - a text the list already carries is not added again. Deduplicating
+///   here rather than in a later Dedup pass is what lets the rank be
+///   honest: the engine's own list is already deduplicated by the time
+///   anything is placed into it.
+///
+/// The rank is clamped to the list, so a short list appends rather than
+/// leaving a gap.
+fn insert_added(mut candidates: Vec<Suggestion>, added: Vec<Suggestion>) -> Vec<Suggestion> {
+    let existing: std::collections::HashSet<&str> =
+        candidates.iter().map(|c| c.text.as_str()).collect();
+    let fresh: Vec<Suggestion> = added
+        .into_iter()
+        .filter(|c| !existing.contains(c.text.as_str()))
+        .take(MAX_ADDED_CANDIDATES)
+        .collect();
+
+    let at = ADDED_CANDIDATE_RANK.min(candidates.len());
+    candidates.splice(at..at, fresh);
+    candidates
+}
+
 /// Readings that name a day, and how far that day is from today. Only an
 /// exact whole-reading match counts: "きょうは" is the start of a sentence,
 /// not a request for the date, and matching a prefix would also leave the
@@ -82,10 +137,10 @@ const DAY_READINGS: &[(&str, i64)] = &[
     ("おととい", -2),
 ];
 
-/// Appends the calendar date as extra candidates when the whole reading
-/// names a day. Appended, never inserted at the top: a stage that
-/// displaced the engine's best guess would change what Enter commits.
-fn calendar_date(input: &StageInput, mut candidates: Vec<Suggestion>) -> Vec<Suggestion> {
+/// Offers the calendar date as extra candidates when the whole reading
+/// names a day. Where they land is `insert_added`'s decision, not this
+/// stage's.
+fn calendar_date(input: &StageInput, candidates: Vec<Suggestion>) -> Vec<Suggestion> {
     let Some((_, offset)) = DAY_READINGS.iter().find(|(r, _)| *r == input.reading) else {
         return candidates;
     };
@@ -112,13 +167,16 @@ fn calendar_date(input: &StageInput, mut candidates: Vec<Suggestion>) -> Vec<Sug
         return candidates;
     };
 
-    candidates.extend(formatted_dates(date).into_iter().map(|text| Suggestion {
-        text,
-        subtext: "日付".to_string(),
-        corresponding_count,
-        surface_count,
-    }));
-    candidates
+    let dates = formatted_dates(date)
+        .into_iter()
+        .map(|text| Suggestion {
+            text,
+            subtext: "日付".to_string(),
+            corresponding_count,
+            surface_count,
+        })
+        .collect();
+    insert_added(candidates, dates)
 }
 
 fn formatted_dates(date: NaiveDate) -> Vec<String> {
@@ -348,8 +406,113 @@ mod tests {
         assert_eq!(texts(&out), ["記者"]);
     }
 
-    /// Dedup runs after this stage precisely so the date stage does not
-    /// have to know what the engine already offered.
+    /// The placement rule, on a list long enough for it to bite: the
+    /// engine keeps the first four slots and the dates take the last
+    /// visible one. Appending instead is what put the date at 331 of 334
+    /// for きょう on a live engine — right, and out of reach.
+    #[test]
+    fn added_candidates_land_on_the_last_visible_slot() {
+        let engine: Vec<Suggestion> = ["きょう", "今日", "境", "教", "橋", "京", "卿"]
+            .iter()
+            .map(|t| spanning(t, 4, 3))
+            .collect();
+
+        let out = run_on("きょう", date(2026, 7, 29), engine);
+
+        assert_eq!(
+            texts(&out),
+            [
+                "きょう",
+                "今日",
+                "境",
+                "教",
+                "2026/07/29",
+                "2026年7月29日",
+                "令和8年7月29日",
+                "橋",
+                "京",
+                "卿"
+            ]
+        );
+    }
+
+    /// Found on a live engine: its raw list repeats itself near the top,
+    /// so placing at index 4 and deduplicating afterwards landed the date
+    /// at index 2. The rank has to be measured against the list the user
+    /// is shown, which is why Dedup runs before the stages that add.
+    #[test]
+    fn the_rank_counts_rows_that_survive_dedup() {
+        let engine: Vec<Suggestion> = ["きょう", "きょう", "今日", "今日", "境", "教", "橋"]
+            .iter()
+            .map(|t| spanning(t, 4, 3))
+            .collect();
+
+        let out = run_on("きょう", date(2026, 7, 29), engine);
+
+        assert_eq!(
+            texts(&out),
+            [
+                "きょう",
+                "今日",
+                "境",
+                "教",
+                "2026/07/29",
+                "2026年7月29日",
+                "令和8年7月29日",
+                "橋"
+            ]
+        );
+    }
+
+    /// The invariant everything else is arranged around.
+    #[test]
+    fn the_top_candidate_is_never_displaced() {
+        for engine_len in 1..8 {
+            let engine: Vec<Suggestion> = (0..engine_len)
+                .map(|i| spanning(&format!("候補{i}"), 4, 3))
+                .collect();
+
+            let out = run_on("きょう", date(2026, 7, 29), engine);
+
+            assert_eq!(out[0].text, "候補0", "list of {engine_len}");
+        }
+    }
+
+    /// A list shorter than the rank appends rather than leaving a gap.
+    #[test]
+    fn a_short_list_appends() {
+        let out = run_on("きょう", date(2026, 7, 29), vec![spanning("今日", 4, 3)]);
+
+        assert_eq!(
+            texts(&out),
+            ["今日", "2026/07/29", "2026年7月29日", "令和8年7月29日"]
+        );
+    }
+
+    /// The bound is on the pipeline, not on the stage that wants in: a
+    /// stage offering more than the cap gets the cap, so no future stage
+    /// (or plugin) can push the engine's ranking further down by asking.
+    #[test]
+    fn no_more_than_the_cap_is_placed() {
+        let engine: Vec<Suggestion> = (0..6)
+            .map(|i| spanning(&format!("候補{i}"), 4, 3))
+            .collect();
+        let added: Vec<Suggestion> = (0..5)
+            .map(|i| spanning(&format!("追加{i}"), 4, 3))
+            .collect();
+
+        let out = super::insert_added(engine, added);
+
+        assert_eq!(
+            texts(&out),
+            [
+                "候補0", "候補1", "候補2", "候補3", "追加0", "追加1", "追加2", "候補4", "候補5"
+            ]
+        );
+    }
+
+    /// The placement helper drops what the list already carries, so the
+    /// date stage does not have to know what the engine offered.
     #[test]
     fn a_date_the_engine_already_proposed_is_not_duplicated() {
         let out = run_on(
