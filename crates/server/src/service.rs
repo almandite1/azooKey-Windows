@@ -10,6 +10,7 @@ use shared::proto::{
     ShrinkTextRequest, ShrinkTextResponse,
 };
 
+use crate::candidate_pipeline;
 use crate::session::session_of;
 use crate::wrappers::{
     RawComposingText, add_text, clear_text, get_composed_text, load_config, move_cursor,
@@ -30,11 +31,15 @@ pub struct MyAzookeyService;
 const MAX_REMOVE_TEXT_COUNT: i32 = 512;
 
 /// Builds the ComposingText payload every composing-text RPC returns: the
-/// current hiragana plus a fresh candidate fetch for the session.
+/// current hiragana plus a fresh candidate fetch for the session, run
+/// through the candidate pipeline. Every RPC that returns candidates goes
+/// through here, so the pipeline hook lives in this one place.
 fn composed(session: i64, composing_text: RawComposingText) -> ComposingText {
+    let hiragana = composing_text.text;
+    let suggestions = candidate_pipeline::run(&hiragana, get_composed_text(session));
     ComposingText {
-        hiragana: composing_text.text,
-        suggestions: get_composed_text(session),
+        hiragana,
+        suggestions,
     }
 }
 
