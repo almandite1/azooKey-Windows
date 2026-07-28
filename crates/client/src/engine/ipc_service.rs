@@ -172,6 +172,74 @@ impl From<shared::proto::ComposingText> for Candidates {
     }
 }
 
+/// One update to what the candidate window shows.
+///
+/// Every field is optional and `None` means "leave it as it is" — which is
+/// what lets the list, the highlight and the caret position travel together
+/// or separately over the same RPC. The distinction matters most for the
+/// list: moving the highlight must NOT resend the candidates, and an empty
+/// list (`Some(vec![])`, the blank a composition ends with) is not the same
+/// thing as not touching the list at all.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CandidateView {
+    pub candidates: Option<Vec<String>>,
+    pub selection: Option<i32>,
+    /// The caret rect, as (top, left, bottom, right).
+    pub position: Option<(i32, i32, i32, i32)>,
+}
+
+impl CandidateView {
+    /// A fresh list with the highlight that goes with it — the keystroke
+    /// path, and the reason this type exists.
+    pub fn list_and_selection(candidates: Vec<String>, selection: i32) -> Self {
+        Self {
+            candidates: Some(candidates),
+            selection: Some(selection),
+            position: None,
+        }
+    }
+
+    /// The highlight alone (the arrow keys). The list is deliberately left
+    /// out: resending it on every arrow press is the traffic this replaced.
+    pub fn selection(selection: i32) -> Self {
+        Self {
+            selection: Some(selection),
+            ..Self::default()
+        }
+    }
+
+    pub fn list(candidates: Vec<String>) -> Self {
+        Self {
+            candidates: Some(candidates),
+            ..Self::default()
+        }
+    }
+
+    pub fn at(top: i32, left: i32, bottom: i32, right: i32) -> Self {
+        Self {
+            position: Some((top, left, bottom, right)),
+            ..Self::default()
+        }
+    }
+
+    fn into_request(self) -> shared::proto::UpdateCandidateViewRequest {
+        shared::proto::UpdateCandidateViewRequest {
+            candidates: self
+                .candidates
+                .map(|texts| shared::proto::CandidateList { texts }),
+            selection: self.selection,
+            position: self.position.map(|(top, left, bottom, right)| {
+                shared::proto::WindowPosition {
+                    top,
+                    left,
+                    bottom,
+                    right,
+                }
+            }),
+        }
+    }
+}
+
 /// Unwraps the `composing_text` an engine RPC answers with into `Candidates`.
 /// A `None` is a protocol error — the caller always sent text to convert, so
 /// the server owed a reading back — and becomes an ordinary error rather than
@@ -327,9 +395,7 @@ pub enum IpcCall {
     SetContext(String),
     ShowWindow,
     HideWindow,
-    SetWindowPosition,
-    SetCandidates(Vec<String>),
-    SetSelection(i32),
+    UpdateCandidateView(CandidateView),
     SetInputMode(String),
 }
 
@@ -545,21 +611,13 @@ window_rpcs! {
         hide_window: shared::proto::EmptyResponse {},
     }
 
-    fn set_window_position(top: i32, left: i32, bottom: i32, right: i32) {
-        record: IpcCall::SetWindowPosition,
-        set_window_position: shared::proto::SetPositionRequest {
-            position: Some(shared::proto::WindowPosition { top, left, bottom, right }),
-        },
-    }
-
-    fn set_candidates(candidates: Vec<String>) {
-        record: IpcCall::SetCandidates(candidates.clone()),
-        set_candidate: shared::proto::SetCandidateRequest { candidates },
-    }
-
-    fn set_selection(index: i32) {
-        record: IpcCall::SetSelection(index),
-        set_selection: shared::proto::SetSelectionRequest { index },
+    /// The one candidate-window content RPC. Everything the window draws goes
+    /// through it, so a keystroke costs one round trip instead of the two the
+    /// separate list and selection calls used to cost — each of them charged
+    /// to the host application's UI thread, which blocks on them.
+    fn update_candidate_view(view: CandidateView) {
+        record: IpcCall::UpdateCandidateView(view.clone()),
+        update_candidate_view: view.into_request(),
     }
 
     /// `String`, not `&str`: the request is built inside an `async move`
@@ -567,6 +625,23 @@ window_rpcs! {
     fn set_input_mode(mode: String) {
         record: IpcCall::SetInputMode(mode.clone()),
         set_input_mode: shared::proto::SetInputModeRequest { mode },
+    }
+}
+
+/// The three thin wrappers over [`IPCService::update_candidate_view`] for
+/// callers that only ever change one part of the view.
+///
+/// `set_window_position` in particular: the caret position has a cadence of
+/// its own (throttled, off the keystroke path — see `UpdatePosState`), and
+/// keeping the name means the edit session that reports it did not have to
+/// learn about the combined RPC.
+impl IPCService {
+    pub fn set_window_position(&self, top: i32, left: i32, bottom: i32, right: i32) {
+        self.update_candidate_view(CandidateView::at(top, left, bottom, right));
+    }
+
+    pub fn set_candidates(&self, candidates: Vec<String>) {
+        self.update_candidate_view(CandidateView::list(candidates));
     }
 }
 

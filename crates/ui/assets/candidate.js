@@ -2,11 +2,25 @@
 // (`li::before { content: counter(number) }`), so it is not real text and a
 // screen reader cannot see it. aria-posinset/aria-setsize carry the same
 // information in a form assistive technology can read.
+//
+// Every write is guarded by a read: a reused row usually keeps the same index
+// and the same set size, and setting an attribute to the value it already has
+// still dirties the element. That is the whole cost of the redraw at typing
+// speed, so the guards are the optimization, not micro-tidiness.
+function setAttributeIfChanged(element, name, value) {
+    if (element.getAttribute(name) !== value) {
+        element.setAttribute(name, value);
+    }
+}
+
 function describeCandidate(li, index, total) {
-    li.id = `candidate-${index}`;
-    li.setAttribute('role', 'option');
-    li.setAttribute('aria-posinset', String(index + 1));
-    li.setAttribute('aria-setsize', String(total));
+    const id = `candidate-${index}`;
+    if (li.id !== id) {
+        li.id = id;
+    }
+    setAttributeIfChanged(li, 'role', 'option');
+    setAttributeIfChanged(li, 'aria-posinset', String(index + 1));
+    setAttributeIfChanged(li, 'aria-setsize', String(total));
     if (!li.hasAttribute('aria-selected')) {
         li.setAttribute('aria-selected', 'false');
     }
@@ -27,7 +41,11 @@ function setCandidateText(li, text) {
         label = document.createElement('span');
         li.appendChild(label);
     }
-    label.textContent = text;
+    // the common case while typing: the row above the one that changed still
+    // holds the same candidate, and rewriting it would relayout for nothing
+    if (label.textContent !== text) {
+        label.textContent = text;
+    }
 }
 
 function updateCandidates(candidates) {
@@ -52,6 +70,23 @@ function updateCandidates(candidates) {
     }
 
     resizeToCandidates(candidates.length);
+}
+
+// The one entry point ui.exe calls. Both halves of an update arrive together
+// (see UpdateCandidateViewRequest in window.proto), so they are applied in one
+// script evaluation and the page lays out once per keystroke instead of twice.
+//
+// An ABSENT field means "unchanged" — the highlight moves through a list the
+// page already has, and rebuilding that list on every arrow key is what this
+// replaced. An empty array is not absent: it is the blank a composition ends
+// with.
+function applyUpdate(update) {
+    if (Array.isArray(update.candidates)) {
+        updateCandidates(update.candidates);
+    }
+    if (typeof update.selection === 'number') {
+        updateSelection(update.selection);
+    }
 }
 
 function updateSelection(index) {
@@ -147,11 +182,22 @@ function postHeight(rows) {
 // composition ends (the TIP blanks the list right after hiding the window),
 // and collapsing to a chrome-only sliver there would only be visible as a
 // flicker on the way into the NEXT composition.
+//
+// A list of the same length is the same height, so the measurement and the
+// round trip through ui.exe are skipped: at typing speed most updates replace
+// the candidates without changing how many there are.
+let lastPostedRows = null;
+
 function resizeToCandidates(count) {
     if (count === 0) {
         return;
     }
-    postHeight(Math.min(count, MAX_VISIBLE_CANDIDATES));
+    const rows = Math.min(count, MAX_VISIBLE_CANDIDATES);
+    if (rows === lastPostedRows) {
+        return;
+    }
+    lastPostedRows = rows;
+    postHeight(rows);
 }
 
 // Long enough for the stylesheet to have been applied — measuring before it
@@ -164,5 +210,8 @@ window.addEventListener('DOMContentLoaded', () => {
     // very first Show until the webview has reported a height (issue #59), so
     // this is what releases it. Full height, since the list it will hold is
     // not known yet; the first updateCandidates corrects it.
-    setTimeout(() => postHeight(MAX_VISIBLE_CANDIDATES), FIRST_MEASUREMENT_DELAY_MS);
+    setTimeout(() => {
+        lastPostedRows = MAX_VISIBLE_CANDIDATES;
+        postHeight(MAX_VISIBLE_CANDIDATES);
+    }, FIRST_MEASUREMENT_DELAY_MS);
 });

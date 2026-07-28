@@ -10,23 +10,32 @@ message WindowPosition {
   int32 right = 4;
 }
 
-// 候補ウィンドウの位置設定メッセージ
-message SetPositionRequest {
-  WindowPosition position = 1; // 設定するウィンドウの位置
-}
-
-// 変換候補を送るメッセージ
-message SetCandidateRequest {
-  repeated string candidates = 1;
-}
-
-// 変換候補を選択するメッセージ
-message SetSelectionRequest {
-  int32 index = 1;
+// 変換候補の一覧。
+//
+// UpdateCandidateView で「一覧は据え置き」と「一覧は空」を区別するためだけに
+// 存在する包み。repeated を直接持たせると空リストと未指定が同じ表現になり、
+// 選択だけを動かす更新でも候補全体を送り直すしかなくなる。
+message CandidateList {
+  repeated string texts = 1;
 }
 
 message SetInputModeRequest {
   string mode = 1;
+}
+
+// 候補ウィンドウの表示内容をまとめて更新するメッセージ。
+//
+// SetCandidate / SetSelection / SetWindowPosition を 1 本に置き換えたもの。
+// 1 打鍵ごとに候補と選択を別々の RPC で送っていたため、ホストアプリの UI
+// スレッドが打鍵あたり 2 回ブロックし（各 300ms のデッドライン）、UI 側も
+// RPC ごとに別のスクリプト評価と別のレイアウトパスを回していた。
+//
+// 3 つのフィールドはすべて任意で、presence が「変更あり」を意味する。
+// 省略されたものは今の表示のまま。
+message UpdateCandidateViewRequest {
+  CandidateList candidates = 1;
+  optional int32 selection = 2;
+  WindowPosition position = 3;
 }
 
 // 候補ウィンドウ制御に対する空のレスポンス
@@ -36,8 +45,7 @@ message EmptyResponse {}
 service WindowService {
   rpc ShowWindow (EmptyResponse) returns (EmptyResponse); // ウィンドウを表示
   rpc HideWindow (EmptyResponse) returns (EmptyResponse); // ウィンドウを非表示
-  rpc SetCandidate (SetCandidateRequest) returns (EmptyResponse); // 候補の設定
-  rpc SetSelection (SetSelectionRequest) returns (EmptyResponse); // 変換候補を選択
-  rpc SetWindowPosition (SetPositionRequest) returns (EmptyResponse); // ウィンドウの位置を設定
+  // 候補・選択・位置の更新（省略したものは据え置き）
+  rpc UpdateCandidateView (UpdateCandidateViewRequest) returns (EmptyResponse);
   rpc SetInputMode (SetInputModeRequest) returns (EmptyResponse); // 変換モードの設定
 }

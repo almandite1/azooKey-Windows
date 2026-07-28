@@ -16,6 +16,7 @@ use crate::UserEvent;
 use crate::geometry::{self, CaretRect};
 use crate::ipc::WindowAction;
 use crate::placement::{CandidatePlacement, ShowDecision};
+use crate::webview;
 use crate::window::{is_visible, notify_ime_event, pin_topmost, set_visibility};
 use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_IME_CHANGE, EVENT_OBJECT_IME_HIDE, EVENT_OBJECT_IME_SHOW,
@@ -106,8 +107,8 @@ pub fn hide_candidate(candidate_window: &Window) {
 /// Announces a content/position change, but only while the window is visible.
 ///
 /// The guard is the point: ending a composition sends `hide_window()` and
-/// then `set_candidates(vec![])`, so without it a CHANGE was announced on a
-/// window that had just been hidden.
+/// then an update with an empty list, so without it a CHANGE was announced on
+/// a window that had just been hidden.
 fn notify_change_if_visible(candidate_window: &Window) {
     if is_visible(candidate_window.hwnd()) {
         notify_ime_event(candidate_window.hwnd(), EVENT_OBJECT_IME_CHANGE);
@@ -158,73 +159,80 @@ pub fn handle_window_action(
             placement.on_hide();
             hide_candidate(candidate_window);
         }
-        WindowAction::SetPosition {
-            top,
-            left,
-            bottom,
-            right,
+        // One update, applied in the order the placement invariants need:
+        // position, then the list, then the highlight.
+        //
+        // Position first because it is what releases a deferred `Show`
+        // (issue #59) and what later resizes re-clamp against (issue #3):
+        // sizing the window for a new list before the caret it belongs to had
+        // arrived would clamp it against the previous composition's rect. The
+        // highlight comes last because it scrolls the list it is moving
+        // through, which has to exist first.
+        WindowAction::Update {
+            position,
+            candidates,
+            selection,
         } => {
-            let caret = CaretRect {
-                top,
-                left,
-                bottom,
-                right,
-            };
-            // remembered so later RESIZES (SetCandidate width, UpdateHeight,
-            // DPI changes) can re-clamp against the same caret (issue #3),
-            // and marked fresh so a Show may now be honoured (issue #59)
-            let release_deferred_show = placement.on_position(caret);
+            if let Some(caret) = position {
+                // remembered so later RESIZES (a wider list, UpdateHeight, DPI
+                // changes) can re-clamp against the same caret (issue #3),
+                // and marked fresh so a Show may now be honoured (issue #59)
+                let release_deferred_show = placement.on_position(caret);
 
-            pin_topmost(candidate_window.hwnd());
-            pin_topmost(indicator_hwnd);
+                pin_topmost(candidate_window.hwnd());
+                pin_topmost(indicator_hwnd);
 
-            let size = candidate_window.inner_size();
-            reposition_candidate(
-                candidate_window,
-                &placement.caret,
-                size.width as i32,
-                size.height as i32,
-            );
-            // clamp the indicator into the work area too — it used to hang
-            // off-screen near screen edges (B20)
-            let indicator_size = indicator_window.inner_size();
-            let (ix, iy) = geometry::get_indicator_position(
-                &caret,
-                indicator_size.width as i32,
-                indicator_size.height as i32,
-            );
-            indicator_window.set_outer_position(PhysicalPosition::new(ix, iy));
+                let size = candidate_window.inner_size();
+                reposition_candidate(
+                    candidate_window,
+                    &placement.caret,
+                    size.width as i32,
+                    size.height as i32,
+                );
+                // clamp the indicator into the work area too — it used to hang
+                // off-screen near screen edges (B20)
+                let indicator_size = indicator_window.inner_size();
+                let (ix, iy) = geometry::get_indicator_position(
+                    &caret,
+                    indicator_size.width as i32,
+                    indicator_size.height as i32,
+                );
+                indicator_window.set_outer_position(PhysicalPosition::new(ix, iy));
 
-            // the window is placed now, so a Show that was waiting on this
-            // position can finally be honoured (issue #59)
-            if release_deferred_show {
-                show_candidate(candidate_window);
+                // the window is placed now, so a Show that was waiting on this
+                // position can finally be honoured (issue #59)
+                if release_deferred_show {
+                    show_candidate(candidate_window);
+                }
             }
 
-            notify_change_if_visible(candidate_window);
-        }
-        WindowAction::SetCandidate { candidates } => {
-            let max_len = geometry::max_candidate_chars(&candidates);
-            resize_candidate(
-                candidate_window,
-                Some(geometry::candidate_window_logical_width(max_len) as f64),
-                None,
-                &placement.caret,
-            );
+            if let Some(candidates) = &candidates {
+                let max_len = geometry::max_candidate_chars(candidates);
+                resize_candidate(
+                    candidate_window,
+                    Some(geometry::candidate_window_logical_width(max_len) as f64),
+                    None,
+                    &placement.caret,
+                );
+            }
 
-            // Vec<String> serialization cannot fail; fall back to an empty
-            // list rather than crash the UI
-            let candidates =
-                serde_json::to_string(&candidates).unwrap_or_else(|_| "[]".to_string());
+            // Both halves in ONE script evaluation, so the webview lays out
+            // once for a keystroke instead of once per RPC. The window has
+            // already been resized here; the contents land asynchronously once
+            // the webview runs the script.
+            if candidates.is_some() || selection.is_some() {
+                let payload = webview::candidate_update_json(candidates.as_deref(), selection);
+                let _ = proxy.send_event(UserEvent::ApplyCandidateUpdate(payload));
+            }
 
-            let _ = proxy.send_event(UserEvent::UpdateCandidates(candidates));
-
-            // The window has already been resized here; the list contents
-            // land asynchronously once the webview runs the script.
-            notify_change_if_visible(candidate_window);
-        }
-        WindowAction::SetSelection { index } => {
-            let _ = proxy.send_event(UserEvent::UpdateSelection(index));
+            // A moved highlight is deliberately NOT announced, exactly as it
+            // was not when it had an RPC of its own: the arrow keys walk a
+            // list the shell has already been told about, and announcing every
+            // step buried the transitions that matter. A new list or a new
+            // position still is one.
+            if position.is_some() || candidates.is_some() {
+                notify_change_if_visible(candidate_window);
+            }
         }
         WindowAction::SetInputMode(input_method) => {
             let _ = proxy.send_event(UserEvent::UpdateInputMethod(input_method));
