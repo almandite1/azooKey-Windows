@@ -31,6 +31,9 @@
 > セキュリティソフトによっては、IMEのDLLがブラウザなどの保護されたプロセスに
 > 読み込まれるのをブロックすることがあります。
 
+各リリースには、同梱物の一覧（SBOM）が`azookey-<version>.cdx.json` / `.spdx.json`として添付されています。
+詳細は[SECURITY.md](SECURITY.md#what-is-in-a-release)を参照してください。
+
 # 機能
 
 - [x] ライブ変換

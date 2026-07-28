@@ -1,0 +1,124 @@
+{
+  "_comment": [
+    "Everything that ships in azookey-setup.exe without a manifest to declare it,",
+    "plus the licenses no cataloguer can read off Package.resolved.",
+    "Consumed by scripts/generate_supplemental_sbom.py; see its docstring.",
+    "",
+    "Rule for the entries below: nothing here is taken on trust when the workflow",
+    "already states it. Every 'verify' block is checked against",
+    ".github/workflows/actions.yml before a single component is emitted, and a",
+    "checksum the workflow pins that no entry claims fails the build too. Bumping",
+    "a download therefore means editing both files, which is the point."
+  ],
+
+  "swift_licenses": {
+    "_comment": [
+      "Keyed by the pin identity in server-swift/Package.resolved. Package.resolved",
+      "records no license, so these come from the upstream repositories and are the",
+      "one part of this file with no automatic cross-check. Re-read the upstream",
+      "LICENSE when a pin moves to a new major version."
+    ],
+    "azookeykanakanjiconverter": "MIT",
+    "jinja": "Apache-2.0",
+    "swift-algorithms": "Apache-2.0",
+    "swift-collections": "Apache-2.0",
+    "swift-numerics": "Apache-2.0",
+    "swift-tokenizers": "Apache-2.0"
+  },
+
+  "submodules": {
+    "_comment": [
+      "Keyed by the path in .gitmodules. The version in the SBOM is the commit the",
+      "superproject records, which is what post_build copies into build/."
+    ],
+    "server-swift/azooKey_dictionary_storage": {
+      "kind": "data",
+      "license": null,
+      "bundled-as": "Dictionary/",
+      "description": "azooKey conversion dictionary. The upstream repository carries no LICENSE file, hence NOASSERTION."
+    },
+    "server-swift/azooKey_emoji_dictionary_storage": {
+      "kind": "data",
+      "license": null,
+      "bundled-as": "EmojiDictionary/",
+      "description": "azooKey emoji dictionary. The upstream repository carries no LICENSE file, hence NOASSERTION."
+    }
+  },
+
+  "_comment_unclaimed_workflow_sha256_env": [
+    "Checksums the workflow pins for things that do NOT ship, and so have no",
+    "component below. Inno Setup compiles the installer; it is not inside it."
+  ],
+  "unclaimed_workflow_sha256_env": ["INNOSETUP_SHA256", "SBOM_UTILITY_SHA256"],
+
+  "bundled": [
+    {
+      "name": "llama.cpp (AVX CPU backend)",
+      "version": "b4846",
+      "type": "library",
+      "purl": "pkg:github/fkunn1326/llama.cpp@b4846?file_name=llama-b4846-bin-win-avx-x64.zip",
+      "license": "MIT",
+      "supplier": "fkunn1326",
+      "description": "Prebuilt llama.cpp from the fork azooKey for Windows links against; provides llama.dll for Zenzai inference. Also the source of server-swift/llama.lib.",
+      "url": "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip",
+      "vcs": "https://github.com/fkunn1326/llama.cpp",
+      "sha256": "AF34E4DFC7154DF650ED705421F26B3A56C685F2E35ABFDD6DF0CC0CB5C4B259",
+      "bundled-as": "llama_cpu/",
+      "verify": { "sha256_from_workflow_env": "LLAMA_CPU_SHA256" }
+    },
+    {
+      "name": "llama.cpp (CUDA 12.4 backend)",
+      "version": "b4846",
+      "type": "library",
+      "purl": "pkg:github/fkunn1326/llama.cpp@b4846?file_name=llama-b4846-bin-win-cuda-cu12.4-x64.zip",
+      "license": "MIT",
+      "supplier": "fkunn1326",
+      "description": "Prebuilt llama.cpp with CUDA acceleration, selected by the Zenzai backend setting.",
+      "url": "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-cuda-cu12.4-x64.zip",
+      "vcs": "https://github.com/fkunn1326/llama.cpp",
+      "sha256": "5307B89AAE1F076E031D6AAB95E63DF5CB96B8D3B1FA7828F412E283A0663019",
+      "bundled-as": "llama_cuda/",
+      "verify": { "sha256_from_workflow_env": "LLAMA_CUDA_SHA256" }
+    },
+    {
+      "name": "llama.cpp (Vulkan backend)",
+      "version": "b4846",
+      "type": "library",
+      "purl": "pkg:github/fkunn1326/llama.cpp@b4846?file_name=llama-b4846-bin-win-vulkan-x64.zip",
+      "license": "MIT",
+      "supplier": "fkunn1326",
+      "description": "Prebuilt llama.cpp with Vulkan acceleration, selected by the Zenzai backend setting.",
+      "url": "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-vulkan-x64.zip",
+      "vcs": "https://github.com/fkunn1326/llama.cpp",
+      "sha256": "ED1B7E6AA70CDB2A93EAAAD8586539DCE83F4FA8A44F4DDEE5A1AB09FFB1189B",
+      "bundled-as": "llama_vulkan/",
+      "verify": { "sha256_from_workflow_env": "LLAMA_VULKAN_SHA256" }
+    },
+    {
+      "name": "zenz-v3.2-small-gguf",
+      "version": "v3.2-small (Q5_K_M)",
+      "type": "machine-learning-model",
+      "purl": "pkg:huggingface/Miwa-Keita/zenz-v3.2-small-gguf?file_name=ggml-model-Q5_K_M.gguf",
+      "license": "Apache-2.0",
+      "supplier": "Miwa-Keita",
+      "description": "The neural kana-kanji conversion model Zenzai runs, shipped as build/zenz.gguf. The purl carries no revision on purpose: the workflow fetches the file from the moving 'main' ref and pins it by the SHA256 below, so the checksum is what identifies these bytes.",
+      "url": "https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf",
+      "vcs": "https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf",
+      "sha256": "29C223D4C23327B80FD13EBB5AB2555057A46317997D5DA391584FFBEF0DB673",
+      "bundled-as": "zenz.gguf",
+      "verify": { "sha256_from_workflow_env": "ZENZ_SHA256" }
+    },
+    {
+      "name": "Swift runtime for Windows",
+      "version": "6.3.3",
+      "type": "library",
+      "purl": "pkg:github/swiftlang/swift@swift-6.3.3-RELEASE",
+      "license": "Apache-2.0 WITH Swift-exception",
+      "supplier": "Apple Inc.",
+      "description": "The Swift runtime DLLs (swiftCore.dll, dispatch.dll and the rest of usr/bin) that post_build copies out of the installed toolchain and the installer ships. No download of its own: the version is whatever toolchain the build used, which the workflow pins.",
+      "vcs": "https://github.com/swiftlang/swift",
+      "bundled-as": "*.dll next to the binaries",
+      "verify": { "version_from_workflow_regex": "swift-version:\\s*swift-([0-9][^-\\s]*)-release" }
+    }
+  ]
+}

@@ -154,6 +154,44 @@ if ($LASTEXITCODE -ne 0) { throw "e2e-vm-run.ps1 failed with exit code $LASTEXIT
 """
 args = ["${@}"]
 
+# The same SBOM CI attaches to a release, reproduced locally. Deliberately NOT
+# part of the `build` flow: it needs syft, which is not a build prerequisite,
+# and nothing in build/ depends on its output.
+#
+# Output goes to target/sbom/ rather than build/ because the installer packages
+# build/ wholesale -- an SBOM inside the artefact it describes is a loop nobody
+# asked for.
+[tasks.sbom]
+description = "Generate the release SBOM into target/sbom (needs syft on PATH)"
+script_runner = "powershell"
+script_extension = "ps1"
+script = """
+$ErrorActionPreference = "Stop"
+
+if ($null -eq (Get-Command syft -ErrorAction SilentlyContinue)) {
+    throw "syft is not on PATH. CI installs it via anchore/sbom-action; " +
+          "locally, get it from https://github.com/anchore/syft/releases and " +
+          "put syft.exe on PATH."
+}
+
+$match = Select-String -Path "Cargo.toml" -Pattern '^version\\s*=\\s*"([^"]+)"' | Select-Object -First 1
+if ($null -eq $match) { throw "workspace version not found in Cargo.toml" }
+$version = $match.Matches[0].Groups[1].Value
+
+New-Item -ItemType Directory -Force target/sbom | Out-Null
+$cdx = "target/sbom/azookey-$version.cdx.json"
+$spdx = "target/sbom/azookey-$version.spdx.json"
+
+# .syft.yaml is what keeps this from walking target/ and build/
+syft scan dir:. -c .syft.yaml -o "cyclonedx-json=$cdx" -o "spdx-json=$spdx"
+if ($LASTEXITCODE -ne 0) { throw "syft failed with exit code $LASTEXITCODE" }
+
+python scripts/generate_supplemental_sbom.py --merge $cdx --output $cdx
+if ($LASTEXITCODE -ne 0) { throw "generate_supplemental_sbom.py failed" }
+
+Write-Host "SBOM written to $cdx and $spdx"
+"""
+
 [tasks.build_tauri]
 description = "Build the Tauri settings app"
 script_runner = "@shell"

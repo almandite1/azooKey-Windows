@@ -1,0 +1,35 @@
+# syft's configuration for the SBOM step in .github/workflows/actions.yml.
+#
+# Only the exclusions matter here. syft catalogues from the lockfiles
+# (Cargo.lock, frontend/package-lock.json), so it never needs the trees those
+# lockfiles describe -- but it will happily walk them if allowed to, and on
+# this repository that means target/ (a restored Rust build cache, hundreds of
+# thousands of files) and build/ (the assembled runtime, models included).
+# Excluding them is the difference between a scan measured in seconds and one
+# measured in minutes, and it changes nothing in the result.
+#
+# The two dictionary submodules are NOT excluded even though they carry no
+# manifest: they are cheap to walk, and leaving them in means a future
+# manifest appearing there is picked up rather than silently skipped. They are
+# also listed by scripts/generate_supplemental_sbom.py, which is where their
+# entry actually comes from.
+exclude:
+  - ./target
+  - ./build
+  - ./frontend/node_modules
+  - ./.git
+  # the prebuilt llama backends and the Swift toolchain's own artefacts: a
+  # local build leaves these in the repository root, CI downloads them. They
+  # are described by hand in scripts/sbom_components.json, with the checksums
+  # the workflow verifies.
+  - ./llama_cpu
+  - ./llama_cuda
+  - ./llama_vulkan
+  - ./server-swift/.build
+  # the github-actions cataloger reads every workflow it finds, and the
+  # dictionary submodules ship workflows of their own. Those actions build
+  # somebody else's repository; they are not part of this product's supply
+  # chain and only make the list harder to read. Our own .github/workflows
+  # stays in scope.
+  - ./server-swift/azooKey_dictionary_storage/.github
+  - ./server-swift/azooKey_emoji_dictionary_storage/.github

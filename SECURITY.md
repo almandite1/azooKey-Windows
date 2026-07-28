@@ -46,6 +46,28 @@ Report privately, and please give the fix a chance to ship before publishing.
 If you would like credit in the release notes, say so — it will be given unless
 you ask otherwise.
 
+## What is in a release
+
+Every release carries a software bill of materials beside the installer:
+
+- `azookey-<version>.cdx.json` — CycloneDX. The complete list: the Rust and npm
+  dependencies, the Swift packages the conversion engine is built from, the two
+  dictionary submodules, and the binaries that ship without a manifest of their
+  own (the llama.cpp backends, the zenz model, the Swift runtime) with the
+  SHA256 of each download.
+- `azookey-<version>.spdx.json` — SPDX, for tooling that wants that format.
+  Rust and npm only; the CycloneDX file is the complete one, and says so in its
+  own metadata.
+
+Both feed a vulnerability scanner (`grype`, `osv-scanner`) directly. The
+WebView2 runtime and the Visual C++ redistributable are *not* listed: the
+installer fetches them from Microsoft at install time, so they are not part of
+what is distributed here.
+
+`gh api repos/almandite1/azooKey-Windows/dependency-graph/sbom` is a second,
+independent source, produced by GitHub from the lockfiles. It covers the Rust
+and npm halves only.
+
 ## Scope notes
 
 Some things that look like vulnerabilities in an IME are known properties of
