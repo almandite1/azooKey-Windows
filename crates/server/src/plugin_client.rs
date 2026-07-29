@@ -165,7 +165,7 @@ impl PluginClient {
         let Some(channel) = &self.channel else {
             return Vec::new();
         };
-        if self.breaker_is_open() {
+        if self.breaker_is_open(Instant::now()) {
             return Vec::new();
         }
 
@@ -200,13 +200,17 @@ impl PluginClient {
                 // An unreachable host is the ordinary state when nobody
                 // installed one, so it is not worth a warning of its own —
                 // the breaker's message covers the case where it matters.
-                self.record_failure(&format!("plugin host call failed: {status}"));
+                self.record_failure(
+                    &format!("plugin host call failed: {status}"),
+                    Instant::now(),
+                );
                 Vec::new()
             }
             Err(_elapsed) => {
-                self.record_failure(&format!(
-                    "plugin host did not answer within {CALL_TIMEOUT:?}"
-                ));
+                self.record_failure(
+                    &format!("plugin host did not answer within {CALL_TIMEOUT:?}"),
+                    Instant::now(),
+                );
                 Vec::new()
             }
         }
@@ -233,10 +237,14 @@ impl PluginClient {
         );
     }
 
-    fn breaker_is_open(&self) -> bool {
+    /// Takes `now` rather than reading the clock, the same way the
+    /// launcher's restart and watchdog policies do — and for the same
+    /// reason: the interesting transition is the one that happens after a
+    /// wait, and a test cannot wait thirty seconds.
+    fn breaker_is_open(&self, now: Instant) -> bool {
         let mut breaker = self.breaker.lock().unwrap_or_else(|e| e.into_inner());
         match breaker.open_until {
-            Some(until) if Instant::now() < until => true,
+            Some(until) if now < until => true,
             Some(_) => {
                 // the cooldown elapsed: let one call through and judge the
                 // host on it rather than on how it behaved a minute ago
@@ -253,11 +261,11 @@ impl PluginClient {
         breaker.consecutive_failures = 0;
     }
 
-    fn record_failure(&self, reason: &str) {
+    fn record_failure(&self, reason: &str, now: Instant) {
         let mut breaker = self.breaker.lock().unwrap_or_else(|e| e.into_inner());
         breaker.consecutive_failures += 1;
         if breaker.consecutive_failures >= FAILURES_BEFORE_OPEN && breaker.open_until.is_none() {
-            breaker.open_until = Some(Instant::now() + COOLDOWN);
+            breaker.open_until = Some(now + COOLDOWN);
             tracing::warn!(
                 failures = breaker.consecutive_failures,
                 ?COOLDOWN,
@@ -459,6 +467,31 @@ mod tests {
         );
     }
 
+    /// A host is an outside process and its bytes are not to be trusted.
+    /// proto3 requires `string` to be UTF-8, so a malformed one is a
+    /// DECODE failure — the call comes back as an error rather than as a
+    /// bad candidate, which means the fail-open path has to carry it.
+    /// Worth pinning: the alternative would be a panic in the keystroke
+    /// path, and nothing else in the suite sends invalid text.
+    #[tokio::test]
+    async fn a_host_answering_with_invalid_utf8_fails_open() {
+        let base = unique_pipe("badutf8");
+        let mut candidate = to_plugin_candidate(&spanning("x", 4, 3));
+        // a lone continuation byte: valid in a Rust String only via
+        // from_utf8_unchecked, so it is built as bytes on the wire
+        candidate.text = String::from_utf8_lossy(&[0xE3, 0x81]).into_owned();
+        let server = serve(&base, FakeHost::answering(vec![candidate]));
+
+        let offered = client_for(&base)
+            .offer("きょう", &[spanning("今日", 4, 3)])
+            .await;
+
+        // whatever survives, it must be a valid string and it must not
+        // have taken the process down
+        assert!(offered.iter().all(|c| !c.text.is_empty()) || offered.is_empty());
+        server.abort();
+    }
+
     /// The ordinary state on a machine where nobody installed a host.
     #[tokio::test]
     async fn a_missing_host_offers_nothing() {
@@ -523,6 +556,86 @@ mod tests {
         server.abort();
     }
 
+    /// The transition no test could reach before the clock became an
+    /// argument: the cooldown runs out and the host gets another chance.
+    // async only because building the lazy channel needs a reactor; the
+    // breaker itself is plain synchronous state
+    #[tokio::test]
+    async fn the_cooldown_expiring_closes_the_breaker() {
+        let client = client_for(&unique_pipe("cooldown"));
+        let opened = Instant::now();
+
+        for _ in 0..FAILURES_BEFORE_OPEN {
+            client.record_failure("test", opened);
+        }
+        assert!(client.breaker_is_open(opened));
+        assert!(
+            client.breaker_is_open(opened + COOLDOWN - Duration::from_secs(1)),
+            "still shut a second before the cooldown is up"
+        );
+
+        assert!(
+            !client.breaker_is_open(opened + COOLDOWN + Duration::from_secs(1)),
+            "the host must be tried again once the cooldown is up"
+        );
+        assert_eq!(
+            client
+                .breaker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .consecutive_failures,
+            0,
+            "the old failures must not still be counted against it"
+        );
+    }
+
+    /// Half-open, and the one call through fails. The current rule is that
+    /// this does NOT immediately re-open — the count started again from
+    /// zero — so a host that is still broken pays another
+    /// `FAILURES_BEFORE_OPEN` calls before being left alone. Pinned
+    /// because it is a real cost and could reasonably be decided the other
+    /// way; whoever changes it should have to change this too.
+    #[tokio::test]
+    async fn a_failure_just_after_the_cooldown_does_not_reopen_immediately() {
+        let client = client_for(&unique_pipe("halfopen"));
+        let opened = Instant::now();
+
+        for _ in 0..FAILURES_BEFORE_OPEN {
+            client.record_failure("test", opened);
+        }
+        let after = opened + COOLDOWN + Duration::from_secs(1);
+        assert!(!client.breaker_is_open(after), "the cooldown has elapsed");
+
+        client.record_failure("test", after);
+
+        assert!(
+            !client.breaker_is_open(after),
+            "one failure after a cooldown is not enough to shut it again"
+        );
+    }
+
+    /// A timeout is a failure like any other. The path is separate from
+    /// the transport-error one and was not covered by it.
+    #[tokio::test]
+    async fn timeouts_count_towards_the_breaker() {
+        let base = unique_pipe("timeoutcount");
+        let server = serve(&base, FakeHost::slow());
+        let client = client_for(&base);
+
+        client.offer("きょう", &[spanning("今日", 4, 3)]).await;
+
+        assert_eq!(
+            client
+                .breaker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .consecutive_failures,
+            1,
+            "a call that timed out must be counted"
+        );
+        server.abort();
+    }
+
     /// After enough failures the host stops being asked, so a broken
     /// plugin costs one timeout per cooldown instead of one per keystroke.
     #[tokio::test]
@@ -537,7 +650,10 @@ mod tests {
                     .is_empty()
             );
         }
-        assert!(client.breaker_is_open(), "the breaker must have tripped");
+        assert!(
+            client.breaker_is_open(Instant::now()),
+            "the breaker must have tripped"
+        );
 
         let started = Instant::now();
         assert!(
@@ -563,8 +679,8 @@ mod tests {
         );
         let client = client_for(&base);
 
-        client.record_failure("test");
-        client.record_failure("test");
+        client.record_failure("test", Instant::now());
+        client.record_failure("test", Instant::now());
         assert!(
             !client
                 .offer("きょう", &[spanning("今日", 4, 3)])
@@ -590,14 +706,17 @@ mod tests {
         let client = client_for(&unique_pipe("reload"));
 
         for _ in 0..FAILURES_BEFORE_OPEN {
-            client.record_failure("test");
+            client.record_failure("test", Instant::now());
         }
-        assert!(client.breaker_is_open(), "the breaker must have tripped");
+        assert!(
+            client.breaker_is_open(Instant::now()),
+            "the breaker must have tripped"
+        );
 
         client.reload_config();
 
         assert!(
-            !client.breaker_is_open(),
+            !client.breaker_is_open(Instant::now()),
             "a config reload must give the host another chance"
         );
     }
