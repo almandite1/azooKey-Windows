@@ -48,6 +48,34 @@ pub(crate) struct StageInput<'a> {
     /// thing here: nothing to add. That is what fail-open means in this
     /// file.
     pub(crate) offered: &'a [Suggestion],
+    /// Every (surface_count, corresponding_count) the ENGINE produced for
+    /// this reading, collected before anything was removed from the list.
+    ///
+    /// Before dedup, deliberately. The host is shown the list as the
+    /// engine ranked it, so it can copy a span from a row that dedup is
+    /// about to drop — same text, different span. Corroborating against
+    /// the deduplicated list would then refuse a span the engine really
+    /// did price, and the public contract ("copy the counts from a
+    /// candidate you were given") would be a promise the core does not
+    /// keep. Fail-open makes that harmless and invisible, which is worse.
+    priced_spans: std::collections::HashSet<(i32, i32)>,
+}
+
+impl<'a> StageInput<'a> {
+    pub(crate) fn new(
+        reading: &'a str,
+        offered: &'a [Suggestion],
+        engine: &[Suggestion],
+    ) -> StageInput<'a> {
+        StageInput {
+            reading,
+            offered,
+            priced_spans: engine
+                .iter()
+                .map(|c| (c.surface_count, c.corresponding_count))
+                .collect(),
+        }
+    }
 }
 
 /// Applies one stage.
@@ -92,7 +120,14 @@ const MAX_ADDED_CANDIDATES: usize = 3;
 ///
 /// - index 0 is never displaced. It is what Enter commits, so moving it
 ///   would change what typing does — the one thing none of this may do.
-///   With a non-empty list the clamp below cannot reach 0.
+///   With a non-empty list the clamp below cannot reach 0, and an EMPTY
+///   list is refused outright: an addition would land at index 0 and
+///   become what Enter commits, with nothing from the engine behind it.
+///   Today `admit` already refuses everything when the engine produced
+///   nothing (no span can be corroborated), so this rule changes no
+///   behaviour — which is exactly why it is written here rather than left
+///   as a side effect of a rule that lives somewhere else and could be
+///   relaxed on its own terms.
 /// - everything added goes at one fixed rank, decided here. A plugin that
 ///   could ask for a rank would compete with the next plugin for the top
 ///   of the list, and the user would arbitrate a fight they never asked to
@@ -111,6 +146,10 @@ const MAX_ADDED_CANDIDATES: usize = 3;
 /// The rank is clamped to the list, so a short list appends rather than
 /// leaving a gap.
 fn insert_added(mut candidates: Vec<Suggestion>, added: Vec<Suggestion>) -> Vec<Suggestion> {
+    if candidates.is_empty() {
+        return candidates;
+    }
+
     let mut seen: std::collections::HashSet<String> =
         candidates.iter().map(|c| c.text.clone()).collect();
     let fresh: Vec<Suggestion> = added
@@ -154,7 +193,11 @@ enum Refusal {
 /// not a range check but corroboration — some candidate the engine itself
 /// produced must claim exactly this span. A plugin can only offer text for
 /// a span the engine already priced.
-fn admit(candidate: &Suggestion, reading: &str, engine: &[Suggestion]) -> Result<(), Refusal> {
+fn admit(
+    candidate: &Suggestion,
+    reading: &str,
+    priced_spans: &std::collections::HashSet<(i32, i32)>,
+) -> Result<(), Refusal> {
     if candidate.text.is_empty() {
         return Err(Refusal::EmptyText);
     }
@@ -165,36 +208,55 @@ fn admit(candidate: &Suggestion, reading: &str, engine: &[Suggestion]) -> Result
     if candidate.corresponding_count < 0 {
         return Err(Refusal::NegativeCorrespondingCount);
     }
-    if !engine.iter().any(|c| {
-        c.surface_count == candidate.surface_count
-            && c.corresponding_count == candidate.corresponding_count
-    }) {
+    if !priced_spans.contains(&(candidate.surface_count, candidate.corresponding_count)) {
         return Err(Refusal::SpanNotCorroborated);
     }
     Ok(())
 }
 
+/// How many of the host's candidates are even looked at.
+///
+/// The host is sent at most `REQUEST_CANDIDATE_LIMIT` (16, in
+/// plugin_client.rs) and may place at most `MAX_ADDED_CANDIDATES` (3), so
+/// anything past this could not be shown regardless. Without the bound,
+/// checking is where an oversized answer would cost: `admit` is a lookup
+/// per candidate and this runs per keystroke, but — unlike the call
+/// itself — it is NOT inside the timeout. A host answering with ten
+/// thousand candidates would spend that time on the keystroke path with
+/// nothing able to stop it.
+const OFFERED_CANDIDATE_LIMIT: usize = 16;
+
 fn plugin_hook(input: &StageInput, candidates: Vec<Suggestion>) -> Vec<Suggestion> {
     if input.offered.is_empty() {
         return candidates;
+    }
+    if input.offered.len() > OFFERED_CANDIDATE_LIMIT {
+        tracing::warn!(
+            offered = input.offered.len(),
+            limit = OFFERED_CANDIDATE_LIMIT,
+            "plugin host answered with more candidates than it was sent; ignoring the tail"
+        );
     }
 
     let admitted: Vec<Suggestion> = input
         .offered
         .iter()
-        .filter(|offered| match admit(offered, input.reading, &candidates) {
-            Ok(()) => true,
-            Err(reason) => {
-                tracing::warn!(
-                    text = %offered.text,
-                    surface_count = offered.surface_count,
-                    corresponding_count = offered.corresponding_count,
-                    ?reason,
-                    "dropped a candidate offered by the plugin host"
-                );
-                false
-            }
-        })
+        .take(OFFERED_CANDIDATE_LIMIT)
+        .filter(
+            |offered| match admit(offered, input.reading, &input.priced_spans) {
+                Ok(()) => true,
+                Err(reason) => {
+                    tracing::warn!(
+                        text = %offered.text,
+                        surface_count = offered.surface_count,
+                        corresponding_count = offered.corresponding_count,
+                        ?reason,
+                        "dropped a candidate offered by the plugin host"
+                    );
+                    false
+                }
+            },
+        )
         .cloned()
         .collect();
 
@@ -249,13 +311,8 @@ mod tests {
     /// The pipeline with nothing offered — the default, since plugins are
     /// off unless the user turns them on.
     fn run_plain(reading: &str, candidates: Vec<Suggestion>) -> Vec<Suggestion> {
-        run(
-            &StageInput {
-                reading,
-                offered: &[],
-            },
-            candidates,
-        )
+        let input = StageInput::new(reading, &[], &candidates);
+        run(&input, candidates)
     }
 
     fn run_offering(
@@ -263,7 +320,16 @@ mod tests {
         offered: &[Suggestion],
         candidates: Vec<Suggestion>,
     ) -> Vec<Suggestion> {
-        run(&StageInput { reading, offered }, candidates)
+        let input = StageInput::new(reading, offered, &candidates);
+        run(&input, candidates)
+    }
+
+    /// The spans of a candidate list, as `admit` receives them.
+    fn spans_of(engine: &[Suggestion]) -> std::collections::HashSet<(i32, i32)> {
+        engine
+            .iter()
+            .map(|c| (c.surface_count, c.corresponding_count))
+            .collect()
     }
 
     #[test]
@@ -369,18 +435,87 @@ mod tests {
         );
     }
 
+    /// A host that answers with far more than it was sent must not make
+    /// the keystroke path pay for it: checking happens outside the RPC
+    /// timeout, so the bound has to be here.
+    #[test]
+    fn an_oversized_answer_is_read_only_as_far_as_it_could_matter() {
+        let engine: Vec<Suggestion> = (0..6)
+            .map(|i| spanning(&format!("候補{i}"), 4, 3))
+            .collect();
+        // every entry is admissible, so only the limit can stop them
+        let offered: Vec<Suggestion> = (0..10_000)
+            .map(|i| spanning(&format!("追加{i}"), 4, 3))
+            .collect();
+
+        let out = run_offering("きょう", &offered, engine);
+
+        assert_eq!(
+            texts(&out),
+            [
+                "候補0", "候補1", "候補2", "候補3", "追加0", "追加1", "追加2", "候補4", "候補5"
+            ]
+        );
+    }
+
+    /// A span the engine priced on a row dedup then removed is still a
+    /// span the engine priced — and it is a row the host was shown, since
+    /// it is sent the list before the pipeline touches it. Refusing it
+    /// would make the public contract ("copy the counts from a candidate
+    /// you were given") false in a way fail-open hides.
+    #[test]
+    fn a_span_from_a_row_dedup_removed_is_still_corroborated() {
+        // two rows render the same and cover different spans; dedup keeps
+        // only the first
+        let engine = vec![
+            spanning("きょう", 4, 3),
+            spanning("今日", 4, 3),
+            spanning("今日", 2, 1),
+            spanning("境", 4, 3),
+            spanning("教", 4, 3),
+        ];
+
+        let out = run_offering("きょう", &[spanning("追加", 2, 1)], engine);
+
+        assert_eq!(
+            texts(&out),
+            ["きょう", "今日", "境", "教", "追加"],
+            "the offered candidate copied a span the engine really produced"
+        );
+    }
+
     /// The invariant everything else is arranged around.
     #[test]
     fn the_top_candidate_is_never_displaced() {
-        for engine_len in 1..8 {
+        for engine_len in 0..8 {
             let engine: Vec<Suggestion> = (0..engine_len)
                 .map(|i| spanning(&format!("候補{i}"), 4, 3))
                 .collect();
 
             let out = run_offering("きょう", &[spanning("追加", 4, 3)], engine);
 
-            assert_eq!(out[0].text, "候補0", "list of {engine_len}");
+            match engine_len {
+                // nothing from the engine means nothing to be behind an
+                // addition, so there is nothing to add TO
+                0 => assert!(out.is_empty(), "an empty list gains nothing"),
+                _ => assert_eq!(out[0].text, "候補0", "list of {engine_len}"),
+            }
         }
+    }
+
+    /// The rule stated on its own terms, not as a side effect of `admit`
+    /// refusing everything when there is nothing to corroborate against.
+    /// Called directly, because the pipeline cannot reach this state while
+    /// that other rule holds — and the point is that it must stay safe if
+    /// that rule is ever relaxed.
+    #[test]
+    fn nothing_is_placed_into_an_empty_list() {
+        let out = super::insert_added(Vec::new(), vec![spanning("追加", 4, 3)]);
+
+        assert!(
+            out.is_empty(),
+            "an addition must never become what Enter commits"
+        );
     }
 
     #[test]
@@ -481,7 +616,7 @@ mod tests {
         let engine = [spanning("今日", 4, 3)];
 
         assert_eq!(
-            admit(&spanning("2026/07/29", 4, 3), "きょう", &engine),
+            admit(&spanning("2026/07/29", 4, 3), "きょう", &spans_of(&engine)),
             Ok(())
         );
     }
@@ -491,7 +626,7 @@ mod tests {
         let engine = [spanning("今日", 4, 3)];
 
         assert_eq!(
-            admit(&spanning("", 4, 3), "きょう", &engine),
+            admit(&spanning("", 4, 3), "きょう", &spans_of(&engine)),
             Err(Refusal::EmptyText)
         );
     }
@@ -503,11 +638,11 @@ mod tests {
         let engine = [spanning("今日", 4, 3)];
 
         assert_eq!(
-            admit(&spanning("嘘", 4, 4), "きょう", &engine),
+            admit(&spanning("嘘", 4, 4), "きょう", &spans_of(&engine)),
             Err(Refusal::SurfaceCountOutOfRange)
         );
         assert_eq!(
-            admit(&spanning("嘘", 4, 0), "きょう", &engine),
+            admit(&spanning("嘘", 4, 0), "きょう", &spans_of(&engine)),
             Err(Refusal::SurfaceCountOutOfRange)
         );
     }
@@ -517,7 +652,7 @@ mod tests {
         let engine = [spanning("今日", 4, 3)];
 
         assert_eq!(
-            admit(&spanning("嘘", -1, 3), "きょう", &engine),
+            admit(&spanning("嘘", -1, 3), "きょう", &spans_of(&engine)),
             Err(Refusal::NegativeCorrespondingCount)
         );
     }
@@ -531,11 +666,11 @@ mod tests {
         let engine = [spanning("今日", 4, 3)];
 
         assert_eq!(
-            admit(&spanning("嘘", 5, 3), "きょう", &engine),
+            admit(&spanning("嘘", 5, 3), "きょう", &spans_of(&engine)),
             Err(Refusal::SpanNotCorroborated)
         );
         assert_eq!(
-            admit(&spanning("嘘", 4, 2), "きょう", &engine),
+            admit(&spanning("嘘", 4, 2), "きょう", &spans_of(&engine)),
             Err(Refusal::SpanNotCorroborated)
         );
     }
@@ -546,7 +681,10 @@ mod tests {
     fn a_partial_span_the_engine_claims_is_admitted() {
         let engine = [spanning("今日", 4, 3), spanning("木", 2, 1)];
 
-        assert_eq!(admit(&spanning("樹", 2, 1), "きょう", &engine), Ok(()));
+        assert_eq!(
+            admit(&spanning("樹", 2, 1), "きょう", &spans_of(&engine)),
+            Ok(())
+        );
     }
 
     /// The whole point, end to end: a host that answers with nonsense
