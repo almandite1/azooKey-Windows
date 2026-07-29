@@ -44,10 +44,11 @@ message PluginCandidate {
 }
 
 message ProcessCandidatesRequest {
-  // What the caller speaks. The host answers a version it does not know
-  // by returning the candidates unchanged rather than by failing: the
-  // whole path is fail-open, so a version skew degrades to "no plugins"
-  // instead of to "no conversion".
+  // What the caller speaks. A host that does not know this version
+  // answers with nothing to add rather than with an error: the whole path
+  // is fail-open, so a version skew degrades to "no plugins" instead of
+  // to "no conversion". `answered_version` below is how the caller finds
+  // out that is what happened.
   uint32 api_version = 1;
   // The hiragana reading being converted.
   string reading = 2;
@@ -71,6 +72,19 @@ message ProcessCandidatesResponse {
   // produced. If a real need for that appears, it arrives as a new field
   // with its own rules, which is what "additive only" is for.
   repeated PluginCandidate added = 1;
+
+  // What the host speaks, always — including when it did not understand
+  // the request and is answering with nothing.
+  //
+  // Without this a version skew is perfectly silent: the host returns an
+  // empty list, the caller sees a successful call with nothing to add,
+  // and every plugin quietly stops working with no error anywhere. That
+  // is the failure this whole file is most likely to meet, because it
+  // arrives by shipping rather than by anyone making a mistake.
+  //
+  // Zero means a host from before this field existed, which is itself a
+  // skew worth naming: no host speaks version 0.
+  uint32 answered_version = 2;
 }
 
 // Runs in its own process (crates/plugin-host), never in the TIP DLL and

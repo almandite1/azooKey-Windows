@@ -25,8 +25,9 @@ use shared::proto::plugin_host_service_client::PluginHostServiceClient;
 use shared::proto::{PluginCandidate, ProcessCandidatesRequest, Suggestion};
 use tonic::transport::Channel;
 
-/// The plugin API version this build speaks.
-const API_VERSION: u32 = 1;
+/// The plugin API version this build speaks — the shared one, so the two
+/// ends cannot drift apart by editing a constant.
+use shared::plugin_api::API_VERSION;
 
 /// How long the keystroke path will wait for the host.
 ///
@@ -82,6 +83,10 @@ pub(crate) struct PluginClient {
     /// `plugins.enable` from settings.json, re-read on UpdateConfig.
     enabled: AtomicBool,
     breaker: Mutex<Breaker>,
+    /// Whether the version mismatch has already been reported. It would
+    /// otherwise be reported per keystroke, and a log line that arrives
+    /// thirty times a second is one nobody reads.
+    reported_skew: AtomicBool,
 }
 
 impl PluginClient {
@@ -108,6 +113,7 @@ impl PluginClient {
                 consecutive_failures: 0,
                 open_until: None,
             }),
+            reported_skew: AtomicBool::new(false),
         };
         client.reload_config();
         client
@@ -124,9 +130,22 @@ impl PluginClient {
     /// unasked and silent for the rest of the cooldown, and the only thing
     /// the user could see was that toggling had not helped.
     pub(crate) fn reload_config(&self) {
-        let enabled = shared::AppConfig::read().plugins.enable;
+        let plugins = shared::AppConfig::read().plugins;
+        let enabled = plugins.enable;
         if self.enabled.swap(enabled, Ordering::Relaxed) != enabled {
             tracing::info!(enabled, "plugin hook switched");
+        }
+        // Said out loud because the setting looks like it works: a user
+        // who lists entries and disables one gets the builtin anyway, and
+        // nothing anywhere would tell them why. Here rather than per
+        // keystroke — this runs at startup and on UpdateConfig.
+        if enabled && !plugins.entries.is_empty() {
+            tracing::info!(
+                entries = plugins.entries.len(),
+                "plugins.entries is not read by this build; every builtin runs \
+                 regardless of what it lists. Per-plugin opt-in comes with \
+                 third-party plugins."
+            );
         }
 
         let mut breaker = self.breaker.lock().unwrap_or_else(|e| e.into_inner());
@@ -173,12 +192,9 @@ impl PluginClient {
                 if elapsed >= SLOW_CALL {
                     tracing::info!(?elapsed, "plugin host was slow to answer");
                 }
-                response
-                    .into_inner()
-                    .added
-                    .iter()
-                    .map(to_suggestion)
-                    .collect()
+                let response = response.into_inner();
+                self.report_skew_once(response.answered_version);
+                response.added.iter().map(to_suggestion).collect()
             }
             Ok(Err(status)) => {
                 // An unreachable host is the ordinary state when nobody
@@ -194,6 +210,27 @@ impl PluginClient {
                 Vec::new()
             }
         }
+    }
+
+    /// Says once, and only once, that the host speaks a different version.
+    ///
+    /// It is not an error and nothing is retried: both sides are
+    /// fail-open, so the user simply has no add-on candidates. That is
+    /// precisely why it needs saying — the symptom of a skew is that a
+    /// working feature stopped existing, with no failure anywhere to
+    /// explain it. Zero means a host built before the field existed,
+    /// which is the same news.
+    fn report_skew_once(&self, answered: u32) {
+        if answered == API_VERSION || self.reported_skew.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            sent = API_VERSION,
+            answered,
+            "the plugin host speaks a different API version; it will add nothing. \
+             This is a mixed installation — the two binaries are from different \
+             builds. Conversion is unaffected."
+        );
     }
 
     fn breaker_is_open(&self) -> bool {
@@ -273,19 +310,45 @@ mod tests {
     struct FakeHost {
         delay: Option<Duration>,
         answer: Vec<PluginCandidate>,
+        /// What it claims to speak. Defaults to agreement.
+        answered_version: u32,
+        /// What the caller said it speaks, so a test can pin that too.
+        seen_version: std::sync::Arc<Mutex<Option<u32>>>,
+    }
+
+    impl FakeHost {
+        fn answering(answer: Vec<PluginCandidate>) -> Self {
+            FakeHost {
+                delay: None,
+                answer,
+                answered_version: API_VERSION,
+                seen_version: Default::default(),
+            }
+        }
+
+        /// Never answers within the budget.
+        fn slow() -> Self {
+            FakeHost {
+                delay: Some(CALL_TIMEOUT * 20),
+                ..FakeHost::answering(Vec::new())
+            }
+        }
     }
 
     #[tonic::async_trait]
     impl PluginHostService for FakeHost {
         async fn process_candidates(
             &self,
-            _: tonic::Request<ProcessCandidatesRequest>,
+            request: tonic::Request<ProcessCandidatesRequest>,
         ) -> Result<tonic::Response<ProcessCandidatesResponse>, tonic::Status> {
+            *self.seen_version.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(request.into_inner().api_version);
             if let Some(delay) = self.delay {
                 tokio::time::sleep(delay).await;
             }
             Ok(tonic::Response::new(ProcessCandidatesResponse {
                 added: self.answer.clone(),
+                answered_version: self.answered_version,
             }))
         }
     }
@@ -324,10 +387,7 @@ mod tests {
         let base = unique_pipe("healthy");
         let server = serve(
             &base,
-            FakeHost {
-                delay: None,
-                answer: vec![to_plugin_candidate(&spanning("2026/07/29", 4, 3))],
-            },
+            FakeHost::answering(vec![to_plugin_candidate(&spanning("2026/07/29", 4, 3))]),
         );
 
         let offered = client_for(&base)
@@ -338,6 +398,65 @@ mod tests {
         assert_eq!(offered[0].text, "2026/07/29");
         assert_eq!(offered[0].surface_count, 3);
         server.abort();
+    }
+
+    /// The half of the version contract this side owns: the caller sends
+    /// the shared constant. Nothing else in the suite would notice if it
+    /// sent something of its own.
+    #[tokio::test]
+    async fn the_caller_sends_the_shared_api_version() {
+        let base = unique_pipe("version");
+        let host = FakeHost::answering(Vec::new());
+        let seen = host.seen_version.clone();
+        let server = serve(&base, host);
+
+        client_for(&base)
+            .offer("きょう", &[spanning("今日", 4, 3)])
+            .await;
+        server.abort();
+
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(shared::plugin_api::API_VERSION)
+        );
+    }
+
+    /// A host from another build answers nothing, successfully, forever.
+    /// The candidates still come through untouched — the point is that
+    /// the skew is said out loud exactly once, because the symptom is a
+    /// feature that stopped existing with no failure to explain it.
+    #[tokio::test]
+    async fn a_host_speaking_another_version_is_reported_once() {
+        let base = unique_pipe("skew");
+        let server = serve(
+            &base,
+            FakeHost {
+                answered_version: API_VERSION + 1,
+                ..FakeHost::answering(Vec::new())
+            },
+        );
+        let client = client_for(&base);
+
+        assert!(
+            client
+                .offer("きょう", &[spanning("今日", 4, 3)])
+                .await
+                .is_empty()
+        );
+        assert!(
+            client.reported_skew.load(Ordering::Relaxed),
+            "the mismatch must be reported"
+        );
+
+        server.abort();
+
+        // a second call must not report it again — this runs per keystroke
+        client.reported_skew.store(false, Ordering::Relaxed);
+        client.report_skew_once(API_VERSION);
+        assert!(
+            !client.reported_skew.load(Ordering::Relaxed),
+            "an agreeing version must not be reported at all"
+        );
     }
 
     /// The ordinary state on a machine where nobody installed a host.
@@ -359,8 +478,8 @@ mod tests {
         let server = serve(
             &base,
             FakeHost {
-                delay: Some(CALL_TIMEOUT * 20),
                 answer: vec![to_plugin_candidate(&spanning("遅い", 4, 3))],
+                ..FakeHost::slow()
             },
         );
 
@@ -383,13 +502,7 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_client_never_calls() {
         let base = unique_pipe("disabled");
-        let server = serve(
-            &base,
-            FakeHost {
-                delay: Some(CALL_TIMEOUT * 20),
-                answer: Vec::new(),
-            },
-        );
+        let server = serve(&base, FakeHost::slow());
 
         // Explicitly off, for the same reason `client_for` sets it
         // explicitly on: `connect` ends with `reload_config`, which reads
@@ -446,10 +559,7 @@ mod tests {
         let base = unique_pipe("reset");
         let server = serve(
             &base,
-            FakeHost {
-                delay: None,
-                answer: vec![to_plugin_candidate(&spanning("2026/07/29", 4, 3))],
-            },
+            FakeHost::answering(vec![to_plugin_candidate(&spanning("2026/07/29", 4, 3))]),
         );
         let client = client_for(&base);
 
@@ -496,13 +606,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_reading_is_not_sent() {
         let base = unique_pipe("empty");
-        let server = serve(
-            &base,
-            FakeHost {
-                delay: Some(CALL_TIMEOUT * 20),
-                answer: Vec::new(),
-            },
-        );
+        let server = serve(&base, FakeHost::slow());
         let client = client_for(&base);
 
         let started = Instant::now();

@@ -5,6 +5,21 @@ pub mod job;
 pub mod logs;
 pub mod pipe;
 
+/// The plugin API's version, in the one place both ends can see it.
+///
+/// It was a private constant in the server and another in the host, both
+/// reading 1. Raising either alone compiled, passed every test, and left
+/// the two speaking different languages — which the wire then handled by
+/// having the host answer nothing, silently, forever. A shared definition
+/// makes that particular mistake unavailable.
+pub mod plugin_api {
+    /// Bumped only for a change that is NOT additive. The proto evolves by
+    /// adding fields; a reader that does not know a field ignores it, and
+    /// that costs nobody a version. This is for the day something has to
+    /// mean a different thing.
+    pub const API_VERSION: u32 = 1;
+}
+
 /// The three proto packages are included flat into one module, so a
 /// message name has to be unique across ALL of them — `plugin.proto` says
 /// `PluginCandidate` rather than `Candidate` for that reason. It is also
