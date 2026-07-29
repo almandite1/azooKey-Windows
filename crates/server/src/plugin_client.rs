@@ -1,0 +1,512 @@
+//! The server's side of the plugin pipe: ask the host what it would add,
+//! and be unbothered when it does not answer.
+//!
+//! Every failure route ends in the same place — an empty offer, which the
+//! pipeline turns into "the list as the engine ranked it". The host being
+//! absent is the NORMAL case, not an error: plugins are off by default, so
+//! most installations never start one. Nothing here may turn a plugin
+//! problem into a conversion problem.
+//!
+//! The one failure that costs something is a slow host, because this runs
+//! inside the keystroke path. That is what the timeout is for, and the
+//! breaker after it: a host that is reliably too slow stops being asked
+//! for a while, so the cost of somebody else's bug is bounded at one
+//! timeout per cooldown rather than one per keystroke.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use shared::proto::plugin_host_service_client::PluginHostServiceClient;
+use shared::proto::{PluginCandidate, ProcessCandidatesRequest, Suggestion};
+use tonic::transport::Channel;
+
+/// The plugin API version this build speaks.
+const API_VERSION: u32 = 1;
+
+/// How long the keystroke path will wait for the host.
+///
+/// Measured against the builtin host on a local pipe (n=200): p50 0.35ms,
+/// p95 0.42ms, worst 0.54ms. One AppendText, conversion included, was
+/// 30.3ms at p50 on the same machine with Zenzai off — so the hop this
+/// waits for costs about one percent of the keystroke it rides on.
+///
+/// The budget is therefore ~50x the observed worst case, which is
+/// deliberate: it is a ceiling on somebody else's bug, not a target. It is
+/// also sized for what comes later. Third-party plugins are to be capped
+/// at 10ms of CPU inside the host, and a server timeout below that would
+/// fire before the host's own protection could, turning a slow plugin into
+/// a transport failure and hiding which one misbehaved. Anything under
+/// ~15ms would need that plan changed first.
+///
+/// What it costs when a host does hang: three keystrokes pay 25ms each,
+/// and then the breaker below stops the asking.
+const CALL_TIMEOUT: Duration = Duration::from_millis(25);
+
+/// A call that took longer than this is logged even when it succeeded.
+/// Below it, the per-keystroke traffic would drown the log.
+const SLOW_CALL: Duration = Duration::from_millis(10);
+
+/// Consecutive failures before the host stops being asked.
+const FAILURES_BEFORE_OPEN: u32 = 3;
+
+/// How long it is left alone once the breaker opens.
+const COOLDOWN: Duration = Duration::from_secs(30);
+
+/// How many candidates the host is shown.
+///
+/// A long reading converts to hundreds of candidates and this runs on
+/// every keystroke, so the whole list would be kilobytes down a pipe per
+/// key. A plugin needs the reading and enough of the list to copy a span
+/// from; the top of the list is where the full-reading spans are. This is
+/// also a privacy bound: the fewer candidates cross the boundary, the less
+/// a plugin learns about what the engine thinks the user is typing.
+const REQUEST_CANDIDATE_LIMIT: usize = 16;
+
+struct Breaker {
+    consecutive_failures: u32,
+    /// When set, no call is attempted until this instant.
+    open_until: Option<Instant>,
+}
+
+pub(crate) struct PluginClient {
+    /// `None` when the channel could not even be built, which makes every
+    /// call a no-op for the life of the process. Lazy otherwise: no
+    /// connection is attempted until the first request, so a server that
+    /// starts before the host does not care about the order.
+    channel: Option<Channel>,
+    /// `plugins.enable` from settings.json, re-read on UpdateConfig.
+    enabled: AtomicBool,
+    breaker: Mutex<Breaker>,
+}
+
+impl PluginClient {
+    pub(crate) fn new() -> Self {
+        Self::connect(shared::pipe::plugin_pipe())
+    }
+
+    fn connect(pipe: String) -> Self {
+        let channel = match shared::pipe::lazy_pipe_channel(pipe) {
+            Ok(channel) => Some(channel),
+            Err(e) => {
+                // Not fatal, and not retried: a channel that cannot be
+                // built is a programming error in the endpoint, not a
+                // transient condition. Conversion is unaffected.
+                tracing::warn!("plugin host channel could not be built ({e}); plugins are off");
+                None
+            }
+        };
+
+        let client = PluginClient {
+            channel,
+            enabled: AtomicBool::new(false),
+            breaker: Mutex::new(Breaker {
+                consecutive_failures: 0,
+                open_until: None,
+            }),
+        };
+        client.reload_config();
+        client
+    }
+
+    /// Re-reads `plugins.enable`. Called at startup and whenever the
+    /// settings app reports a change.
+    pub(crate) fn reload_config(&self) {
+        let enabled = shared::AppConfig::read().plugins.enable;
+        if self.enabled.swap(enabled, Ordering::Relaxed) != enabled {
+            tracing::info!(enabled, "plugin hook switched");
+        }
+    }
+
+    /// What the host would add to this list, or nothing.
+    ///
+    /// The answer is unvalidated: this returns what the host said, and the
+    /// pipeline decides what may be shown. Keeping the two apart is what
+    /// lets the rules be tested without a host and enforced without trust.
+    pub(crate) async fn offer(&self, reading: &str, candidates: &[Suggestion]) -> Vec<Suggestion> {
+        if !self.enabled.load(Ordering::Relaxed) || reading.is_empty() {
+            return Vec::new();
+        }
+        let Some(channel) = &self.channel else {
+            return Vec::new();
+        };
+        if self.breaker_is_open() {
+            return Vec::new();
+        }
+
+        let request = ProcessCandidatesRequest {
+            api_version: API_VERSION,
+            reading: reading.to_string(),
+            candidates: candidates
+                .iter()
+                .take(REQUEST_CANDIDATE_LIMIT)
+                .map(to_plugin_candidate)
+                .collect(),
+        };
+
+        // The channel is cheap to clone (it is a handle, not a
+        // connection); the generated client needs an owned, mutable one.
+        let mut client = PluginHostServiceClient::new(channel.clone());
+        let started = Instant::now();
+        let call = tokio::time::timeout(CALL_TIMEOUT, client.process_candidates(request)).await;
+        let elapsed = started.elapsed();
+
+        match call {
+            Ok(Ok(response)) => {
+                self.record_success();
+                if elapsed >= SLOW_CALL {
+                    tracing::info!(?elapsed, "plugin host was slow to answer");
+                }
+                response
+                    .into_inner()
+                    .added
+                    .iter()
+                    .map(to_suggestion)
+                    .collect()
+            }
+            Ok(Err(status)) => {
+                // An unreachable host is the ordinary state when nobody
+                // installed one, so it is not worth a warning of its own —
+                // the breaker's message covers the case where it matters.
+                self.record_failure(&format!("plugin host call failed: {status}"));
+                Vec::new()
+            }
+            Err(_elapsed) => {
+                self.record_failure(&format!(
+                    "plugin host did not answer within {CALL_TIMEOUT:?}"
+                ));
+                Vec::new()
+            }
+        }
+    }
+
+    fn breaker_is_open(&self) -> bool {
+        let mut breaker = self.breaker.lock().unwrap_or_else(|e| e.into_inner());
+        match breaker.open_until {
+            Some(until) if Instant::now() < until => true,
+            Some(_) => {
+                // the cooldown elapsed: let one call through and judge the
+                // host on it rather than on how it behaved a minute ago
+                breaker.open_until = None;
+                breaker.consecutive_failures = 0;
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn record_success(&self) {
+        let mut breaker = self.breaker.lock().unwrap_or_else(|e| e.into_inner());
+        breaker.consecutive_failures = 0;
+    }
+
+    fn record_failure(&self, reason: &str) {
+        let mut breaker = self.breaker.lock().unwrap_or_else(|e| e.into_inner());
+        breaker.consecutive_failures += 1;
+        if breaker.consecutive_failures >= FAILURES_BEFORE_OPEN && breaker.open_until.is_none() {
+            breaker.open_until = Some(Instant::now() + COOLDOWN);
+            tracing::warn!(
+                failures = breaker.consecutive_failures,
+                ?COOLDOWN,
+                "{reason}; not asking the plugin host again for a while"
+            );
+        } else {
+            tracing::debug!("{reason}");
+        }
+    }
+}
+
+fn to_plugin_candidate(candidate: &Suggestion) -> PluginCandidate {
+    PluginCandidate {
+        text: candidate.text.clone(),
+        subtext: candidate.subtext.clone(),
+        corresponding_count: candidate.corresponding_count,
+        surface_count: candidate.surface_count,
+    }
+}
+
+fn to_suggestion(candidate: &PluginCandidate) -> Suggestion {
+    Suggestion {
+        text: candidate.text.clone(),
+        subtext: candidate.subtext.clone(),
+        corresponding_count: candidate.corresponding_count,
+        surface_count: candidate.surface_count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! These stand up a real host on a throwaway pipe, so the transport,
+    //! the timeout and the breaker are exercised together. Nothing here
+    //! references an FFI symbol (see wrappers.rs).
+
+    use super::*;
+    use shared::proto::ProcessCandidatesResponse;
+    use shared::proto::plugin_host_service_server::{PluginHostService, PluginHostServiceServer};
+
+    fn spanning(text: &str, corresponding_count: i32, surface_count: i32) -> Suggestion {
+        Suggestion {
+            text: text.to_string(),
+            subtext: String::new(),
+            corresponding_count,
+            surface_count,
+        }
+    }
+
+    /// A stand-in for the real host, so a test can pick the failure.
+    struct FakeHost {
+        delay: Option<Duration>,
+        answer: Vec<PluginCandidate>,
+    }
+
+    #[tonic::async_trait]
+    impl PluginHostService for FakeHost {
+        async fn process_candidates(
+            &self,
+            _: tonic::Request<ProcessCandidatesRequest>,
+        ) -> Result<tonic::Response<ProcessCandidatesResponse>, tonic::Status> {
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(tonic::Response::new(ProcessCandidatesResponse {
+                added: self.answer.clone(),
+            }))
+        }
+    }
+
+    /// Pipe names are machine-global, so keep each test's name to itself.
+    fn unique_pipe(tag: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        format!(
+            "azookey_test_plugin_{}_{}_{}",
+            tag,
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn serve(base: &str, host: FakeHost) -> tokio::task::JoinHandle<()> {
+        let incoming = azookey_server::TonicNamedPipeServer::new(base).expect("pipe listener");
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(PluginHostServiceServer::new(host))
+                .serve_with_incoming(incoming)
+                .await;
+        })
+    }
+
+    /// Enabled without reading settings.json — these tests must not depend
+    /// on the machine's configuration.
+    fn client_for(base: &str) -> PluginClient {
+        let client = PluginClient::connect(format!(r"\\.\pipe\{base}"));
+        client.enabled.store(true, Ordering::Relaxed);
+        client
+    }
+
+    #[tokio::test]
+    async fn a_healthy_host_is_used() {
+        let base = unique_pipe("healthy");
+        let server = serve(
+            &base,
+            FakeHost {
+                delay: None,
+                answer: vec![to_plugin_candidate(&spanning("2026/07/29", 4, 3))],
+            },
+        );
+
+        let offered = client_for(&base)
+            .offer("きょう", &[spanning("今日", 4, 3)])
+            .await;
+
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].text, "2026/07/29");
+        assert_eq!(offered[0].surface_count, 3);
+        server.abort();
+    }
+
+    /// The ordinary state on a machine where nobody installed a host.
+    #[tokio::test]
+    async fn a_missing_host_offers_nothing() {
+        let client = client_for(&unique_pipe("absent"));
+
+        let offered = client.offer("きょう", &[spanning("今日", 4, 3)]).await;
+
+        assert!(offered.is_empty());
+    }
+
+    /// The failure that would actually be felt: a host that answers too
+    /// late is abandoned, and the keystroke path waits no longer than the
+    /// budget for it.
+    #[tokio::test]
+    async fn a_slow_host_is_abandoned_at_the_timeout() {
+        let base = unique_pipe("slow");
+        let server = serve(
+            &base,
+            FakeHost {
+                delay: Some(CALL_TIMEOUT * 20),
+                answer: vec![to_plugin_candidate(&spanning("遅い", 4, 3))],
+            },
+        );
+
+        let started = Instant::now();
+        let offered = client_for(&base)
+            .offer("きょう", &[spanning("今日", 4, 3)])
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(offered.is_empty());
+        assert!(
+            elapsed < CALL_TIMEOUT * 10,
+            "the call must not outlast the budget by much, took {elapsed:?}"
+        );
+        server.abort();
+    }
+
+    /// Switched off, nothing is attempted at all — no connection, no
+    /// timeout, no cost on the keystroke path.
+    #[tokio::test]
+    async fn a_disabled_client_never_calls() {
+        let base = unique_pipe("disabled");
+        let server = serve(
+            &base,
+            FakeHost {
+                delay: Some(CALL_TIMEOUT * 20),
+                answer: Vec::new(),
+            },
+        );
+
+        let client = PluginClient::connect(format!(r"\\.\pipe\{base}"));
+        let started = Instant::now();
+        let offered = client.offer("きょう", &[spanning("今日", 4, 3)]).await;
+
+        assert!(offered.is_empty());
+        assert!(
+            started.elapsed() < CALL_TIMEOUT,
+            "a disabled hook must not even wait"
+        );
+        server.abort();
+    }
+
+    /// After enough failures the host stops being asked, so a broken
+    /// plugin costs one timeout per cooldown instead of one per keystroke.
+    #[tokio::test]
+    async fn repeated_failures_open_the_breaker() {
+        let client = client_for(&unique_pipe("breaker"));
+
+        for _ in 0..FAILURES_BEFORE_OPEN {
+            assert!(
+                client
+                    .offer("きょう", &[spanning("今日", 4, 3)])
+                    .await
+                    .is_empty()
+            );
+        }
+        assert!(client.breaker_is_open(), "the breaker must have tripped");
+
+        let started = Instant::now();
+        assert!(
+            client
+                .offer("きょう", &[spanning("今日", 4, 3)])
+                .await
+                .is_empty()
+        );
+        assert!(
+            started.elapsed() < CALL_TIMEOUT,
+            "an open breaker must skip the call entirely"
+        );
+    }
+
+    /// A success clears the count, so an occasional hiccup never adds up
+    /// to an open breaker.
+    #[tokio::test]
+    async fn a_success_resets_the_failure_count() {
+        let base = unique_pipe("reset");
+        let server = serve(
+            &base,
+            FakeHost {
+                delay: None,
+                answer: vec![to_plugin_candidate(&spanning("2026/07/29", 4, 3))],
+            },
+        );
+        let client = client_for(&base);
+
+        client.record_failure("test");
+        client.record_failure("test");
+        assert!(
+            !client
+                .offer("きょう", &[spanning("今日", 4, 3)])
+                .await
+                .is_empty()
+        );
+
+        assert_eq!(
+            client
+                .breaker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .consecutive_failures,
+            0
+        );
+        server.abort();
+    }
+
+    /// Nothing to convert, nothing to ask about.
+    #[tokio::test]
+    async fn an_empty_reading_is_not_sent() {
+        let base = unique_pipe("empty");
+        let server = serve(
+            &base,
+            FakeHost {
+                delay: Some(CALL_TIMEOUT * 20),
+                answer: Vec::new(),
+            },
+        );
+        let client = client_for(&base);
+
+        let started = Instant::now();
+        assert!(client.offer("", &[]).await.is_empty());
+        assert!(started.elapsed() < CALL_TIMEOUT);
+        server.abort();
+    }
+
+    /// The host is shown the top of the list, not all of it: this runs per
+    /// keystroke, and a long reading has hundreds of candidates.
+    #[tokio::test]
+    async fn the_host_is_not_shown_the_whole_list() {
+        let base = unique_pipe("limit");
+        let incoming = azookey_server::TonicNamedPipeServer::new(&base).expect("pipe listener");
+        let seen = std::sync::Arc::new(Mutex::new(0usize));
+
+        struct Counting(std::sync::Arc<Mutex<usize>>);
+        #[tonic::async_trait]
+        impl PluginHostService for Counting {
+            async fn process_candidates(
+                &self,
+                request: tonic::Request<ProcessCandidatesRequest>,
+            ) -> Result<tonic::Response<ProcessCandidatesResponse>, tonic::Status> {
+                *self.0.lock().unwrap_or_else(|e| e.into_inner()) =
+                    request.into_inner().candidates.len();
+                Ok(tonic::Response::new(ProcessCandidatesResponse::default()))
+            }
+        }
+
+        let server = tokio::spawn({
+            let seen = seen.clone();
+            async move {
+                let _ = tonic::transport::Server::builder()
+                    .add_service(PluginHostServiceServer::new(Counting(seen)))
+                    .serve_with_incoming(incoming)
+                    .await;
+            }
+        });
+
+        let engine: Vec<Suggestion> = (0..100).map(|i| spanning(&format!("c{i}"), 4, 3)).collect();
+        client_for(&base).offer("きょう", &engine).await;
+
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|e| e.into_inner()),
+            REQUEST_CANDIDATE_LIMIT
+        );
+        server.abort();
+    }
+}

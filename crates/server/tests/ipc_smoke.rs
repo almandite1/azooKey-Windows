@@ -211,8 +211,15 @@ async fn long_composition_shrink_does_not_kill_the_server() {
     clear(&mut client).await;
 }
 
+/// Unlike its neighbours this one also needs `plugin-host.exe` running and
+/// `plugins.enable` true in settings.json — the date candidate is no
+/// longer produced by the server. Which makes it the end-to-end proof of
+/// the whole path: engine list -> pipe -> host -> pipe -> validation ->
+/// placement. With the host stopped every other test here still passes and
+/// this one simply finds no date, which is what fail-open is supposed to
+/// look like from outside.
 #[tokio::test]
-#[ignore = "requires a running azookey-server with its DLL environment"]
+#[ignore = "requires a running azookey-server AND plugin-host, with plugins.enable"]
 async fn a_day_reading_gains_the_calendar_date() {
     // The candidate pipeline's unit tests pin what the stage does with a
     // list; only a live engine can show it running on the list the engine

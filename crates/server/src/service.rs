@@ -10,15 +10,17 @@ use shared::proto::{
     ShrinkTextRequest, ShrinkTextResponse,
 };
 
-use crate::candidate_pipeline;
+use crate::candidate_pipeline::{self, StageInput};
+use crate::plugin_client::PluginClient;
 use crate::session::session_of;
 use crate::wrappers::{
     RawComposingText, add_text, clear_text, get_composed_text, load_config, move_cursor,
     remove_text, set_context, shrink_text,
 };
 
-#[derive(Debug, Default)]
-pub struct MyAzookeyService;
+pub struct MyAzookeyService {
+    plugins: PluginClient,
+}
 
 /// Ceiling on one `RemoveText` batch.
 ///
@@ -30,16 +32,39 @@ pub struct MyAzookeyService;
 /// other application's keystrokes are waiting on.
 const MAX_REMOVE_TEXT_COUNT: i32 = 512;
 
-/// Builds the ComposingText payload every composing-text RPC returns: the
-/// current hiragana plus a fresh candidate fetch for the session, run
-/// through the candidate pipeline. Every RPC that returns candidates goes
-/// through here, so the pipeline hook lives in this one place.
-fn composed(session: i64, composing_text: RawComposingText) -> ComposingText {
-    let hiragana = composing_text.text;
-    let suggestions = candidate_pipeline::run(&hiragana, get_composed_text(session));
-    ComposingText {
-        hiragana,
-        suggestions,
+impl MyAzookeyService {
+    pub fn new() -> Self {
+        MyAzookeyService {
+            plugins: PluginClient::new(),
+        }
+    }
+
+    /// Builds the ComposingText payload every composing-text RPC returns:
+    /// the current hiragana plus a fresh candidate fetch for the session,
+    /// run through the candidate pipeline. Every RPC that returns
+    /// candidates goes through here, so the pipeline hook lives in this
+    /// one place.
+    ///
+    /// The plugin host is asked BEFORE the pipeline runs and its answer is
+    /// carried in as data, which is what keeps the pipeline a synchronous
+    /// pure function. Awaiting here does not stall the single-threaded
+    /// runtime — only the FFI does that — and with plugins off (the
+    /// default) there is nothing to await at all.
+    async fn composed(&self, session: i64, composing_text: RawComposingText) -> ComposingText {
+        let hiragana = composing_text.text;
+        let candidates = get_composed_text(session);
+        let offered = self.plugins.offer(&hiragana, &candidates).await;
+        let suggestions = candidate_pipeline::run(
+            &StageInput {
+                reading: &hiragana,
+                offered: &offered,
+            },
+            candidates,
+        );
+        ComposingText {
+            hiragana,
+            suggestions,
+        }
     }
 }
 
@@ -64,7 +89,7 @@ impl AzookeyService for MyAzookeyService {
         let input = request.into_inner().text_to_append;
 
         Ok(Response::new(AppendTextResponse {
-            composing_text: Some(composed(session, add_text(session, &input))),
+            composing_text: Some(self.composed(session, add_text(session, &input)).await),
         }))
     }
 
@@ -86,7 +111,7 @@ impl AzookeyService for MyAzookeyService {
         }
 
         Ok(Response::new(RemoveTextResponse {
-            composing_text: Some(composed(session, composing_text)),
+            composing_text: Some(self.composed(session, composing_text).await),
         }))
     }
 
@@ -98,7 +123,7 @@ impl AzookeyService for MyAzookeyService {
         let offset = request.into_inner().offset;
 
         Ok(Response::new(MoveCursorResponse {
-            composing_text: Some(composed(session, move_cursor(session, offset))),
+            composing_text: Some(self.composed(session, move_cursor(session, offset)).await),
         }))
     }
 
@@ -141,7 +166,10 @@ impl AzookeyService for MyAzookeyService {
         }
 
         Ok(Response::new(ShrinkTextResponse {
-            composing_text: Some(composed(session, shrink_text(session, surface_offset))),
+            composing_text: Some(
+                self.composed(session, shrink_text(session, surface_offset))
+                    .await,
+            ),
         }))
     }
 
@@ -161,6 +189,9 @@ impl AzookeyService for MyAzookeyService {
         _: Request<shared::proto::UpdateConfigRequest>,
     ) -> Result<Response<shared::proto::UpdateConfigResponse>, Status> {
         load_config();
+        // the same signal reaches the Rust side: `plugins.enable` lives in
+        // settings.json too, and the engine's reload does not carry it
+        self.plugins.reload_config();
         Ok(Response::new(shared::proto::UpdateConfigResponse {}))
     }
 }
