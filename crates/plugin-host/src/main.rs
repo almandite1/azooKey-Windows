@@ -1,0 +1,61 @@
+//! The plugin host: a separate process that answers "what would you add
+//! to this candidate list?".
+//!
+//! Why a process of its own, when the work is a pure function over a list:
+//! the conversion server runs a single-threaded runtime because the Swift
+//! FFI demands it, so a plugin that hung inside it would stop answering
+//! the watchdog's health ping and get the ENGINE restarted. And the TIP
+//! DLL is loaded into every text application, where a crash takes the
+//! host application down with it. Out here, a plugin that hangs is a
+//! timeout the server rides out, and a plugin that crashes is a process
+//! the launcher restarts while typing carries on.
+//!
+//! Nothing calls this yet — the server-side hook comes next. Started by
+//! hand it is a working host; started by the launcher it will be the third
+//! supervised child.
+
+mod builtin;
+mod service;
+mod trace;
+
+use azookey_server::TonicNamedPipeServer;
+use tonic::transport::Server;
+
+use shared::proto::plugin_host_service_server::PluginHostServiceServer;
+
+use service::MyPluginHost;
+
+// Single-threaded to match the conversion server. Nothing here needs it —
+// there is no FFI and no shared mutable state — but one runtime flavour
+// across the stack means one less thing to re-derive when a process
+// misbehaves. If a builtin ever needs real concurrency, this is the line
+// to revisit, and the reason will be its own rather than inherited.
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    trace::setup_logger();
+    tracing::info!("PluginHost started");
+
+    // standard gRPC health service, polled by the launcher's watchdog once
+    // this process is supervised
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_service_status("", tonic_health::ServingStatus::Serving)
+        .await;
+
+    // The pipe listener comes from the server crate, together with the
+    // DACL it applies. Deliberately the same string as the other two
+    // pipes: a sandboxed principal may connect but may not create an
+    // instance, so it cannot stand in front of this host and read what is
+    // being typed. Adding a pipe must not mean writing a new descriptor.
+    let incoming = TonicNamedPipeServer::new(&shared::pipe::plugin_pipe_base())?;
+
+    tracing::info!("PluginHost listening");
+
+    Server::builder()
+        .add_service(health_service)
+        .add_service(PluginHostServiceServer::new(MyPluginHost))
+        .serve_with_incoming(incoming)
+        .await?;
+
+    Ok(())
+}
