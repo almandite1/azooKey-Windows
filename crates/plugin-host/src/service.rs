@@ -7,8 +7,9 @@ use shared::proto::{ProcessCandidatesRequest, ProcessCandidatesResponse};
 
 use crate::builtin;
 
-/// The plugin API version this host implements.
-pub(crate) const API_VERSION: u32 = 1;
+/// The plugin API version this host implements — the shared one, so the
+/// two ends cannot drift apart by editing a constant.
+pub(crate) use shared::plugin_api::API_VERSION;
 
 #[derive(Debug, Default)]
 pub struct MyPluginHost;
@@ -26,14 +27,19 @@ impl PluginHostService for MyPluginHost {
         // routes end at the same candidate list — but an error would be
         // logged as a fault on every keystroke, and a version skew between
         // two binaries of the same product is a deployment state, not a
-        // fault. Warned once per request at the caller's discretion, not
-        // here: this runs per keystroke.
-        if request.api_version != API_VERSION {
-            return Ok(Response::new(ProcessCandidatesResponse::default()));
-        }
+        // fault. `answered_version` is what lets the caller tell the two
+        // apart; saying nothing and saying "nothing applies" look
+        // identical without it, and this side cannot be the one to log it
+        // (this runs per keystroke, and the skew is the caller's news).
+        let added = if request.api_version == API_VERSION {
+            builtin::run(&request.reading, &request.candidates)
+        } else {
+            Vec::new()
+        };
 
         Ok(Response::new(ProcessCandidatesResponse {
-            added: builtin::run(&request.reading, &request.candidates),
+            added,
+            answered_version: API_VERSION,
         }))
     }
 }
