@@ -7,6 +7,7 @@ members = [
   "crates/ui",
   "crates/macros",
   "crates/launcher",
+  "crates/plugin-host",
   "crates/e2e",
   "crates/test-support",
   "frontend/src-tauri"

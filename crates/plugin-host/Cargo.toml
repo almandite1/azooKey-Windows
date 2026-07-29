@@ -1,0 +1,22 @@
+[package]
+name = "plugin-host"
+version.workspace = true
+edition = "2024"
+resolver = "2"
+
+[dependencies]
+# same single-threaded shape as the conversion server, for a different
+# reason: nothing here is thread-unsafe, but one runtime flavour across the
+# stack is one less thing to reason about when a process misbehaves
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+shared = { workspace = true }
+# for TonicNamedPipeServer only — the pipe listener and its DACL live in
+# that crate. This host calls no FFI, so the linker drops the Swift import
+# and the binary gains no runtime dependency on the engine (ui.exe already
+# depends on this crate the same way, and does not import azookey-server.dll).
+azookey-server = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

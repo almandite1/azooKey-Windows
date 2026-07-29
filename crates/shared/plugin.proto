@@ -56,11 +56,21 @@ message ProcessCandidatesRequest {
 }
 
 message ProcessCandidatesResponse {
-  // The list to use instead. The core validates every entry and falls
-  // back to what it sent on anything it does not like, so a plugin
-  // cannot break conversion by answering badly — only by answering
-  // slowly, which the timeout covers.
-  repeated PluginCandidate candidates = 1;
+  // What to ADD — not the list to use.
+  //
+  // Returning a whole list would hand the plugin the ordering back: it
+  // could put itself first, which is the one thing the ranking policy
+  // exists to prevent, and no amount of validation short of diffing the
+  // two lists would catch it. A plugin says what to offer; the core says
+  // where it goes (fixed rank, capped count, index 0 untouchable) and
+  // validates every entry, falling back to what it sent on anything it
+  // does not like. So a plugin cannot break conversion by answering
+  // badly — only by answering slowly, which the timeout covers.
+  //
+  // This also means a plugin cannot remove or reorder what the engine
+  // produced. If a real need for that appears, it arrives as a new field
+  // with its own rules, which is what "additive only" is for.
+  repeated PluginCandidate added = 1;
 }
 
 // Runs in its own process (crates/plugin-host), never in the TIP DLL and
