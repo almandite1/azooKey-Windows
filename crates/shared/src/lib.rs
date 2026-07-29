@@ -258,7 +258,15 @@ impl AppConfig {
     /// Read the stored settings, falling back to defaults for anything that
     /// cannot be read. Never writes.
     pub fn read() -> Self {
-        match Self::load_from(&get_config_root()) {
+        Self::read_in(&get_config_root())
+    }
+
+    /// The same, from a directory the caller names. Public for the same
+    /// reason `new_in` and `write_to` exist privately: what happens on a
+    /// re-read is worth testing, and the alternative is a test that reads
+    /// the machine it runs on.
+    pub fn read_in(config_root: &Path) -> Self {
+        match Self::load_from(config_root) {
             LoadOutcome::Parsed(config) => config,
             LoadOutcome::Missing | LoadOutcome::Malformed => AppConfig::default(),
         }
@@ -648,6 +656,47 @@ mod tests {
         assert_eq!(config.zenzai.profile, "", "missing field gets a default");
         assert!(config.zenzai.enable);
         assert_eq!(config.zenzai.backend, "cuda");
+    }
+
+    /// What the server does on every UpdateConfig: read the file again and
+    /// take the new answer. Both directions, because a switch that only
+    /// worked one way would look like it worked.
+    ///
+    /// `read` rather than `new_in`: the re-read must not create, migrate
+    /// or stamp anything, and a test that used the startup path would not
+    /// notice if it started doing so.
+    #[test]
+    fn a_re_read_sees_the_setting_change_in_both_directions() {
+        let root = TempConfigRoot::new();
+
+        root.write_settings(r#"{"version":"0.1.0","plugins":{"enable":true}}"#);
+        assert!(AppConfig::read_in(root.path()).plugins.enable);
+
+        root.write_settings(r#"{"version":"0.1.0","plugins":{"enable":false}}"#);
+        assert!(!AppConfig::read_in(root.path()).plugins.enable);
+
+        root.write_settings(r#"{"version":"0.1.0","plugins":{"enable":true}}"#);
+        assert!(AppConfig::read_in(root.path()).plugins.enable);
+    }
+
+    /// A re-read of a broken file must hand back the defaults rather than
+    /// whatever was there before — and must not repair the file, which is
+    /// the startup path's job and only on startup.
+    #[test]
+    fn a_re_read_of_a_broken_file_is_the_defaults_and_changes_nothing() {
+        let root = TempConfigRoot::new();
+        let broken = r#"{"version":"#;
+        root.write_settings(broken);
+
+        let config = AppConfig::read_in(root.path());
+
+        assert!(!config.plugins.enable);
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(root.read_settings(), broken, "a re-read must not write");
+        assert!(
+            !root.path().join(SETTINGS_BACKUP_FILENAME).exists(),
+            "and must not back anything up either"
+        );
     }
 
     /// The degenerate end of the same rule: an empty (or absent) zenzai

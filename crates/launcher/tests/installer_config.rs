@@ -32,16 +32,18 @@ fn read(name: &str) -> String {
 /// missing.
 #[test]
 fn every_supervised_binary_is_packaged() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Makefile.toml");
-    let makefile = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let makefile = workspace_file("Makefile.toml");
 
-    for exe in [
-        "ui.exe",
-        "azookey-server.exe",
-        "launcher.exe",
-        "plugin-host.exe",
-    ] {
+    // derived from main.rs rather than listed here: a hardcoded list
+    // stays green when a fourth child is added and not packaged, which is
+    // the whole failure this guards against
+    let supervised = supervised_binaries();
+    assert!(
+        supervised.contains(&"plugin-host.exe".to_string()),
+        "the plugin host should be among the supervised children: {supervised:?}"
+    );
+
+    for exe in &supervised {
         assert!(
             makefile.contains(&format!("cp target/$str/{exe} build")),
             "post_build must copy {exe} into build/"
@@ -52,6 +54,49 @@ fn every_supervised_binary_is_packaged() {
              missing one ships as a broken installer"
         );
     }
+    // launcher.exe supervises rather than being supervised, so it is not
+    // in the derived list — and it still has to be packaged
+    assert!(makefile.contains("cp target/$str/launcher.exe build"));
+}
+
+/// The plugin host must be spawned by the NON-fatal supervisor.
+///
+/// Swapping it for `run_supervisor` compiles, passes every other test,
+/// and quietly converts "the add-ons are gone" into "the IME is gone" —
+/// the launcher exits, and the job object takes the engine and the
+/// candidate window with it. There is no runtime test that could catch
+/// that without staging a crash loop, so the wiring is read instead.
+#[test]
+fn the_plugin_host_is_supervised_non_fatally() {
+    let main = workspace_file("crates/launcher/src/main.rs");
+
+    let call = main
+        .split("supervisor::run")
+        .find(|section| section.contains("plugin-host.exe"))
+        .expect("main.rs should supervise plugin-host.exe");
+
+    assert!(
+        call.starts_with("_optional_supervisor("),
+        "plugin-host.exe must go through run_optional_supervisor, or losing \
+         it takes the whole IME down: got {call:.60}"
+    );
+}
+
+fn workspace_file(relative: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(relative);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+}
+
+/// The executable names the launcher spawns, read out of its own source.
+fn supervised_binaries() -> Vec<String> {
+    workspace_file("crates/launcher/src/main.rs")
+        .split("supervisor::run")
+        .skip(1)
+        .filter_map(|section| section.split('"').nth(1).map(str::to_string))
+        .collect()
 }
 
 /// The task's Arguments become `C:\Program Files\Azookey\launch.vbs` at
@@ -362,6 +407,37 @@ fn install_kills_only_processes_from_the_install_directory() {
         assert!(
             body.contains(name),
             "{name} is unambiguous and must still be matched by name: got {body}"
+        );
+    }
+}
+
+/// The WMI query is what actually decides which processes are found, and
+/// nothing was checking it. `install_stops_the_running_stack_before_copying`
+/// reads `StopRunningStack`, where the executable names appear only in the
+/// no-WMI fallback — so deleting a name from the query left every test
+/// green while an upgrade quietly stopped stopping that process and hit a
+/// locked file instead.
+#[test]
+fn the_process_query_names_every_process_the_installer_must_stop() {
+    let iss = read("Installer.iss");
+
+    let body = code_block(&iss, "function StackProcesses");
+    let query = body
+        .split("ExecQuery")
+        .nth(1)
+        .expect("StackProcesses should run a WMI query");
+
+    for name in [
+        "launcher.exe",
+        "ui.exe",
+        "azookey-server.exe",
+        "plugin-host.exe",
+        "Azookey.exe",
+    ] {
+        assert!(
+            query.contains(name),
+            "the WMI query must ask for {name}, or an upgrade leaves it \
+             running and holding its own file: got {query}"
         );
     }
 }

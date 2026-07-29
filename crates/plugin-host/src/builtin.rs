@@ -205,6 +205,31 @@ mod tests {
         );
     }
 
+    /// When several candidates cover the same kana but disagree about
+    /// keystrokes, the first — the engine's highest-ranked — is the one
+    /// copied. Any of them would be corroborated by the core, so this is
+    /// a choice rather than a constraint, and it is pinned so a rewrite
+    /// has to make it again on purpose.
+    #[test]
+    fn the_span_comes_from_the_highest_ranked_candidate_that_covers_the_reading() {
+        let added = run_with(
+            &PluginInput {
+                reading: "きょう",
+                today: date(2026, 7, 29),
+            },
+            &[
+                spanning("きょう", 3, 3),
+                spanning("今日", 4, 3),
+                spanning("京", 6, 3),
+            ],
+        );
+
+        assert!(
+            added.iter().all(|c| c.corresponding_count == 3),
+            "the first covering candidate decides"
+        );
+    }
+
     #[test]
     fn nothing_is_offered_without_a_candidate_covering_the_reading() {
         assert!(run_on("きょう", date(2026, 7, 29), &[spanning("きょ", 3, 2)]).is_empty());

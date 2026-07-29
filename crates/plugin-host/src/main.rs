@@ -25,6 +25,28 @@ use shared::proto::plugin_host_service_server::PluginHostServiceServer;
 
 use service::MyPluginHost;
 
+/// Turns a panic in a request handler into the death of this process.
+///
+/// tonic catches a handler panic inside the connection task, so without
+/// this the host would stay up, keep answering health checks, and add
+/// nothing to any candidate list ever again — alive to the supervisor,
+/// useless to the user, and rediscovered by the server's breaker every
+/// thirty seconds forever. Dying is strictly better: the supervisor
+/// restarts it with backoff, and a plugin whose panic is deterministic
+/// eventually exhausts the budget and is given up on, non-fatally.
+///
+/// Deliberately minimal. The hook runs while unwinding, and anything it
+/// does that could itself panic would abort with the original cause lost.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        // not `panic::abort`: an ordinary exit code is what the
+        // supervisor already knows how to read as "died abnormally"
+        std::process::exit(1);
+    }));
+}
+
 // Single-threaded to match the conversion server. Nothing here needs it —
 // there is no FFI and no shared mutable state — but one runtime flavour
 // across the stack means one less thing to re-derive when a process
@@ -33,6 +55,7 @@ use service::MyPluginHost;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     trace::setup_logger();
+    install_panic_hook();
     tracing::info!("PluginHost started");
 
     // standard gRPC health service, polled by the launcher's watchdog once

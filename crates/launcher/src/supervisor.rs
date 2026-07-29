@@ -50,17 +50,32 @@ pub(crate) async fn run_supervisor(exe: &'static str, prefix: &'static str, pipe
 /// because an optional process could not be kept alive would turn a
 /// cosmetic failure into a total one — and, through the job object, would
 /// do it by killing the very server that was still working.
+///
+/// What this does NOT do, both deliberate and both worth knowing before
+/// reading a bug report:
+///
+/// * a child that exits cleanly (code 0) is taken at its word and not
+///   restarted, exactly as for the fatal variant. Nothing here exits on
+///   purpose today, so this has never happened.
+/// * once it gives up, it does not try again for the life of the
+///   launcher. A re-arm after some long cooldown would be reasonable and
+///   is not implemented; until then the recovery is a logon, and the log
+///   line below is the only sign anything is missing.
 pub(crate) async fn run_optional_supervisor(
     exe: &'static str,
     prefix: &'static str,
     pipe_name: String,
 ) {
     if supervise(exe, prefix, &pipe_name).await == SuperviseOutcome::GaveUp {
-        log_err(&format!(
-            "{prefix} is unrecoverable; carrying on without it (conversion is unaffected)"
-        ));
+        log_err(&format!("{prefix} {GAVE_UP_NON_FATALLY}"));
     }
 }
+
+/// The sentence a field log is searched for when an add-on is missing and
+/// nobody knows why. Pinned by a test because it is the only evidence
+/// this state produces.
+const GAVE_UP_NON_FATALLY: &str =
+    "is unrecoverable; carrying on without it (conversion is unaffected)";
 
 /// Why a supervisor loop stopped.
 #[derive(Debug, PartialEq, Eq)]
@@ -246,7 +261,18 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::run_optional_supervisor;
+    use super::{GAVE_UP_NON_FATALLY, run_optional_supervisor};
+
+    /// The message says three things a reader needs: that it is over,
+    /// that the launcher is staying, and that typing still works. Losing
+    /// any of them turns the log into "something failed" — which is what
+    /// sends someone looking for an IME bug that is not there.
+    #[test]
+    fn the_give_up_message_says_the_ime_is_unaffected() {
+        assert!(GAVE_UP_NON_FATALLY.contains("unrecoverable"));
+        assert!(GAVE_UP_NON_FATALLY.contains("carrying on without it"));
+        assert!(GAVE_UP_NON_FATALLY.contains("conversion is unaffected"));
+    }
 
     /// The whole difference between the two variants, and the only way to
     /// assert it: `run_supervisor` ends the PROCESS when it gives up, so a
