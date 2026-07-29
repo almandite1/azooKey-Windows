@@ -34,11 +34,18 @@ fn get_config_root() -> PathBuf {
 /// answer rather than silently reading a root-relative `Azookey` folder.
 /// Same reasoning as [`local_data_root`], and the same shape.
 pub fn config_root() -> Option<PathBuf> {
-    let appdata = std::env::var_os("APPDATA")?;
-    if appdata.is_empty() {
+    config_root_in(std::env::var_os("APPDATA"))
+}
+
+/// Takes the environment value explicitly so tests never read or race on
+/// a real environment variable (same reason as [`local_data_root_in`] and
+/// the `*_in`/`*_to` config helpers).
+pub fn config_root_in(base: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let base = base?;
+    if base.is_empty() {
         return None;
     }
-    Some(Path::new(&appdata).join("Azookey"))
+    Some(Path::new(&base).join("Azookey"))
 }
 
 /// `%LOCALAPPDATA%\Azookey` — where per-user RUNTIME state belongs: logs,

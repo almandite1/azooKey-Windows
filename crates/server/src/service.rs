@@ -54,13 +54,11 @@ impl MyAzookeyService {
         let hiragana = composing_text.text;
         let candidates = get_composed_text(session);
         let offered = self.plugins.offer(&hiragana, &candidates).await;
-        let suggestions = candidate_pipeline::run(
-            &StageInput {
-                reading: &hiragana,
-                offered: &offered,
-            },
-            candidates,
-        );
+        // The host and the validator are given the same view of what the
+        // engine produced: this list, before the pipeline removes
+        // anything from it.
+        let input = StageInput::new(&hiragana, &offered, &candidates);
+        let suggestions = candidate_pipeline::run(&input, candidates);
         ComposingText {
             hiragana,
             suggestions,
