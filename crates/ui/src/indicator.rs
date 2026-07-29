@@ -20,6 +20,20 @@ pub fn create_indicator_window(event_loop: &EventLoop<UserEvent>) -> Result<Wind
     Ok(window)
 }
 
+/// Shares theme.css (the design tokens) with the candidate window; the
+/// accent border is the indicator's own look (assets/indicator.css). Takes
+/// the theme CSS rather than reading it for the same reason as
+/// [`crate::candidate`]'s builder.
+fn indicator_html(user_theme_css: &str) -> String {
+    format!(
+        include_str!("../assets/indicator.html"),
+        theme_css = include_str!("../assets/theme.css"),
+        user_theme_css = user_theme_css,
+        indicator_css = include_str!("../assets/indicator.css"),
+        indicator_js = include_str!("../assets/indicator.js"),
+    )
+}
+
 /// Shares the candidate window's `WebContext`, so both webviews live in the
 /// one profile under `%LOCALAPPDATA%` (issue #54). Sharing it is also what
 /// keeps their `CoreWebView2EnvironmentOptions` identical, which WebView2
@@ -28,14 +42,7 @@ pub fn create_indicator_webview<'a>(
     window: &'a Window,
     context: &'a mut WebContext,
 ) -> Result<WebView> {
-    // Shares theme.css (the design tokens) with the candidate window; the
-    // accent border is the indicator's own look (assets/indicator.css).
-    let html = format!(
-        include_str!("../assets/indicator.html"),
-        theme_css = include_str!("../assets/theme.css"),
-        indicator_css = include_str!("../assets/indicator.css"),
-        indicator_js = include_str!("../assets/indicator.js"),
-    );
+    let html = indicator_html(&crate::theme::Theme::read().to_css());
 
     let webview = WebViewBuilder::new_with_web_context(context)
         .with_transparent(true)
@@ -44,4 +51,23 @@ pub fn create_indicator_webview<'a>(
         .context("Failed to create webview")?;
 
     Ok(webview)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::indicator_html;
+
+    /// The indicator shares theme.css, so it has to share the theme too —
+    /// an あ/A badge that kept the shipped colours while the candidate
+    /// window changed would look like a bug in the theme.
+    #[test]
+    fn the_indicator_takes_the_same_theme() {
+        let html = indicator_html(":root { --accent: #123456; }");
+
+        let defaults = html.find("--accent: #2CB5FF").expect("the shipped token");
+        let theme = html.find("--accent: #123456").expect("the user's token");
+
+        assert!(defaults < theme, "the theme must come after the defaults");
+        assert!(theme < html.find("</style>").expect("a closed style element"));
+    }
 }

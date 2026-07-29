@@ -26,6 +26,21 @@ fn get_config_root() -> PathBuf {
     appdata.join("Azookey")
 }
 
+/// `%APPDATA%\Azookey` — where per-user CONFIGURATION belongs, for the
+/// files this crate does not own itself (`AppConfig` reaches the same
+/// directory through the private helper above).
+///
+/// `None` when `APPDATA` is unset or empty, so a caller picks its own
+/// answer rather than silently reading a root-relative `Azookey` folder.
+/// Same reasoning as [`local_data_root`], and the same shape.
+pub fn config_root() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    if appdata.is_empty() {
+        return None;
+    }
+    Some(Path::new(&appdata).join("Azookey"))
+}
+
 /// `%LOCALAPPDATA%\Azookey` — where per-user RUNTIME state belongs: logs,
 /// crash dumps, the WebView2 profile. Deliberately not `get_config_root`:
 /// that one is `%APPDATA%` (roaming), which is for settings a user would
