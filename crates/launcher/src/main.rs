@@ -75,9 +75,23 @@ async fn main() -> anyhow::Result<()> {
         "[ui]",
         shared::pipe::ui_pipe(),
     ));
+    // The third child is supervised the same way but is NOT allowed to take
+    // the launcher down with it: an absent plugin host is what the server
+    // already expects whenever the feature is off, so losing it costs the
+    // user their add-on candidates and nothing else. Started unconditionally
+    // rather than only when plugins.enable is set — otherwise turning the
+    // feature on in the settings app would appear to do nothing until the
+    // next logon, since the server reloads that setting live and the
+    // launcher does not.
+    let plugin_handle = tokio::spawn(supervisor::run_optional_supervisor(
+        "plugin-host.exe",
+        "[plugin-host]",
+        shared::pipe::plugin_pipe(),
+    ));
 
     let _ = server_handle.await;
     let _ = ui_handle.await;
+    let _ = plugin_handle.await;
 
     Ok(())
 }

@@ -21,6 +21,39 @@ fn read(name: &str) -> String {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
+/// Every process the launcher supervises has to be in `build/` for the
+/// installer's `../build/*` to pick it up.
+///
+/// The failure this guards is quiet in the worst way: a supervised child
+/// that was never packaged does not break the build or the install. The
+/// launcher just fails to spawn it on the user's machine, and — for a
+/// child supervised non-fatally, which is exactly the kind most likely to
+/// be forgotten — the IME then works fine with the feature silently
+/// missing.
+#[test]
+fn every_supervised_binary_is_packaged() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Makefile.toml");
+    let makefile = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+
+    for exe in [
+        "ui.exe",
+        "azookey-server.exe",
+        "launcher.exe",
+        "plugin-host.exe",
+    ] {
+        assert!(
+            makefile.contains(&format!("cp target/$str/{exe} build")),
+            "post_build must copy {exe} into build/"
+        );
+        assert!(
+            makefile.contains(&format!("\"build/{exe}\"")),
+            "{exe} must be in post_build's required-artifact list, or a \
+             missing one ships as a broken installer"
+        );
+    }
+}
+
 /// The task's Arguments become `C:\Program Files\Azookey\launch.vbs` at
 /// install time. wscript.exe does not do CreateProcess-style prefix
 /// guessing: an unquoted path with a space makes it look for
@@ -205,7 +238,12 @@ fn uninstall_stops_the_running_processes() {
         .find(|l| l.contains("/IM") && l.contains("launcher.exe"))
         .expect("Installer.iss should pass the processes to taskkill via /IM");
 
-    for proc in ["launcher.exe", "ui.exe", "azookey-server.exe"] {
+    for proc in [
+        "launcher.exe",
+        "ui.exe",
+        "azookey-server.exe",
+        "plugin-host.exe",
+    ] {
         assert!(
             params.contains(proc),
             "uninstall's taskkill must target {proc}: got {params}"
@@ -283,6 +321,7 @@ fn install_stops_the_running_stack_before_copying() {
         "launcher.exe",
         "ui.exe",
         "azookey-server.exe",
+        "plugin-host.exe",
         "Azookey.exe",
     ] {
         assert!(

@@ -42,6 +42,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_service_status("", tonic_health::ServingStatus::Serving)
         .await;
 
+    // Test hook for the watchdog: block the runtime after N seconds so
+    // every RPC — the health check included — stops answering. Completely
+    // inert unless the variable is set.
+    //
+    // A DIFFERENT variable from the server's on purpose. The e2e harness
+    // sets its one as a machine-scope variable that the launcher passes to
+    // every child, so a shared name would arm both processes at once and
+    // the watchdog scenario could no longer say which one it had proved.
+    if let Some(secs) = std::env::var("AZOOKEY_TEST_PLUGIN_HANG_AFTER_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        tracing::warn!("TEST MODE: runtime will hang after {secs}s");
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            tracing::warn!("TEST MODE: blocking the runtime now");
+            std::thread::sleep(std::time::Duration::MAX);
+        });
+    }
+
     // The pipe listener comes from the server crate, together with the
     // DACL it applies. Deliberately the same string as the other two
     // pipes: a sandboxed principal may connect but may not create an

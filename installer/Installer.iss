@@ -137,7 +137,7 @@ Type: filesandordirs; Name: "{app}\ui.exe.WebView2"
 ; elevated schtasks may delete a machine-scope task.
 Filename: "taskkill"; \
   RunOnceId: "KillAzookeyProcs"; \
-  Parameters: "/F /IM launcher.exe /IM ui.exe /IM azookey-server.exe /IM Azookey.exe"; \
+  Parameters: "/F /IM launcher.exe /IM ui.exe /IM azookey-server.exe /IM plugin-host.exe /IM Azookey.exe"; \
   Flags: runhidden
 Filename: "schtasks"; \
   RunOnceId: "DelAzookeyStartupTask"; \
@@ -343,10 +343,14 @@ begin
     Service := Locator.ConnectServer('', 'root\CIMV2');
     Items := Service.ExecQuery('SELECT Name, ExecutablePath FROM Win32_Process' +
       ' WHERE Name = "launcher.exe" OR Name = "ui.exe"' +
-      ' OR Name = "azookey-server.exe" OR Name = "Azookey.exe"');
+      ' OR Name = "azookey-server.exe" OR Name = "plugin-host.exe"' +
+      ' OR Name = "Azookey.exe"');
     for i := 0 to Items.Count - 1 do
     begin
       Item := Items.ItemIndex(i);
+      // plugin-host.exe is deliberately absent from the name-only list
+      // below: it is as generic a name as ui.exe, so it is ours only when
+      // it runs from the install directory.
       Name := Lowercase(VariantText(Item.Name));
       // ExecutablePath is NULL for processes we may not open; those are not
       // ours to kill anyway
@@ -388,7 +392,7 @@ begin
     // Azookey.exe is the settings app, installed by the chained Tauri NSIS,
     // which cannot replace its own running exe either.
     Log('WMI unavailable; falling back to a name-only taskkill');
-    ShellExec('', 'taskkill', '/F /IM launcher.exe /IM ui.exe /IM azookey-server.exe /IM Azookey.exe', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
+    ShellExec('', 'taskkill', '/F /IM launcher.exe /IM ui.exe /IM azookey-server.exe /IM plugin-host.exe /IM Azookey.exe', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
     Sleep(1500);
     exit;
   end;
