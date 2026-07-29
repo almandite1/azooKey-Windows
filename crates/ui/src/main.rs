@@ -23,6 +23,7 @@ pub mod indicator;
 pub mod ipc;
 pub mod placement;
 pub mod startup;
+pub mod theme;
 pub mod uiaccess;
 pub mod webview;
 pub mod window;
