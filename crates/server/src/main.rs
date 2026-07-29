@@ -1,5 +1,6 @@
 mod candidate_pipeline;
 mod ffi;
+mod plugin_client;
 mod service;
 mod session;
 mod trace;
@@ -27,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("executable path has no parent directory")?;
     wrappers::initialize(&parent_dir.to_string_lossy());
 
-    let service = MyAzookeyService;
+    let service = MyAzookeyService::new();
 
     // standard gRPC health service, polled by the launcher's watchdog.
     // Because this runtime is single-threaded, ANY hang inside a Swift FFI

@@ -3,10 +3,13 @@
 //! the single merge point), so a new transformation is a new
 //! `CandidateStage` variant plus its match arm here — no other file.
 //!
-//! Stages are pure functions over (reading, candidates); nothing here may
-//! touch the FFI, so the whole module is testable without a Swift runtime.
-
-use chrono::{Datelike, NaiveDate, TimeDelta};
+//! Everything here is a pure function over (input, candidates). The one
+//! stage whose material comes from outside the process — what the plugin
+//! host offered — receives it as data in `StageInput`, fetched before the
+//! pipeline runs. That is deliberate: it keeps the whole module
+//! synchronous and testable with no pipe, no host, and no FFI, which
+//! matters most for the part that decides what an outside process is
+//! allowed to put in front of the user.
 
 use shared::proto::Suggestion;
 
@@ -14,13 +17,13 @@ use shared::proto::Suggestion;
 /// exhaustive on purpose: adding a variant without deciding what it does
 /// is a compile error, not a silent no-op.
 pub(crate) enum CandidateStage {
-    /// Offers the calendar date for a reading that names a day.
-    CalendarDate,
     /// Drops candidates whose surface text has already appeared, keeping
     /// the first (highest-ranked) occurrence. Subtext is deliberately not
     /// part of the key: two candidates that render the same are duplicates
     /// to the user regardless of how their annotations differ.
     Dedup,
+    /// Checks what the plugin host offered and places what survives.
+    PluginHook,
 }
 
 /// The fixed order every candidate list goes through.
@@ -28,20 +31,23 @@ pub(crate) enum CandidateStage {
 /// Dedup runs FIRST, and that is load-bearing rather than tidy: a rank
 /// means a position in the list the user actually sees, and the engine's
 /// raw list repeats itself near the top. Inserting at index 4 before
-/// deduplicating put the date at index 2 on a live engine — the rank was
-/// measured against rows that were about to be removed.
-const STAGES: &[CandidateStage] = &[CandidateStage::Dedup, CandidateStage::CalendarDate];
+/// deduplicating put an added candidate at index 2 on a live engine — the
+/// rank was measured against rows that were about to be removed.
+const STAGES: &[CandidateStage] = &[CandidateStage::Dedup, CandidateStage::PluginHook];
 
-/// Everything a stage may need besides the candidate list.
-///
-/// Built once per run, and the clock is read here rather than inside the
-/// stage that wants it: a stage that called `Local::now` itself could not
-/// be tested, and two stages in one run could otherwise disagree about
-/// what day it is across a midnight boundary.
-struct StageInput<'a> {
+/// Everything a stage needs besides the candidate list.
+pub(crate) struct StageInput<'a> {
     /// The hiragana the candidates convert.
-    reading: &'a str,
-    today: NaiveDate,
+    pub(crate) reading: &'a str,
+    /// What the plugin host answered for this reading — UNVALIDATED, and
+    /// treated as hostile input until `admit` says otherwise.
+    ///
+    /// Empty when plugins are switched off, when the host is unreachable,
+    /// when it timed out, and when it answered nothing. Those are four
+    /// different events to the client that fetched this and exactly one
+    /// thing here: nothing to add. That is what fail-open means in this
+    /// file.
+    pub(crate) offered: &'a [Suggestion],
 }
 
 /// Applies one stage.
@@ -51,62 +57,50 @@ fn apply(
     candidates: Vec<Suggestion>,
 ) -> Vec<Suggestion> {
     match stage {
-        CandidateStage::CalendarDate => calendar_date(input, candidates),
         CandidateStage::Dedup => dedup(candidates),
+        CandidateStage::PluginHook => plugin_hook(input, candidates),
     }
 }
 
 /// Runs the full pipeline in the order `STAGES` fixes.
-pub(crate) fn run(reading: &str, candidates: Vec<Suggestion>) -> Vec<Suggestion> {
-    run_with(
-        &StageInput {
-            reading,
-            today: chrono::Local::now().date_naive(),
-        },
-        candidates,
-    )
-}
-
-fn run_with(input: &StageInput, candidates: Vec<Suggestion>) -> Vec<Suggestion> {
+pub(crate) fn run(input: &StageInput, candidates: Vec<Suggestion>) -> Vec<Suggestion> {
     STAGES.iter().fold(candidates, |candidates, stage| {
         apply(stage, input, candidates)
     })
 }
 
-/// Where a candidate the pipeline INVENTED goes in the list.
+/// Where a candidate the pipeline did not convert goes in the list.
 ///
 /// The candidate window shows five at a time and pages by five
 /// (`MAX_VISIBLE_CANDIDATES` in crates/ui/assets/candidate.js), so index 4
-/// is the last slot a user sees without paging. Appending instead put the
-/// date at position 331 of 334 for きょう — correct, and unreachable.
+/// is the last slot a user sees without paging. Appending instead put an
+/// added candidate at position 331 of 334 for きょう — correct, and
+/// unreachable.
 ///
 /// Revisit this if the window's page size changes; the two numbers are
 /// related by "the last visible slot", not by coincidence.
 const ADDED_CANDIDATE_RANK: usize = 4;
 
-/// How many invented candidates the pipeline will place, in total, per
-/// list. A bound on how far the engine's own ranking can be pushed down,
-/// and the number a plugin must not be able to raise (see the policy note
-/// on `insert_added`).
+/// How many added candidates the pipeline will place, in total, per list.
+/// A bound on how far the engine's own ranking can be pushed down, and the
+/// number a plugin must not be able to raise.
 const MAX_ADDED_CANDIDATES: usize = 3;
 
 /// Places candidates that no conversion produced.
 ///
-/// THE POLICY, which stages and (later) plugins do not get a say in:
+/// THE POLICY, which plugins do not get a say in:
 ///
 /// - index 0 is never displaced. It is what Enter commits, so moving it
 ///   would change what typing does — the one thing none of this may do.
 ///   With a non-empty list the clamp below cannot reach 0.
-/// - everything else added goes at one fixed rank, decided here. A stage
-///   that could ask for a rank would be a stage that competes with the
-///   next stage for the top of the list, and the user would arbitrate a
-///   fight they never asked to have.
+/// - everything added goes at one fixed rank, decided here. A plugin that
+///   could ask for a rank would compete with the next plugin for the top
+///   of the list, and the user would arbitrate a fight they never asked to
+///   have. This is why the wire format carries additions rather than a
+///   replacement list: there is nothing for a plugin to say about order.
 /// - at most `MAX_ADDED_CANDIDATES` survive, so the bound holds however
-///   many stages want in.
-/// - a text the list already carries is not added again. Deduplicating
-///   here rather than in a later Dedup pass is what lets the rank be
-///   honest: the engine's own list is already deduplicated by the time
-///   anything is placed into it.
+///   many plugins want in.
+/// - a text the list already carries is not added again.
 ///
 /// The rank is clamped to the list, so a short list appends rather than
 /// leaving a gap.
@@ -124,84 +118,81 @@ fn insert_added(mut candidates: Vec<Suggestion>, added: Vec<Suggestion>) -> Vec<
     candidates
 }
 
-/// Readings that name a day, and how far that day is from today. Only an
-/// exact whole-reading match counts: "きょうは" is the start of a sentence,
-/// not a request for the date, and matching a prefix would also leave the
-/// span ambiguous.
-const DAY_READINGS: &[(&str, i64)] = &[
-    ("きょう", 0),
-    ("あす", 1),
-    ("あした", 1),
-    ("きのう", -1),
-    ("あさって", 2),
-    ("おととい", -2),
-];
+/// Why a candidate the plugin host offered was refused. Carried as a
+/// reason rather than a bool so the log says which rule was broken —
+/// there is no other way for a plugin author to find out.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    EmptyText,
+    /// Covers no kana, or more kana than the reading has.
+    SurfaceCountOutOfRange,
+    NegativeCorrespondingCount,
+    /// No candidate from the engine covers this same span, so nothing
+    /// corroborates the keystroke count.
+    SpanNotCorroborated,
+}
 
-/// Offers the calendar date as extra candidates when the whole reading
-/// names a day. Where they land is `insert_added`'s decision, not this
-/// stage's.
-fn calendar_date(input: &StageInput, candidates: Vec<Suggestion>) -> Vec<Suggestion> {
-    let Some((_, offset)) = DAY_READINGS.iter().find(|(r, _)| *r == input.reading) else {
-        return candidates;
-    };
-    let Some(date) = TimeDelta::try_days(*offset).and_then(|d| input.today.checked_add_signed(d))
-    else {
-        return candidates;
-    };
+/// Whether an offered candidate may be shown.
+///
+/// The counts are the dangerous part, and the reason is not obvious: they
+/// are not decoration, they are what the commit spends. `surface_count` is
+/// the kana ShrinkText removes from the reading, and `corresponding_count`
+/// is what the client drops from its own keystroke buffer. A candidate
+/// carrying the wrong pair does not look wrong in the window — it commits,
+/// and leaves the reading or the raw input out of step with what is on
+/// screen, which is the shape of the duplicated-clause bug this project
+/// has already paid for once.
+///
+/// A plugin cannot compute `corresponding_count`: the same reading can be
+/// typed kyou or kilyou and only the engine tracked which. So the rule is
+/// not a range check but corroboration — some candidate the engine itself
+/// produced must claim exactly this span. A plugin can only offer text for
+/// a span the engine already priced.
+fn admit(candidate: &Suggestion, reading: &str, engine: &[Suggestion]) -> Result<(), Refusal> {
+    if candidate.text.is_empty() {
+        return Err(Refusal::EmptyText);
+    }
+    let reading_kana = reading.chars().count() as i32;
+    if candidate.surface_count < 1 || candidate.surface_count > reading_kana {
+        return Err(Refusal::SurfaceCountOutOfRange);
+    }
+    if candidate.corresponding_count < 0 {
+        return Err(Refusal::NegativeCorrespondingCount);
+    }
+    if !engine.iter().any(|c| {
+        c.surface_count == candidate.surface_count
+            && c.corresponding_count == candidate.corresponding_count
+    }) {
+        return Err(Refusal::SpanNotCorroborated);
+    }
+    Ok(())
+}
 
-    // How much of the reading a candidate covers has to be exactly right:
-    // `surface_count` is what ShrinkText spends, and `corresponding_count`
-    // is what the client drops from its own keystroke buffer. The kana
-    // count we know — the whole reading, since the match above was against
-    // all of it. The KEYSTROKE count we do not: the same reading can be
-    // typed as kyou or kilyou, and only the engine tracked which. So take
-    // it from a candidate the engine already reported for this same span,
-    // and offer nothing at all when there is none. Inventing a number here
-    // is how a candidate leaves stale romaji behind after a commit.
-    let surface_count = input.reading.chars().count() as i32;
-    let Some(corresponding_count) = candidates
+fn plugin_hook(input: &StageInput, candidates: Vec<Suggestion>) -> Vec<Suggestion> {
+    if input.offered.is_empty() {
+        return candidates;
+    }
+
+    let admitted: Vec<Suggestion> = input
+        .offered
         .iter()
-        .find(|c| c.surface_count == surface_count)
-        .map(|c| c.corresponding_count)
-    else {
-        return candidates;
-    };
-
-    let dates = formatted_dates(date)
-        .into_iter()
-        .map(|text| Suggestion {
-            text,
-            subtext: "日付".to_string(),
-            corresponding_count,
-            surface_count,
+        .filter(|offered| match admit(offered, input.reading, &candidates) {
+            Ok(()) => true,
+            Err(reason) => {
+                tracing::warn!(
+                    text = %offered.text,
+                    surface_count = offered.surface_count,
+                    corresponding_count = offered.corresponding_count,
+                    ?reason,
+                    "dropped a candidate offered by the plugin host"
+                );
+                false
+            }
         })
+        .cloned()
         .collect();
-    insert_added(candidates, dates)
-}
 
-fn formatted_dates(date: NaiveDate) -> Vec<String> {
-    let mut formats = vec![
-        format!("{:04}/{:02}/{:02}", date.year(), date.month(), date.day()),
-        format!("{}年{}月{}日", date.year(), date.month(), date.day()),
-    ];
-    if let Some(year) = reiwa_year(date) {
-        formats.push(format!("令和{}年{}月{}日", year, date.month(), date.day()));
-    }
-    formats
-}
-
-/// The Reiwa era began on 2019-05-01 and its first year is written 元年,
-/// not 1年. `None` before that date: this stage only ever formats a day
-/// near today, so an earlier date means the machine clock is wrong, and
-/// silently labelling 2018 as 令和0年 would be worse than saying nothing.
-fn reiwa_year(date: NaiveDate) -> Option<String> {
-    if date < NaiveDate::from_ymd_opt(2019, 5, 1)? {
-        return None;
-    }
-    Some(match date.year() - 2018 {
-        1 => "元".to_string(),
-        year => year.to_string(),
-    })
+    insert_added(candidates, admitted)
 }
 
 // The engine can propose the same surface text more than once and only the
@@ -222,8 +213,7 @@ mod tests {
     //! (see the warning in wrappers.rs — one import would make every test
     //! in the crate need the Swift runtime).
 
-    use super::{StageInput, run, run_with};
-    use chrono::{Datelike, NaiveDate};
+    use super::{Refusal, StageInput, admit, run};
     use shared::proto::Suggestion;
 
     fn suggestion(text: &str, subtext: &str) -> Suggestion {
@@ -246,25 +236,34 @@ mod tests {
         }
     }
 
-    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).expect("a real calendar date")
-    }
-
-    /// The pipeline with the clock pinned, so a test never depends on the
-    /// day it runs.
-    fn run_on(reading: &str, today: NaiveDate, candidates: Vec<Suggestion>) -> Vec<Suggestion> {
-        run_with(&StageInput { reading, today }, candidates)
-    }
-
     fn texts(candidates: &[Suggestion]) -> Vec<&str> {
         candidates.iter().map(|s| s.text.as_str()).collect()
     }
 
+    /// The pipeline with nothing offered — the default, since plugins are
+    /// off unless the user turns them on.
+    fn run_plain(reading: &str, candidates: Vec<Suggestion>) -> Vec<Suggestion> {
+        run(
+            &StageInput {
+                reading,
+                offered: &[],
+            },
+            candidates,
+        )
+    }
+
+    fn run_offering(
+        reading: &str,
+        offered: &[Suggestion],
+        candidates: Vec<Suggestion>,
+    ) -> Vec<Suggestion> {
+        run(&StageInput { reading, offered }, candidates)
+    }
+
     #[test]
     fn duplicate_text_keeps_the_first_occurrence() {
-        let out = run_on(
+        let out = run_plain(
             "きしゃ",
-            date(2026, 7, 29),
             vec![
                 suggestion("記者", ""),
                 suggestion("汽車", ""),
@@ -277,9 +276,8 @@ mod tests {
 
     #[test]
     fn order_is_preserved() {
-        let out = run_on(
+        let out = run_plain(
             "あき",
-            date(2026, 7, 29),
             vec![
                 suggestion("秋", ""),
                 suggestion("空き", ""),
@@ -294,9 +292,8 @@ mod tests {
     /// subtexts differ — the first one's subtext survives.
     #[test]
     fn subtext_difference_does_not_defeat_dedup() {
-        let out = run_on(
+        let out = run_plain(
             "きしゃ",
-            date(2026, 7, 29),
             vec![
                 suggestion("記者", "annotation A"),
                 suggestion("記者", "annotation B"),
@@ -309,107 +306,29 @@ mod tests {
 
     #[test]
     fn empty_list_stays_empty() {
-        assert_eq!(run_on("", date(2026, 7, 29), vec![]), vec![]);
+        assert_eq!(run_plain("", vec![]), vec![]);
     }
 
+    /// The default path, and the one that must cost nothing: with the
+    /// feature off there is nothing offered, and the list comes through
+    /// exactly as the engine ranked it.
     #[test]
-    fn a_day_reading_gains_the_calendar_date() {
-        let out = run_on(
-            "きょう",
-            date(2026, 7, 29),
-            vec![spanning("今日", 4, 3), spanning("京", 4, 3)],
-        );
+    fn nothing_offered_leaves_the_list_alone() {
+        let engine: Vec<Suggestion> = ["きょう", "今日", "境", "教", "橋"]
+            .iter()
+            .map(|t| spanning(t, 4, 3))
+            .collect();
 
-        assert_eq!(
-            texts(&out),
-            [
-                "今日",
-                "京",
-                "2026/07/29",
-                "2026年7月29日",
-                "令和8年7月29日"
-            ],
-            "the engine's own candidates keep the top of the list"
-        );
-        assert!(out[2..].iter().all(|s| s.subtext == "日付"));
+        let out = run_plain("きょう", engine.clone());
+
+        assert_eq!(texts(&out), texts(&engine));
     }
 
-    /// The span has to be exactly right or committing the candidate
-    /// desyncs the client: kana for ShrinkText, keystrokes for the raw
-    /// input buffer. Both are copied from what the engine said about the
-    /// same reading — here a reading typed as `kilyou`, six keystrokes.
-    #[test]
-    fn added_candidates_span_what_the_engine_said_they_span() {
-        let out = run_on("きょう", date(2026, 7, 29), vec![spanning("今日", 6, 3)]);
+    // ---- placement ----
 
-        assert!(
-            out[1..]
-                .iter()
-                .all(|s| s.corresponding_count == 6 && s.surface_count == 3),
-            "a made-up keystroke count would leave stale romaji after a commit"
-        );
-    }
-
-    /// No candidate covers the whole reading, so nothing here knows what
-    /// the span costs in keystrokes — offer nothing rather than guess.
-    #[test]
-    fn nothing_is_added_without_a_candidate_covering_the_reading() {
-        let out = run_on("きょう", date(2026, 7, 29), vec![spanning("きょ", 3, 2)]);
-
-        assert_eq!(texts(&out), ["きょ"]);
-    }
-
-    #[test]
-    fn offsets_land_on_the_right_day() {
-        for (reading, expected) in [
-            ("きのう", "2026/07/28"),
-            ("あした", "2026/07/30"),
-            ("あす", "2026/07/30"),
-            ("あさって", "2026/07/31"),
-            ("おととい", "2026/07/27"),
-        ] {
-            let reading_len = reading.chars().count() as i32;
-            let out = run_on(
-                reading,
-                date(2026, 7, 29),
-                vec![spanning("x", 4, reading_len)],
-            );
-
-            assert_eq!(out[1].text, expected, "reading {reading}");
-        }
-    }
-
-    #[test]
-    fn a_day_offset_crosses_the_year_boundary() {
-        let out = run_on("あした", date(2026, 12, 31), vec![spanning("明日", 6, 3)]);
-
-        assert_eq!(out[1].text, "2027/01/01");
-        assert_eq!(out[2].text, "2027年1月1日");
-    }
-
-    /// Only the whole reading counts: this one is the start of a sentence.
-    #[test]
-    fn a_reading_that_merely_starts_with_a_day_is_untouched() {
-        let out = run_on(
-            "きょうは",
-            date(2026, 7, 29),
-            vec![spanning("今日は", 6, 4)],
-        );
-
-        assert_eq!(texts(&out), ["今日は"]);
-    }
-
-    #[test]
-    fn an_ordinary_reading_is_untouched() {
-        let out = run_on("きしゃ", date(2026, 7, 29), vec![spanning("記者", 5, 3)]);
-
-        assert_eq!(texts(&out), ["記者"]);
-    }
-
-    /// The placement rule, on a list long enough for it to bite: the
-    /// engine keeps the first four slots and the dates take the last
-    /// visible one. Appending instead is what put the date at 331 of 334
-    /// for きょう on a live engine — right, and out of reach.
+    /// The placement rule on a list long enough for it to bite: the engine
+    /// keeps the first four slots and the additions take the last visible
+    /// one.
     #[test]
     fn added_candidates_land_on_the_last_visible_slot() {
         let engine: Vec<Suggestion> = ["きょう", "今日", "境", "教", "橋", "京", "卿"]
@@ -417,29 +336,18 @@ mod tests {
             .map(|t| spanning(t, 4, 3))
             .collect();
 
-        let out = run_on("きょう", date(2026, 7, 29), engine);
+        let out = run_offering("きょう", &[spanning("2026/07/29", 4, 3)], engine);
 
         assert_eq!(
             texts(&out),
-            [
-                "きょう",
-                "今日",
-                "境",
-                "教",
-                "2026/07/29",
-                "2026年7月29日",
-                "令和8年7月29日",
-                "橋",
-                "京",
-                "卿"
-            ]
+            ["きょう", "今日", "境", "教", "2026/07/29", "橋", "京", "卿"]
         );
     }
 
     /// Found on a live engine: its raw list repeats itself near the top,
-    /// so placing at index 4 and deduplicating afterwards landed the date
-    /// at index 2. The rank has to be measured against the list the user
-    /// is shown, which is why Dedup runs before the stages that add.
+    /// so placing at index 4 and deduplicating afterwards landed the
+    /// addition at index 2. The rank has to be measured against the list
+    /// the user is shown.
     #[test]
     fn the_rank_counts_rows_that_survive_dedup() {
         let engine: Vec<Suggestion> = ["きょう", "きょう", "今日", "今日", "境", "教", "橋"]
@@ -447,20 +355,11 @@ mod tests {
             .map(|t| spanning(t, 4, 3))
             .collect();
 
-        let out = run_on("きょう", date(2026, 7, 29), engine);
+        let out = run_offering("きょう", &[spanning("2026/07/29", 4, 3)], engine);
 
         assert_eq!(
             texts(&out),
-            [
-                "きょう",
-                "今日",
-                "境",
-                "教",
-                "2026/07/29",
-                "2026年7月29日",
-                "令和8年7月29日",
-                "橋"
-            ]
+            ["きょう", "今日", "境", "教", "2026/07/29", "橋"]
         );
     }
 
@@ -472,36 +371,35 @@ mod tests {
                 .map(|i| spanning(&format!("候補{i}"), 4, 3))
                 .collect();
 
-            let out = run_on("きょう", date(2026, 7, 29), engine);
+            let out = run_offering("きょう", &[spanning("追加", 4, 3)], engine);
 
             assert_eq!(out[0].text, "候補0", "list of {engine_len}");
         }
     }
 
-    /// A list shorter than the rank appends rather than leaving a gap.
     #[test]
     fn a_short_list_appends() {
-        let out = run_on("きょう", date(2026, 7, 29), vec![spanning("今日", 4, 3)]);
-
-        assert_eq!(
-            texts(&out),
-            ["今日", "2026/07/29", "2026年7月29日", "令和8年7月29日"]
+        let out = run_offering(
+            "きょう",
+            &[spanning("追加", 4, 3)],
+            vec![spanning("今日", 4, 3)],
         );
+
+        assert_eq!(texts(&out), ["今日", "追加"]);
     }
 
-    /// The bound is on the pipeline, not on the stage that wants in: a
-    /// stage offering more than the cap gets the cap, so no future stage
-    /// (or plugin) can push the engine's ranking further down by asking.
+    /// The cap is on the pipeline, not on whoever wants in: no plugin can
+    /// push the engine's ranking further down by offering more.
     #[test]
     fn no_more_than_the_cap_is_placed() {
         let engine: Vec<Suggestion> = (0..6)
             .map(|i| spanning(&format!("候補{i}"), 4, 3))
             .collect();
-        let added: Vec<Suggestion> = (0..5)
+        let offered: Vec<Suggestion> = (0..5)
             .map(|i| spanning(&format!("追加{i}"), 4, 3))
             .collect();
 
-        let out = super::insert_added(engine, added);
+        let out = run_offering("きょう", &offered, engine);
 
         assert_eq!(
             texts(&out),
@@ -511,55 +409,106 @@ mod tests {
         );
     }
 
-    /// The placement helper drops what the list already carries, so the
-    /// date stage does not have to know what the engine offered.
     #[test]
-    fn a_date_the_engine_already_proposed_is_not_duplicated() {
-        let out = run_on(
+    fn an_offer_the_engine_already_made_is_not_duplicated() {
+        let out = run_offering(
             "きょう",
-            date(2026, 7, 29),
-            vec![spanning("今日", 4, 3), spanning("2026/07/29", 4, 3)],
+            &[spanning("今日", 4, 3)],
+            vec![spanning("きょう", 4, 3), spanning("今日", 4, 3)],
         );
+
+        assert_eq!(texts(&out), ["きょう", "今日"]);
+    }
+
+    // ---- what the host is allowed to put in front of the user ----
+
+    #[test]
+    fn a_corroborated_span_is_admitted() {
+        let engine = [spanning("今日", 4, 3)];
 
         assert_eq!(
-            texts(&out),
-            ["今日", "2026/07/29", "2026年7月29日", "令和8年7月29日"]
+            admit(&spanning("2026/07/29", 4, 3), "きょう", &engine),
+            Ok(())
         );
     }
 
     #[test]
-    fn the_first_year_of_reiwa_is_gannen() {
-        let out = run_on("きょう", date(2019, 5, 1), vec![spanning("今日", 4, 3)]);
+    fn empty_text_is_refused() {
+        let engine = [spanning("今日", 4, 3)];
 
-        assert_eq!(out[3].text, "令和元年5月1日");
-    }
-
-    /// A clock set before the era began gets the two plain formats and no
-    /// era line, rather than 令和0年.
-    #[test]
-    fn a_date_before_reiwa_gets_no_era_candidate() {
-        let out = run_on("きょう", date(2019, 4, 30), vec![spanning("今日", 4, 3)]);
-
-        assert_eq!(texts(&out), ["今日", "2019/04/30", "2019年4月30日"]);
-    }
-
-    /// The production entry point reads the real clock; everything else is
-    /// pinned, so this is the one test that proves `run` is wired to it.
-    #[test]
-    fn run_uses_the_current_date() {
-        let slash_format =
-            |d: NaiveDate| format!("{:04}/{:02}/{:02}", d.year(), d.month(), d.day());
-        // bracketing the call rather than taking one reading: the clock can
-        // roll over to the next day mid-test, and a CI failure at midnight
-        // would say nothing about the code
-        let before = chrono::Local::now().date_naive();
-        let out = run("きょう", vec![spanning("今日", 4, 3)]);
-        let after = chrono::Local::now().date_naive();
-
-        assert!(
-            [before, after].map(slash_format).contains(&out[1].text),
-            "run must read the real clock, got {}",
-            out[1].text
+        assert_eq!(
+            admit(&spanning("", 4, 3), "きょう", &engine),
+            Err(Refusal::EmptyText)
         );
+    }
+
+    /// A candidate claiming more kana than the reading has would make the
+    /// commit spend kana that are not there.
+    #[test]
+    fn a_surface_count_past_the_reading_is_refused() {
+        let engine = [spanning("今日", 4, 3)];
+
+        assert_eq!(
+            admit(&spanning("嘘", 4, 4), "きょう", &engine),
+            Err(Refusal::SurfaceCountOutOfRange)
+        );
+        assert_eq!(
+            admit(&spanning("嘘", 4, 0), "きょう", &engine),
+            Err(Refusal::SurfaceCountOutOfRange)
+        );
+    }
+
+    #[test]
+    fn a_negative_keystroke_count_is_refused() {
+        let engine = [spanning("今日", 4, 3)];
+
+        assert_eq!(
+            admit(&spanning("嘘", -1, 3), "きょう", &engine),
+            Err(Refusal::NegativeCorrespondingCount)
+        );
+    }
+
+    /// The rule a plugin is most likely to break honestly: the span looks
+    /// reasonable but no candidate the engine produced claims it, so
+    /// nothing corroborates the keystroke count. Committing it would leave
+    /// the client's raw input out of step with the screen.
+    #[test]
+    fn a_span_no_engine_candidate_claims_is_refused() {
+        let engine = [spanning("今日", 4, 3)];
+
+        assert_eq!(
+            admit(&spanning("嘘", 5, 3), "きょう", &engine),
+            Err(Refusal::SpanNotCorroborated)
+        );
+        assert_eq!(
+            admit(&spanning("嘘", 4, 2), "きょう", &engine),
+            Err(Refusal::SpanNotCorroborated)
+        );
+    }
+
+    /// A partial span is fine as long as the engine priced it — a plugin
+    /// may offer text for a clause the engine also found.
+    #[test]
+    fn a_partial_span_the_engine_claims_is_admitted() {
+        let engine = [spanning("今日", 4, 3), spanning("木", 2, 1)];
+
+        assert_eq!(admit(&spanning("樹", 2, 1), "きょう", &engine), Ok(()));
+    }
+
+    /// The whole point, end to end: a host that answers with nonsense
+    /// changes nothing the user sees.
+    #[test]
+    fn a_hostile_answer_cannot_reach_the_user() {
+        let engine = vec![spanning("きょう", 4, 3), spanning("今日", 4, 3)];
+        let offered = [
+            spanning("", 4, 3),
+            spanning("span past the reading", 4, 99),
+            spanning("negative", -3, 3),
+            spanning("uncorroborated", 7, 3),
+        ];
+
+        let out = run_offering("きょう", &offered, engine.clone());
+
+        assert_eq!(texts(&out), texts(&engine));
     }
 }
