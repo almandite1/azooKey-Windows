@@ -117,6 +117,26 @@ Filename: "icacls"; \
   StatusMsg: "Granting read access to sandboxed applications..."; \
   Flags: runhidden
 
+[InstallDelete]
+; The settings app used to be called frontend.exe: Tauri names the main
+; binary after the crate unless `mainBinaryName` says otherwise, and it did
+; not until #97.
+;
+; Tauri's own installer removes the old name when it changes — but only once,
+; and only if the file is not in use. Upgrading with the settings app OPEN
+; leaves a 10 MB orphan, because its running-instance check looks for the NEW
+; name and so never stops the old process; and the removal is never retried,
+; because by then the registry records the new name and the condition that
+; triggers it can no longer be true. Verified on a test machine, both ways.
+;
+; So Setup deletes it here, unconditionally and before the copies, with the
+; old name added to the stop list below so the file is not locked when this
+; runs.
+;
+; Remove both once no supported upgrade path starts from a build older
+; than #97.
+Type: files; Name: "{app}\frontend.exe"
+
 [UninstallDelete]
 ; launch.vbs is created at post-install by [Code], so Setup does not track
 ; it; delete it explicitly, otherwise it keeps {app} from being removed
@@ -317,8 +337,12 @@ end;
 // entirely, so /IM reached every one of them on the machine. A process is
 // ours when it runs from the install directory; azookey-server.exe and
 // Azookey.exe are matched by name alone because those names are already
-// unambiguous, and the settings app in particular lives wherever the chained
-// Tauri NSIS put it rather than under {app}.
+// unambiguous.
+//
+// frontend.exe is the settings app's OLD name (see [InstallDelete] and #97).
+// It is here so the file is not locked when Setup deletes it, and it is
+// emphatically NOT in the name-only list — "frontend.exe" belongs to half the
+// world. Only one under {app} is ours. Remove with the [InstallDelete] entry.
 // WMI hands back NULL for fields we may not read (ExecutablePath on a
 // process we cannot open), and Pascal Script has no VarToStr to absorb that.
 function VariantText(const Value: Variant): String;
@@ -344,7 +368,7 @@ begin
     Items := Service.ExecQuery('SELECT Name, ExecutablePath FROM Win32_Process' +
       ' WHERE Name = "launcher.exe" OR Name = "ui.exe"' +
       ' OR Name = "azookey-server.exe" OR Name = "plugin-host.exe"' +
-      ' OR Name = "Azookey.exe"');
+      ' OR Name = "Azookey.exe" OR Name = "frontend.exe"');
     for i := 0 to Items.Count - 1 do
     begin
       Item := Items.ItemIndex(i);

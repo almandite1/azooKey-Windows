@@ -127,6 +127,52 @@ fn the_settings_app_is_named_the_same_everywhere() {
     );
 }
 
+/// The settings app's old name has to be deleted AND stopped.
+///
+/// Tauri removes a renamed binary itself, but only once and only if the
+/// file is free: upgrading with the settings app open leaves a 10 MB
+/// orphan, because the running-instance check looks for the NEW name and
+/// never stops the old process — and the removal is not retried, since by
+/// then the registry records the new name. Both halves were reproduced on
+/// a test machine, which is why Setup does it instead.
+///
+/// The delete is useless without the stop: a running exe cannot be
+/// deleted. Nothing else would notice if one of the two were dropped.
+#[test]
+fn the_settings_apps_old_name_is_both_stopped_and_deleted() {
+    let iss = read("Installer.iss");
+    const LEGACY: &str = "frontend.exe";
+
+    assert!(
+        iss.contains(&format!("Type: files; Name: \"{{app}}\\{LEGACY}\"")),
+        "the legacy binary must be deleted on install"
+    );
+
+    let query = code_block(&iss, "function StackProcesses")
+        .split("ExecQuery")
+        .nth(1)
+        .expect("StackProcesses should run a WMI query")
+        .to_string();
+    assert!(
+        query.contains(LEGACY),
+        "the legacy binary must be stopped, or the delete above hits a \
+         locked file: got {query}"
+    );
+
+    // ...and stopped by PATH, not by name: "frontend.exe" is not ours
+    // wherever it happens to run
+    let body = code_block(&iss, "function StackProcesses");
+    let name_matched = body
+        .lines()
+        .filter(|l| l.contains("Name = '") || l.contains("(Name ="))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !name_matched.to_lowercase().contains(LEGACY),
+        "{LEGACY} must not be matched by name alone: got {name_matched}"
+    );
+}
+
 /// Everything the installer ships as an executable has to be on the
 /// signing list. `plugin-host.exe` was added, packaged, and left off it —
 /// which would have shipped one unsigned binary among signed ones, the
