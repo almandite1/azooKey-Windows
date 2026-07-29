@@ -100,22 +100,36 @@ impl Theme {
     /// cascade order rather than by `!important` — a theme should lose to
     /// nothing and override nothing it was not given.
     ///
+    /// BOTH blocks are wrapped in a media query, including the light one,
+    /// and that is the whole correctness of this function. A bare `:root`
+    /// here would be placed after theme.css's own
+    /// `@media (prefers-color-scheme: dark)` block, and since the two have
+    /// the same specificity the later one wins — so a light-only theme
+    /// would paint its light colours over dark mode as well, leaving the
+    /// shipped dark `--text` on the user's light background. Scoping the
+    /// light block says what it means, and lets a file that names only one
+    /// scheme leave the other exactly as it shipped.
+    ///
     /// Empty when there is nothing to say, which keeps the generated page
     /// byte-identical to the untouched one on the overwhelmingly common
     /// path of no theme at all.
     pub fn to_css(&self) -> String {
         let mut css = String::new();
         if !self.light.is_empty() {
-            css.push_str(&format!(":root {{\n{}}}\n", declarations(&self.light)));
+            css.push_str(&scheme_block("light", &self.light));
         }
         if !self.dark.is_empty() {
-            css.push_str(&format!(
-                "@media (prefers-color-scheme: dark) {{\n:root {{\n{}}}\n}}\n",
-                declarations(&self.dark)
-            ));
+            css.push_str(&scheme_block("dark", &self.dark));
         }
         css
     }
+}
+
+fn scheme_block(scheme: &str, tokens: &BTreeMap<String, String>) -> String {
+    format!(
+        "@media (prefers-color-scheme: {scheme}) {{\n:root {{\n{}}}\n}}\n",
+        declarations(tokens)
+    )
 }
 
 fn declarations(tokens: &BTreeMap<String, String>) -> String {
@@ -169,9 +183,33 @@ mod tests {
 
         let css = theme.to_css();
 
+        let light = css
+            .find("@media (prefers-color-scheme: light) {")
+            .expect("a light block");
+        let dark = css
+            .find("@media (prefers-color-scheme: dark) {")
+            .expect("a dark block");
+        assert!(light < dark, "light first, then dark: {css}");
         assert!(css.contains(":root {\n    --window-bg: #FAFAFA;\n}"));
-        assert!(css.contains("@media (prefers-color-scheme: dark) {"));
         assert!(css.contains("--text: #EEE;"));
+    }
+
+    /// The bug this scoping exists to prevent. A bare `:root` would be
+    /// emitted after theme.css's own dark block, win on source order at
+    /// equal specificity, and paint a light-only theme over dark mode —
+    /// leaving the shipped dark `--text` on the user's light background.
+    #[test]
+    fn a_light_only_theme_does_not_reach_dark_mode() {
+        let css = Theme::parse(r##"{"light":{"window-bg":"#FFFFFF"}}"##).to_css();
+
+        assert!(
+            css.starts_with("@media (prefers-color-scheme: light) {"),
+            "the light block must be scoped, not bare: {css}"
+        );
+        assert!(
+            !css.contains("dark"),
+            "nothing may apply to dark mode: {css}"
+        );
     }
 
     /// The common case: no file, no theme, and a page identical to the one
@@ -222,7 +260,10 @@ mod tests {
     fn an_unknown_token_is_dropped() {
         let theme = Theme::parse(r##"{"light":{"not-a-token":"#fff","window-bg":"#000"}}"##);
 
-        assert_eq!(theme.to_css(), ":root {\n    --window-bg: #000;\n}\n");
+        assert_eq!(
+            theme.to_css(),
+            "@media (prefers-color-scheme: light) {\n:root {\n    --window-bg: #000;\n}\n}\n"
+        );
     }
 
     /// A name carrying its own punctuation is refused by the same rule,
@@ -240,7 +281,10 @@ mod tests {
         let theme =
             Theme::parse(r##"{"light":{"window-bg":"#000","accent":"javascript:alert(1)"}}"##);
 
-        assert_eq!(theme.to_css(), ":root {\n    --window-bg: #000;\n}\n");
+        assert_eq!(
+            theme.to_css(),
+            "@media (prefers-color-scheme: light) {\n:root {\n    --window-bg: #000;\n}\n}\n"
+        );
     }
 
     /// A hand-edited file must not stop the window from being drawn.
@@ -264,10 +308,11 @@ mod tests {
     /// colours instead of being half-overridden.
     #[test]
     fn one_block_alone_is_fine() {
-        let dark_only = Theme::parse(r##"{"dark":{"window-bg":"#000"}}"##);
+        let css = Theme::parse(r##"{"dark":{"window-bg":"#000"}}"##).to_css();
 
-        let css = dark_only.to_css();
-        assert!(css.starts_with("@media (prefers-color-scheme: dark)"));
-        assert!(!css.contains(":root {\n    --window-bg: #000;\n}\n:root"));
+        assert_eq!(
+            css,
+            "@media (prefers-color-scheme: dark) {\n:root {\n    --window-bg: #000;\n}\n}\n"
+        );
     }
 }

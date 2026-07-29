@@ -10,8 +10,12 @@
 //! The one failure that costs something is a slow host, because this runs
 //! inside the keystroke path. That is what the timeout is for, and the
 //! breaker after it: a host that is reliably too slow stops being asked
-//! for a while, so the cost of somebody else's bug is bounded at one
-//! timeout per cooldown rather than one per keystroke.
+//! for a while, so the cost of somebody else's bug is a few timeouts per
+//! cooldown rather than one per keystroke. A few, not one — the cooldown
+//! expiring clears the failure count as well, so a host that is still
+//! broken has to fail `FAILURES_BEFORE_OPEN` times again before it is
+//! left alone. That is the price of ever letting a recovered host back
+//! in without being told.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,11 +115,23 @@ impl PluginClient {
 
     /// Re-reads `plugins.enable`. Called at startup and whenever the
     /// settings app reports a change.
+    ///
+    /// Also forgets whatever the breaker had concluded. Turning the
+    /// feature off and on again is what a user does when a plugin
+    /// misbehaved and they have since fixed or restarted it, so it is the
+    /// clearest signal available that the old verdict no longer describes
+    /// anything. Without this, a host that had just been repaired stayed
+    /// unasked and silent for the rest of the cooldown, and the only thing
+    /// the user could see was that toggling had not helped.
     pub(crate) fn reload_config(&self) {
         let enabled = shared::AppConfig::read().plugins.enable;
         if self.enabled.swap(enabled, Ordering::Relaxed) != enabled {
             tracing::info!(enabled, "plugin hook switched");
         }
+
+        let mut breaker = self.breaker.lock().unwrap_or_else(|e| e.into_inner());
+        breaker.consecutive_failures = 0;
+        breaker.open_until = None;
     }
 
     /// What the host would add to this list, or nothing.
@@ -375,7 +391,14 @@ mod tests {
             },
         );
 
+        // Explicitly off, for the same reason `client_for` sets it
+        // explicitly on: `connect` ends with `reload_config`, which reads
+        // the real settings.json. Leaving it to do that made this test
+        // fail on a machine with plugins enabled and pass vacuously on one
+        // with no settings file at all — which is every CI runner.
         let client = PluginClient::connect(format!(r"\\.\pipe\{base}"));
+        client.enabled.store(false, Ordering::Relaxed);
+
         let started = Instant::now();
         let offered = client.offer("きょう", &[spanning("今日", 4, 3)]).await;
 
@@ -448,6 +471,25 @@ mod tests {
             0
         );
         server.abort();
+    }
+
+    /// Toggling the feature is what a user does after fixing a plugin, so
+    /// it has to clear the verdict the breaker reached about the old one.
+    #[tokio::test]
+    async fn reloading_the_config_forgets_the_breaker() {
+        let client = client_for(&unique_pipe("reload"));
+
+        for _ in 0..FAILURES_BEFORE_OPEN {
+            client.record_failure("test");
+        }
+        assert!(client.breaker_is_open(), "the breaker must have tripped");
+
+        client.reload_config();
+
+        assert!(
+            !client.breaker_is_open(),
+            "a config reload must give the host another chance"
+        );
     }
 
     /// Nothing to convert, nothing to ask about.

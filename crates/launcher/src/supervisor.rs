@@ -261,7 +261,7 @@ mod tests {
         run_optional_supervisor(
             "azookey-no-such-binary-should-ever-exist.exe",
             "[test]",
-            r"\.\pipe\azookey_test_nonexistent".to_string(),
+            r"\\.\pipe\azookey_test_nonexistent".to_string(),
         )
         .await;
 
