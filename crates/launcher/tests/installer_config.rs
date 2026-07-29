@@ -82,6 +82,96 @@ fn the_plugin_host_is_supervised_non_fatally() {
     );
 }
 
+/// The settings app's executable name must be the one the bundler will
+/// actually produce.
+///
+/// Tauri names the binary after `mainBinaryName`, and WITHOUT that key it
+/// names it after the crate — so `productName` being "Azookey" says
+/// nothing about what ships. That is how the installer came to name a
+/// process no machine has ever run (#97): the taskkill and the WMI query
+/// asked for `Azookey.exe` while the file was called `frontend.exe`, and
+/// every test here passed because they asked for the same wrong name.
+#[test]
+fn the_settings_app_is_named_the_same_everywhere() {
+    let binary = settings_app_binary();
+    assert_eq!(
+        binary, "Azookey.exe",
+        "the settings app's name changed; every reference below has to change with it"
+    );
+
+    let iss = read("Installer.iss");
+    let params = iss
+        .lines()
+        .find(|l| l.contains("/IM") && l.contains("launcher.exe"))
+        .expect("Installer.iss should pass the processes to taskkill via /IM");
+    assert!(
+        params.contains(&binary),
+        "uninstall's taskkill must name the settings app as it is actually \
+         built: got {params}"
+    );
+
+    let query = code_block(&iss, "function StackProcesses")
+        .split("ExecQuery")
+        .nth(1)
+        .expect("StackProcesses should run a WMI query")
+        .to_string();
+    assert!(
+        query.contains(&binary),
+        "the WMI query must name the settings app as it is actually built: \
+         got {query}"
+    );
+
+    assert!(
+        workspace_file("SIGNING.md").contains(&binary),
+        "an unsigned settings app is the failure this list exists to prevent"
+    );
+}
+
+/// Everything the installer ships as an executable has to be on the
+/// signing list. `plugin-host.exe` was added, packaged, and left off it —
+/// which would have shipped one unsigned binary among signed ones, the
+/// hardest kind of gap to notice because nothing fails.
+#[test]
+fn every_packaged_executable_is_on_the_signing_list() {
+    let signing = workspace_file("SIGNING.md");
+
+    for exe in required_executables() {
+        assert!(
+            signing.contains(&exe),
+            "{exe} is packaged but missing from SIGNING.md"
+        );
+    }
+}
+
+/// `mainBinaryName` from the Tauri config, with the extension the bundler
+/// adds. Read rather than hardcoded — hardcoding is what let the two
+/// drift apart in the first place.
+fn settings_app_binary() -> String {
+    let config = workspace_file("frontend/src-tauri/tauri.conf.json");
+    let name = config
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("\"mainBinaryName\":"))
+        .map(|rest| rest.trim().trim_matches(|c| c == '"' || c == ',').trim())
+        .map(str::to_string)
+        .expect(
+            "tauri.conf.json must set mainBinaryName; without it Tauri names \
+             the binary after the crate and every reference to it here is wrong",
+        );
+    format!("{name}.exe")
+}
+
+/// The `.exe` entries of post_build's required-artifact list — what the
+/// installer is guaranteed to ship.
+fn required_executables() -> Vec<String> {
+    workspace_file("Makefile.toml")
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("\"build/"))
+        .filter_map(|rest| rest.split('"').next())
+        .filter(|name| name.ends_with(".exe"))
+        .map(str::to_string)
+        .collect()
+}
+
 fn workspace_file(relative: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

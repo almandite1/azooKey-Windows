@@ -32,7 +32,8 @@ Everything the installer places that Windows executes or loads:
 | `azookey-server.dll` | `server-swift/` — the Swift conversion engine |
 | `ui.exe` | `crates/ui` — candidate window and mode indicator |
 | `launcher.exe` | `crates/launcher` — supervisor for server and UI |
-| `Azookey.exe` | `frontend/` — the Tauri settings app |
+| `plugin-host.exe` | `crates/plugin-host` — the add-on host |
+| `Azookey.exe` | `frontend/` — the Tauri settings app. The name comes from `mainBinaryName` in `frontend/src-tauri/tauri.conf.json`; without it Tauri names the binary after the crate, and this list stops matching what ships (#97) |
 
 ## Provenance
 
