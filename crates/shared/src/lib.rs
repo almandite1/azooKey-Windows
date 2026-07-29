@@ -150,10 +150,14 @@ pub struct PluginEntry {
     pub enabled: bool,
 }
 
-/// Add-on settings. Nothing reads these yet — the plugin host does not
-/// exist in this build — but the schema lands first so a settings.json
-/// written from here on already has the section, and the opt-in it
-/// describes is off by default.
+/// Add-on settings, off by default.
+///
+/// `enable` is read by the conversion server, at startup and on every
+/// UpdateConfig, and decides whether the plugin host is asked anything at
+/// all. `entries` is NOT read by anything in this build: the host runs a
+/// fixed set of builtins, so setting an entry's `enabled` to false does
+/// not stop it. It is here because the schema is the part that has to
+/// land early, and per-plugin opt-in is what it will carry.
 ///
 /// `enable` is the master switch, separate from the per-entry `enabled`:
 /// turning the feature off must not require the user to disable every
@@ -380,11 +384,10 @@ mod tests {
         }
     }
 
-    /// Nothing links against the plugin API yet — the host that serves it
-    /// and the client that calls it are still to come — so a build.rs that
-    /// quietly stopped compiling plugin.proto would break nothing until
-    /// then. Naming the generated types here is what makes that a build
-    /// failure now rather than a puzzle later.
+    /// The host and the client both link against this now, so a build.rs
+    /// that stopped compiling plugin.proto would fail loudly on its own.
+    /// The test stays because it fails FIRST and in one line, rather than
+    /// as a hundred missing-type errors in two other crates.
     #[test]
     fn the_plugin_api_surface_is_generated() {
         use crate::proto::plugin_host_service_client::PluginHostServiceClient;

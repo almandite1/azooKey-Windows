@@ -4,7 +4,9 @@
 //! [`logging`] (the session log file), [`job`] (the kill-on-close job the
 //! children are tied to), [`policy`] (the pure restart/hang decisions) and
 //! [`supervisor`] (the loop that applies them). This file is startup: the
-//! single-instance guard, the backend PATH, and the two supervisors.
+//! single-instance guard, the backend PATH, and the three supervisors —
+//! two of which may end the launcher when they give up, and one of which
+//! may not.
 
 mod job;
 mod logging;

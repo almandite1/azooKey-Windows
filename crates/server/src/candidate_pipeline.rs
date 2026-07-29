@@ -100,16 +100,22 @@ const MAX_ADDED_CANDIDATES: usize = 3;
 ///   replacement list: there is nothing for a plugin to say about order.
 /// - at most `MAX_ADDED_CANDIDATES` survive, so the bound holds however
 ///   many plugins want in.
-/// - a text the list already carries is not added again.
+/// - a text the list already carries is not added again, and neither is
+///   one the SAME answer already offered. The Dedup stage cannot clean up
+///   after this one — it runs before it, and has to, for the rank to mean
+///   a row the user will see — so duplicates among the additions would
+///   reach the window. One host answering twice is easy to dismiss as a
+///   host bug; the moment several plugins are summed into one answer it
+///   stops being anybody's bug in particular.
 ///
 /// The rank is clamped to the list, so a short list appends rather than
 /// leaving a gap.
 fn insert_added(mut candidates: Vec<Suggestion>, added: Vec<Suggestion>) -> Vec<Suggestion> {
-    let existing: std::collections::HashSet<&str> =
-        candidates.iter().map(|c| c.text.as_str()).collect();
+    let mut seen: std::collections::HashSet<String> =
+        candidates.iter().map(|c| c.text.clone()).collect();
     let fresh: Vec<Suggestion> = added
         .into_iter()
-        .filter(|c| !existing.contains(c.text.as_str()))
+        .filter(|c| seen.insert(c.text.clone()))
         .take(MAX_ADDED_CANDIDATES)
         .collect();
 
@@ -405,6 +411,54 @@ mod tests {
             texts(&out),
             [
                 "候補0", "候補1", "候補2", "候補3", "追加0", "追加1", "追加2", "候補4", "候補5"
+            ]
+        );
+    }
+
+    /// Dedup runs BEFORE this stage and cannot come back to tidy up, so
+    /// an answer that repeats itself would reach the window repeating
+    /// itself. Today one host says it twice; once several plugins are
+    /// summed into one answer, two of them agreeing is the ordinary case.
+    #[test]
+    fn an_answer_that_repeats_itself_is_placed_once() {
+        let engine: Vec<Suggestion> = (0..6)
+            .map(|i| spanning(&format!("候補{i}"), 4, 3))
+            .collect();
+        let offered = [
+            spanning("追加", 4, 3),
+            spanning("追加", 4, 3),
+            spanning("追加", 4, 3),
+        ];
+
+        let out = run_offering("きょう", &offered, engine);
+
+        assert_eq!(
+            texts(&out),
+            ["候補0", "候補1", "候補2", "候補3", "追加", "候補4", "候補5"]
+        );
+    }
+
+    /// The cap counts what is placed, not what was offered: three copies
+    /// of one text must not spend the whole budget and crowd out a second
+    /// distinct candidate behind them.
+    #[test]
+    fn duplicates_do_not_spend_the_cap() {
+        let engine: Vec<Suggestion> = (0..6)
+            .map(|i| spanning(&format!("候補{i}"), 4, 3))
+            .collect();
+        let offered = [
+            spanning("A", 4, 3),
+            spanning("A", 4, 3),
+            spanning("A", 4, 3),
+            spanning("B", 4, 3),
+        ];
+
+        let out = run_offering("きょう", &offered, engine);
+
+        assert_eq!(
+            texts(&out),
+            [
+                "候補0", "候補1", "候補2", "候補3", "A", "B", "候補4", "候補5"
             ]
         );
     }

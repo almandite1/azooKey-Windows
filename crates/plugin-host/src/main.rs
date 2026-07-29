@@ -10,9 +10,9 @@
 //! timeout the server rides out, and a plugin that crashes is a process
 //! the launcher restarts while typing carries on.
 //!
-//! Nothing calls this yet — the server-side hook comes next. Started by
-//! hand it is a working host; started by the launcher it will be the third
-//! supervised child.
+//! The launcher starts it as its third supervised child, and the
+//! conversion server calls it once per keystroke while `plugins.enable`
+//! is set. Started by hand it is a working host on its own.
 
 mod builtin;
 mod service;
