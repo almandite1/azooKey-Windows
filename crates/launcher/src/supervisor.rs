@@ -38,6 +38,30 @@ pub(crate) async fn run_supervisor(exe: &'static str, prefix: &'static str, pipe
     }
 }
 
+/// Runs one child's supervisor and, if it gives up, lets the rest of the
+/// stack carry on.
+///
+/// For a child the IME does not need. [`run_supervisor`] ends the launcher
+/// because a dead server or UI means no input at all, so releasing the
+/// single-instance mutex is the only route back. That reasoning does not
+/// transfer: the plugin host going away costs the user their add-on
+/// candidates and nothing else, and the conversion path treats an absent
+/// host exactly like a switched-off one. Tearing down a working IME
+/// because an optional process could not be kept alive would turn a
+/// cosmetic failure into a total one — and, through the job object, would
+/// do it by killing the very server that was still working.
+pub(crate) async fn run_optional_supervisor(
+    exe: &'static str,
+    prefix: &'static str,
+    pipe_name: String,
+) {
+    if supervise(exe, prefix, &pipe_name).await == SuperviseOutcome::GaveUp {
+        log_err(&format!(
+            "{prefix} is unrecoverable; carrying on without it (conversion is unaffected)"
+        ));
+    }
+}
+
 /// Why a supervisor loop stopped.
 #[derive(Debug, PartialEq, Eq)]
 enum SuperviseOutcome {
@@ -218,4 +242,29 @@ where
             sink(&format!("{}: {}", prefix, line));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_optional_supervisor;
+
+    /// The whole difference between the two variants, and the only way to
+    /// assert it: `run_supervisor` ends the PROCESS when it gives up, so a
+    /// non-fatal variant that accidentally took the same path would kill
+    /// this test binary rather than fail an assertion. Reaching the line
+    /// after the await is the proof.
+    ///
+    /// A name nothing can spawn makes the supervisor give up immediately,
+    /// which is the same verdict a crash loop reaches the slow way.
+    #[tokio::test]
+    async fn an_optional_child_that_cannot_start_does_not_end_the_launcher() {
+        run_optional_supervisor(
+            "azookey-no-such-binary-should-ever-exist.exe",
+            "[test]",
+            r"\.\pipe\azookey_test_nonexistent".to_string(),
+        )
+        .await;
+
+        // if the variant exited, nothing below would run
+    }
 }

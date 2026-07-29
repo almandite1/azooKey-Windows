@@ -243,6 +243,7 @@ cp target/$str/ui.exe build
 cp target/$str/azookey-server.exe build
 cp target/$str/azookey_windows.dll build
 cp target/$str/launcher.exe build
+cp target/$str/plugin-host.exe build
 
 
 cp target/i686-pc-windows-msvc/$str/azookey_windows.dll build/x86
@@ -302,6 +303,7 @@ $required = @(
     "build/azookey-server.dll",
     "build/azookey_windows.dll",
     "build/launcher.exe",
+    "build/plugin-host.exe",
     "build/x86/azookey_windows.dll",
     "build/zenz.gguf",
     "build/llama_cpu/llama.dll",
