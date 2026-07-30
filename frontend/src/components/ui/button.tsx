@@ -50,6 +50,9 @@ function Button({
   return (
     <Comp
       data-slot="button"
+      // a bare <button> defaults to type="submit"; asChild is excluded because
+      // Slot would copy the attribute onto whatever element the caller passed
+      type={asChild ? undefined : "button"}
       className={cn(buttonVariants({ variant, size, className }))}
       {...props}
     />

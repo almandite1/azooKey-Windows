@@ -1,4 +1,5 @@
 import { Bot, Settings, Megaphone } from "lucide-react"
+import { Link, useLocation } from "react-router"
 
 import {
     Sidebar,
@@ -41,46 +42,52 @@ const footer = [
 ]
 
 export function AppSidebar() {
-    let currentPath = window.location.pathname;
+    const { pathname } = useLocation();
 
     return (
         <Sidebar>
+            {/* client-side <Link>, not <a href>: a real navigation would ask the
+                embedded asset protocol for /zenzai, which has no SPA fallback */}
             <SidebarContent>
-                <SidebarGroup>
-                    <SidebarGroupLabel>設定</SidebarGroupLabel>
-                    <SidebarGroupContent>
-                        <SidebarMenu>
-                            {contents.map((item) => (
-                                <SidebarMenuItem key={item.title} className={currentPath == item.url ? "[&>*]:bg-sidebar-accent" : ""}>
-                                    <SidebarMenuButton asChild>
-                                        <a href={item.url}>
-                                            <item.icon />
-                                            <span>{item.title}</span>
-                                        </a>
-                                    </SidebarMenuButton>
-                                </SidebarMenuItem>
-                            ))}
-                        </SidebarMenu>
-                    </SidebarGroupContent>
-                </SidebarGroup>
+                <nav aria-label="設定メニュー">
+                    <SidebarGroup>
+                        <SidebarGroupLabel>設定</SidebarGroupLabel>
+                        <SidebarGroupContent>
+                            <SidebarMenu>
+                                {contents.map((item) => (
+                                    <SidebarMenuItem key={item.title}>
+                                        <SidebarMenuButton asChild isActive={pathname === item.url}>
+                                            <Link to={item.url} aria-current={pathname === item.url ? "page" : undefined}>
+                                                <item.icon aria-hidden="true" />
+                                                <span>{item.title}</span>
+                                            </Link>
+                                        </SidebarMenuButton>
+                                    </SidebarMenuItem>
+                                ))}
+                            </SidebarMenu>
+                        </SidebarGroupContent>
+                    </SidebarGroup>
+                </nav>
             </SidebarContent>
             <SidebarFooter>
-                <SidebarGroup>
-                    <SidebarGroupContent>
-                        <SidebarMenu>
-                            {footer.map((item) => (
-                                <SidebarMenuItem key={item.title} className={currentPath == item.url ? "[&>*]:bg-sidebar-accent" : ""}>
-                                    <SidebarMenuButton asChild>
-                                        <a href={item.url}>
-                                            <item.icon />
-                                            <span>{item.title}</span>
-                                        </a>
-                                    </SidebarMenuButton>
-                                </SidebarMenuItem>
-                            ))}
-                        </SidebarMenu>
-                    </SidebarGroupContent>
-                </SidebarGroup>
+                <nav aria-label="このアプリについて">
+                    <SidebarGroup>
+                        <SidebarGroupContent>
+                            <SidebarMenu>
+                                {footer.map((item) => (
+                                    <SidebarMenuItem key={item.title}>
+                                        <SidebarMenuButton asChild isActive={pathname === item.url}>
+                                            <Link to={item.url} aria-current={pathname === item.url ? "page" : undefined}>
+                                                <item.icon aria-hidden="true" />
+                                                <span>{item.title}</span>
+                                            </Link>
+                                        </SidebarMenuButton>
+                                    </SidebarMenuItem>
+                                ))}
+                            </SidebarMenu>
+                        </SidebarGroupContent>
+                    </SidebarGroup>
+                </nav>
             </SidebarFooter>
         </Sidebar>
     )

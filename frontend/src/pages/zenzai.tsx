@@ -122,46 +122,50 @@ export const Zenzai = () => {
 
     return (
         <div className="space-y-8">
-            <section className="space-y-2">
-                <h1 className="text-sm font-bold text-foreground">Zenzai</h1>
+            {/* the one heading on this page doubles as the page title and the
+                section's accessible name */}
+            <section className="space-y-2" aria-labelledby="zenzai-heading">
+                <h1 id="zenzai-heading" className="text-lg font-bold text-foreground">Zenzai</h1>
                 <div className="flex items-center space-x-4 rounded-md border p-4">
-                    <Bot />
+                    <Bot aria-hidden="true" />
                     <div className="flex-1 space-y-1">
-                        <p className="text-sm font-medium leading-none">
+                        <label htmlFor="zenzai-enable" className="text-sm font-medium leading-none">
                             Zenzaiを有効化
-                        </p>
-                        <p className="text-xs text-muted-foreground">
+                        </label>
+                        <p id="zenzai-enable-description" className="text-xs text-muted-foreground">
                             Zenzaiを有効にして、変換精度を向上させます
                         </p>
                     </div>
-                    <Switch checked={value.enable} onCheckedChange={handleZenzaiChange} />
+                    <Switch id="zenzai-enable" aria-describedby="zenzai-enable-description" checked={value.enable} onCheckedChange={handleZenzaiChange} />
                 </div>
                 <div className="space-y-4 rounded-md border p-4">
                     <div className="flex items-center space-x-4 ">
-                        <User />
+                        <User aria-hidden="true" />
                         <div className="flex-1 space-y-1">
-                            <p className="text-sm font-medium leading-none">
+                            <label htmlFor="zenzai-profile" className="text-sm font-medium leading-none">
                                 変換プロファイル
-                            </p>
-                            <p className="text-xs text-muted-foreground">
+                            </label>
+                            <p id="zenzai-profile-description" className="text-xs text-muted-foreground">
                                 Zenzaiで利用されるユーザー情報を設定します
                             </p>
                         </div>
                     </div>
-                    <Textarea placeholder="例）山田太郎、数学科の学生。" value={value.profile} disabled={!value.enable} onChange={handleProfileChange} />
+                    <Textarea id="zenzai-profile" aria-describedby="zenzai-profile-description" placeholder="例）山田太郎、数学科の学生。" value={value.profile} disabled={!value.enable} onChange={handleProfileChange} />
                 </div>
                 <div className="flex items-center space-x-4 rounded-md border p-4">
-                    <Cpu />
+                    <Cpu aria-hidden="true" />
                     <div className="flex-1 space-y-1">
-                        <p className="text-sm font-medium leading-none">
+                        {/* SelectTrigger is a <button role="combobox">, so it takes
+                            aria-labelledby rather than a <label for> */}
+                        <p id="zenzai-backend-label" className="text-sm font-medium leading-none">
                             バックエンド
                         </p>
-                        <p className="text-xs text-muted-foreground">
+                        <p id="zenzai-backend-description" className="text-xs text-muted-foreground">
                             Zenzaiを利用するバックエンドを選択します
                         </p>
                     </div>
                     <Select disabled={!value.enable} value={value.backend} onValueChange={handleBackendChange}>
-                        <SelectTrigger className="w-48">
+                        <SelectTrigger id="zenzai-backend" className="w-48" aria-labelledby="zenzai-backend-label zenzai-backend" aria-describedby="zenzai-backend-description">
                             <SelectValue placeholder="バックエンドを選択" />
                         </SelectTrigger>
                         <SelectContent>
