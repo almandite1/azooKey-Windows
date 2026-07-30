@@ -255,9 +255,33 @@ impl TextServiceFactory_Impl {
             tracing::warn!("could not record the mode toggle time: {error:?}");
         }
 
-        self.start_composition()?;
-        self.update_pos();
-        self.end_composition()?;
+        // Tearing the composition down needs a document context; publishing
+        // the mode does not. And `context` is recorded on the KEY path alone
+        // (`handle_key` / `toggle_input_mode` in engine/key_dispatch.rs), so a
+        // mode switch that arrived as a CLICK on the language-bar item finds
+        // none in an application the user has not typed in yet — where
+        // `start_composition` failed with "Context is null" and took the whole
+        // arm with it, before the mode was ever published. That is why clicking
+        // the あ/A in the notification area did nothing at all until something
+        // had been typed (issue #99).
+        //
+        // Skipping is safe as well as necessary: with no context there is no
+        // composition of ours to end, because losing the focus is what brought
+        // us here and `OnSetFocus` ends the composition on the document being
+        // left. It is the rule `update_pos_from_selection` already follows —
+        // no context is normal, and it must never open an edit session on a
+        // context it does not have.
+        // bound rather than tested inline: `start_composition` borrows the
+        // service again, and a borrow still alive from the condition would
+        // fail it
+        let has_context = self.borrow()?.context.is_some();
+        if has_context {
+            self.start_composition()?;
+            self.update_pos();
+            self.end_composition()?;
+        } else {
+            tracing::debug!("No context; switching the mode without a composition");
+        }
 
         self.close_candidate_ui(ipc_service);
 
@@ -403,8 +427,8 @@ mod tests {
     use crate::engine::ipc_service::{CandidateView, Candidates, FakeIpc, IpcCall};
     use crate::engine::test_util::{install_fake_ipc, recorded_calls, scripted};
     use crate::tsf::test_support::{
-        EditSessionBehavior, FakeContext, RangeLog, factory_of, factory_with_context,
-        factory_with_fake_context, global_state_lock,
+        CompartmentLog, EditSessionBehavior, FakeContext, FakeThreadMgr, RangeLog, ThreadMgrLog,
+        factory_of, factory_with_context, factory_with_fake_context, global_state_lock,
     };
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
@@ -876,6 +900,65 @@ mod tests {
         assert!(
             recorded_calls(&fake).contains(&IpcCall::ClearText),
             "the server's reading must be dropped too, or it comes back on the next key"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// A mode switch that arrived as a CLICK on the language-bar item has no
+    /// document context: `context` is recorded on the key path alone, so an
+    /// application nothing has been typed into yet has none. The composition
+    /// teardown is what is optional in that case — the mode is not.
+    ///
+    /// Issue #99: `start_composition` failed with "Context is null" and took
+    /// the whole arm with it, so clicking the あ/A in the notification area did
+    /// nothing at all until something had been typed. Everything the mode
+    /// switch consists of is asserted here, because "did nothing" was the bug.
+    #[test]
+    fn a_mode_switch_needs_no_document_context() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(Candidates::default());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = factory_of(&tip);
+        let compartments = Rc::new(CompartmentLog::default());
+        let log = Rc::new(ThreadMgrLog::default());
+        {
+            let mut text_service = factory.borrow_mut().unwrap();
+            // a thread manager, so publishing the mode can actually succeed
+            text_service.thread_mgr = Some(FakeThreadMgr::with_compartments(
+                log.clone(),
+                compartments.clone(),
+            ));
+            // ...and no context, which is what a click looks like
+            text_service.context = None;
+        }
+
+        factory
+            .handle_action(
+                &[ClientAction::SetIMEMode(InputMode::Kana)],
+                CompositionState::None,
+            )
+            .expect("switching the mode must not require a document context");
+
+        assert_eq!(
+            factory.borrow().unwrap().input_mode,
+            InputMode::Kana,
+            "the cached mode is what the language-bar icon is drawn from"
+        );
+        assert!(
+            log.langbar_adds.get() > 0,
+            "the icon must be refreshed, or the tray keeps showing the old mode"
+        );
+
+        let calls = recorded_calls(&fake);
+        assert!(
+            calls.contains(&IpcCall::SetInputMode("あ".to_string())),
+            "the mode indicator must be told: {calls:?}"
+        );
+        assert!(
+            calls.contains(&IpcCall::ClearText),
+            "the server's reading goes with the mode switch: {calls:?}"
         );
 
         IMEState::get().unwrap().ipc_service = None;
