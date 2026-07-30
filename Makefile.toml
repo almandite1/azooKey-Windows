@@ -10,6 +10,10 @@ args = ["fmt"]
 description = "Build the swift code"
 script_runner = "@shell"
 script = """
+# set -e, or the cp below runs even when swift build failed -- and then the
+# Rust link picks up the PREVIOUS azookey-server.lib. The build goes green
+# with an engine nobody compiled.
+set -e
 cd server-swift
 swift build -c release
 cp .build/x86_64-unknown-windows-msvc/release/azookey-server.lib ../
@@ -196,6 +200,7 @@ Write-Host "SBOM written to $cdx and $spdx"
 description = "Build the Tauri settings app"
 script_runner = "@shell"
 script = """
+set -e
 cd frontend
 npm run tauri build -- --no-bundle
 """
