@@ -39,4 +39,3 @@ struct SessionState {
 // become real, configurable paths when the learning feature lands.
 let emojiDictionaryFileName = "emoji_all_E16.0.txt"
 let placeholderDataDirectory = URL(filePath: "./test")
-let zenzaiInferenceLimit = 1

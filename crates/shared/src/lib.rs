@@ -144,6 +144,18 @@ pub struct ZenzaiConfig {
     pub enable: bool,
     pub profile: String,
     pub backend: String,
+    /// How many times the model may re-run to improve one conversion.
+    /// The engine clamps this to 1..=10; the default stays at what the
+    /// engine hardcoded before it was configurable, so upgrading does not
+    /// silently make everyone's typing slower.
+    pub inference_limit: u32,
+    /// The three v3 context strings, the same shape as `profile`: short
+    /// hints the model is given about what the user is writing about
+    /// (`topic`), how (`style`) and what they tend to prefer
+    /// (`preference`). Empty means "say nothing", as with `profile`.
+    pub topic: String,
+    pub style: String,
+    pub preference: String,
 }
 
 impl Default for ZenzaiConfig {
@@ -152,6 +164,10 @@ impl Default for ZenzaiConfig {
             enable: false,
             profile: "".to_string(),
             backend: "cpu".to_string(),
+            inference_limit: 1,
+            topic: "".to_string(),
+            style: "".to_string(),
+            preference: "".to_string(),
         }
     }
 }
@@ -474,6 +490,57 @@ mod tests {
         assert_eq!(config.zenzai.backend, "cpu", "missing field gets a default");
         assert_eq!(config.version, CONFIG_VERSION);
         assert!(root.read_settings().contains(CONFIG_VERSION));
+    }
+
+    /// The zenzai keys added after the first release have to degrade the same
+    /// way `backend` did, and to the values the engine used while they were
+    /// still hardcoded — an upgrade must not change how conversion behaves
+    /// until the user asks it to.
+    #[test]
+    fn zenzai_keys_added_later_default_to_the_previous_behaviour() {
+        let root = TempConfigRoot::new();
+        root.write_settings(
+            r#"{"version":"0.1.0","zenzai":{"enable":true,"profile":"p","backend":"cuda"}}"#,
+        );
+
+        let config = AppConfig::new_in(root.path());
+
+        assert_eq!(
+            config.zenzai.inference_limit, 1,
+            "what the engine hardcoded"
+        );
+        assert_eq!(config.zenzai.topic, "");
+        assert_eq!(config.zenzai.style, "");
+        assert_eq!(config.zenzai.preference, "");
+        assert!(config.zenzai.enable, "the old keys still survive");
+        assert_eq!(config.zenzai.profile, "p");
+    }
+
+    /// The engine decodes this file itself, by field name, so the names have
+    /// to survive a round trip through disk exactly as spelled.
+    #[test]
+    fn the_zenzai_context_keys_round_trip() {
+        let root = TempConfigRoot::new();
+        let mut config = AppConfig::default();
+        config.zenzai.inference_limit = 5;
+        config.zenzai.topic = "ソフトウェア開発".to_string();
+        config.zenzai.style = "ですます調".to_string();
+        config.zenzai.preference = "漢字は控えめに".to_string();
+
+        config.write_to(root.path()).expect("write");
+
+        let stored = root.read_settings();
+        for key in ["inference_limit", "topic", "style", "preference"] {
+            assert!(
+                stored.contains(&format!("\"{key}\"")),
+                "the Swift decoder looks for {key} by name"
+            );
+        }
+        let reread = AppConfig::new_in(root.path());
+        assert_eq!(reread.zenzai.inference_limit, 5);
+        assert_eq!(reread.zenzai.topic, "ソフトウェア開発");
+        assert_eq!(reread.zenzai.style, "ですます調");
+        assert_eq!(reread.zenzai.preference, "漢字は控えめに");
     }
 
     #[test]
