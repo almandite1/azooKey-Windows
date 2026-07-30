@@ -1,6 +1,7 @@
 #ifndef ffi_h
 #define ffi_h
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /*
@@ -49,7 +50,22 @@ struct FFICandidate {
 
 /* engine lifecycle */
 void Initialize(const char *path);
-void LoadConfig(void);
+/*
+ * Applies the settings in `json` — the whole settings.json document as text.
+ *
+ * Takes the text rather than reading the file itself, and returns whether it
+ * worked, for three reasons that were all one bug. The engine used to read
+ * settings.json on its own while the Rust caller read it too, in the same
+ * UpdateConfig, so a save landing between the two reads applied half of one
+ * version and half of the other. A decode failure was kept to itself, so the
+ * settings app reported success while conversion carried on with the old
+ * values. And the path `%APPDATA%\Azookey\settings.json` was spelled out on
+ * both sides of the boundary.
+ *
+ * False means nothing was applied and the engine kept the configuration it
+ * had; the caller reports that rather than claiming the save took effect.
+ */
+bool LoadConfig(const char *json);
 
 /*
  * per-session composing text

@@ -130,8 +130,16 @@ pub(crate) fn set_context(session: i64, context: &str) {
     unsafe { SetContext(session, context.as_ptr()) };
 }
 
-pub(crate) fn load_config() {
-    unsafe { LoadConfig() };
+/// Hands the settings document to the engine and reports whether it took.
+///
+/// The text comes from the caller on purpose. The engine used to open
+/// settings.json itself while the Rust side read it too in the same
+/// UpdateConfig — one save landing between the two reads applied half of each
+/// version — and a decode failure never left the Swift side, so the settings
+/// app said "saved" while conversion kept the old values.
+pub(crate) fn load_config(json: &str) -> bool {
+    let json = to_cstring(json);
+    unsafe { LoadConfig(json.as_ptr()) }
 }
 
 /// Drops the engine's composing state for a session whose connection went

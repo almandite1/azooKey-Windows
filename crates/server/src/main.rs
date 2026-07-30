@@ -26,6 +26,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parent_dir = current_exe
         .parent()
         .ok_or("executable path has no parent directory")?;
+    // Configuration BEFORE Initialize, and from here rather than from the
+    // engine: Initialize warms the converter up using the current options, so
+    // a session that starts with Zenzai on has to know that before the warm-up
+    // rather than on the first keystroke after it. The engine no longer opens
+    // settings.json at all — this process is its only reader.
+    match shared::AppConfig::new().to_engine_json() {
+        Ok(json) => {
+            if !wrappers::load_config(&json) {
+                tracing::warn!("the engine refused the stored settings; using its own defaults");
+            }
+        }
+        Err(e) => tracing::warn!("could not pass the stored settings to the engine: {e}"),
+    }
     wrappers::initialize(&parent_dir.to_string_lossy());
 
     let service = MyAzookeyService::new();

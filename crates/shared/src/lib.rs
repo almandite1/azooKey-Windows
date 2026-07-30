@@ -64,7 +64,7 @@ pub fn config_root_in(base: Option<std::ffi::OsString>) -> Option<PathBuf> {
 }
 
 /// `%LOCALAPPDATA%\Azookey` — where per-user RUNTIME state belongs: logs,
-/// crash dumps, the WebView2 profile. Deliberately not `get_config_root`:
+/// crash dumps, the WebView2 profile. Deliberately not [`config_root`]:
 /// that one is `%APPDATA%` (roaming), which is for settings a user would
 /// want to follow them between machines, not for a browser profile.
 ///
@@ -362,6 +362,42 @@ fn config_root_or_error() -> Result<PathBuf, String> {
 }
 
 impl AppConfig {
+    /// This build's canonical form of these settings: the version stamped and
+    /// every bounded value inside its range.
+    ///
+    /// One function so that what goes into the file and what goes to the
+    /// engine cannot differ — they are the same document, produced here.
+    fn normalized(&self) -> AppConfig {
+        let mut config = AppConfig {
+            // whatever version the caller happens to be holding, what lands
+            // on disk is this build's schema — the settings app round-trips
+            // the whole config through the frontend, version field included
+            version: CONFIG_VERSION.to_string(),
+            ..self.clone()
+        };
+        // Bounded here, not only by the reader. The engine clamps what it
+        // decodes, but that is across an FFI boundary: until this existed, any
+        // u32 the frontend or a hand-edit produced was persisted verbatim and
+        // only the far side saved us.
+        config.zenzai.inference_limit = config.zenzai.inference_limit.clamp(
+            *ZENZAI_INFERENCE_LIMIT.start(),
+            *ZENZAI_INFERENCE_LIMIT.end(),
+        );
+        config
+    }
+
+    /// These settings as the JSON text the engine is handed.
+    ///
+    /// The engine used to open `settings.json` for itself, which meant one
+    /// `UpdateConfig` read the file twice — once here, once over the FFI
+    /// boundary — and a save landing between the two reads applied half of one
+    /// version and half of the other. Now there is a single read, and the
+    /// engine is given exactly the document this build would have written.
+    pub fn to_engine_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.normalized())
+            .map_err(|e| format!("failed to serialize settings for the engine: {e}"))
+    }
+
     /// Persist to `settings.json`, refusing to overwrite a file this build
     /// cannot account for — one written by a newer schema (whose unknown keys
     /// serializing through this build would drop), or one that is not JSON at
@@ -400,22 +436,7 @@ impl AppConfig {
             LoadOutcome::Parsed(_) | LoadOutcome::Missing => {}
         }
 
-        // whatever version the caller happens to be holding, what lands on
-        // disk is this build's schema — the settings app round-trips the
-        // whole config through the frontend, version field included
-        let mut stamped = AppConfig {
-            version: CONFIG_VERSION.to_string(),
-            ..self.clone()
-        };
-        // Bounded on the way out, not only on the way in. The engine clamps
-        // what it reads, but that is across an FFI boundary from here: until
-        // this line, any u32 the frontend or a hand-edit produced was
-        // persisted verbatim and only the reader saved us.
-        stamped.zenzai.inference_limit = stamped.zenzai.inference_limit.clamp(
-            *ZENZAI_INFERENCE_LIMIT.start(),
-            *ZENZAI_INFERENCE_LIMIT.end(),
-        );
-        let config_str = serde_json::to_string_pretty(&stamped)
+        let config_str = serde_json::to_string_pretty(&self.normalized())
             .map_err(|e| format!("failed to serialize settings: {e}"))?;
         // write-then-rename rather than a plain write: fs::write truncates
         // first, so a crash or power loss mid-write leaves a half-file that
@@ -1046,6 +1067,34 @@ mod tests {
         assert_eq!(
             AppConfig::read_in(root.path()).zenzai.inference_limit,
             *ZENZAI_INFERENCE_LIMIT.start()
+        );
+    }
+
+    /// The defaults are Rust's to define, and the Swift engine has its own
+    /// copy of every one of them. Nothing compared the two, so "the default
+    /// inference limit is 1" could stop being true on one side only — and the
+    /// symptom would be conversion behaving differently from what the settings
+    /// app shows, with no test failing anywhere.
+    ///
+    /// Both suites read this file: here it is compared against what this build
+    /// serializes, and in `config_tests.swift` it is applied to a fresh
+    /// `EngineConfig` and expected to change nothing.
+    #[test]
+    fn the_defaults_match_the_shared_fixture() {
+        let fixture = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/default-settings.json"),
+        )
+        .expect("read fixtures/default-settings.json");
+
+        let expected: serde_json::Value =
+            serde_json::from_str(&fixture).expect("the fixture is JSON");
+        let actual: serde_json::Value =
+            serde_json::to_value(AppConfig::default()).expect("serialize the defaults");
+
+        assert_eq!(
+            actual, expected,
+            "the defaults changed; update fixtures/default-settings.json and check that the \
+             Swift engine's EngineConfig still agrees with it"
         );
     }
 

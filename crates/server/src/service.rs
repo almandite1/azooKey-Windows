@@ -186,7 +186,22 @@ impl AzookeyService for MyAzookeyService {
         &self,
         _: Request<shared::proto::UpdateConfigRequest>,
     ) -> Result<Response<shared::proto::UpdateConfigResponse>, Status> {
-        load_config();
+        // ONE read, here, handed to both halves. The engine used to open
+        // settings.json for itself, so this RPC read the file twice and a save
+        // landing between the two reads applied half of each version.
+        let config = shared::AppConfig::try_read().map_err(Status::failed_precondition)?;
+        let json = config
+            .to_engine_json()
+            .map_err(|e| Status::internal(format!("could not pass the settings on: {e}")))?;
+
+        // Reported, not swallowed. A decode failure in the engine used to stay
+        // there: the settings app showed a success toast while conversion
+        // carried on with the values it already had.
+        if !load_config(&json) {
+            return Err(Status::internal(
+                "the conversion engine refused the new settings and kept the ones it had",
+            ));
+        }
         // the same signal reaches the Rust side: `plugins.enable` lives in
         // settings.json too, and the engine's reload does not carry it
         self.plugins.reload_config();

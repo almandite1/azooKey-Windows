@@ -15,31 +15,6 @@ import KanaKanjiConverterModule
 @Suite("engine configuration")
 @MainActor
 struct EngineConfigTests {
-    /// A throwaway `%APPDATA%` containing `Azookey\settings.json` (or, when
-    /// `contents` is nil, no file at all).
-    private struct AppData {
-        let path: String
-
-        init(_ contents: String?) {
-            let root = URL(filePath: NSTemporaryDirectory())
-                .appendingPathComponent("azk-settings-\(UUID().uuidString)")
-            let folder = root.appendingPathComponent("Azookey")
-            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            if let contents {
-                try? contents.write(
-                    to: folder.appendingPathComponent("settings.json"),
-                    atomically: true,
-                    encoding: .utf8
-                )
-            }
-            self.path = root.path
-        }
-
-        func remove() {
-            try? FileManager.default.removeItem(atPath: path)
-        }
-    }
-
     /// Restores `config` around a test: it is process-global engine state and
     /// the suite writes it.
     private func withRestoredConfig(_ body: () -> Void) {
@@ -48,35 +23,38 @@ struct EngineConfigTests {
         body()
     }
 
-    @Test("a complete settings file is read and decoded")
-    func completeFileIsRead() {
-        let appData = AppData(#"{"version":"0.1.0","zenzai":{"enable":true,"profile":"私は猫だ","backend":"cpu"}}"#)
-        defer { appData.remove() }
+    /// Hands a document to the real FFI export, the way the server does.
+    /// `String(cString:)` on the far side, so this goes through exactly the
+    /// path a live call takes.
+    private func loadConfigThroughFFI(_ json: String) -> Bool {
+        json.withCString { load_config(json: $0) }
+    }
 
-        let settings = loadSettingsFile(appDataPath: appData.path)
+    @Test("a complete settings document is decoded")
+    func completeDocumentIsRead() {
+        let settings = decodeSettings(
+            #"{"version":"0.1.0","zenzai":{"enable":true,"profile":"私は猫だ","backend":"cpu"}}"#
+        )
 
         #expect(settings?.zenzai?.enable == true)
         #expect(settings?.zenzai?.profile == "私は猫だ")
     }
 
-    /// First run: there is no file yet. That is normal, not an error, and the
-    /// caller keeps the current config.
-    @Test("a missing settings file degrades to nil")
-    func missingFileIsNil() {
-        let appData = AppData(nil)
-        defer { appData.remove() }
+    /// A document that is not JSON must not stop the engine — every
+    /// application on the desktop depends on it coming up — and it must be
+    /// reported rather than swallowed, which is what the export's Bool is for.
+    @Test("text that is not JSON degrades to nil and is reported")
+    func corruptDocumentIsNil() {
+        #expect(decodeSettings(#"{"zenzai":{"enable":"#) == nil)
 
-        #expect(loadSettingsFile(appDataPath: appData.path) == nil)
-    }
+        withRestoredConfig {
+            config = EngineConfig(zenzaiEnabled: true, zenzaiProfile: "keep me")
 
-    /// A hand-edited (or half-written) file must not stop the engine from
-    /// starting — every application on the desktop depends on it coming up.
-    @Test("a corrupt settings file degrades to nil")
-    func corruptFileIsNil() {
-        let appData = AppData(#"{"zenzai":{"enable":"#)
-        defer { appData.remove() }
+            #expect(loadConfigThroughFFI(#"{"zenzai":{"enable":"#) == false)
 
-        #expect(loadSettingsFile(appDataPath: appData.path) == nil)
+            #expect(config.zenzaiEnabled, "nothing may be applied from a document we cannot read")
+            #expect(config.zenzaiProfile == "keep me")
+        }
     }
 
     /// The Rust side owns the schema and writes keys this decoder does not
@@ -84,27 +62,49 @@ struct EngineConfigTests {
     /// adds. They must be ignored, not fail the parse.
     @Test("keys the engine does not read are ignored")
     func unknownKeysAreIgnored() {
-        let appData = AppData(#"{"version":"9.9.9","future":{"x":1},"zenzai":{"enable":true,"backend":"cuda","profile":"p","future_key":42}}"#)
-        defer { appData.remove() }
-
-        let settings = loadSettingsFile(appDataPath: appData.path)
+        let settings = decodeSettings(
+            #"{"version":"9.9.9","future":{"x":1},"zenzai":{"enable":true,"backend":"cuda","profile":"p","future_key":42}}"#
+        )
 
         #expect(settings?.zenzai?.enable == true)
         #expect(settings?.zenzai?.profile == "p")
     }
 
-    /// Per-key tolerance, mirroring `#[serde(default)]` on the Rust struct: a
-    /// file written before a key existed decodes, with that key absent rather
-    /// than the whole parse failing.
-    @Test("a partial settings file decodes with the missing keys absent")
-    func partialFileDecodes() {
-        let appData = AppData(#"{"zenzai":{"enable":true}}"#)
-        defer { appData.remove() }
-
-        let settings = loadSettingsFile(appDataPath: appData.path)
+    /// Per-key tolerance for an ABSENT key: a document written before a key
+    /// existed decodes, with that key nil rather than the whole parse failing.
+    @Test("a partial settings document decodes with the missing keys absent")
+    func partialDocumentDecodes() {
+        let settings = decodeSettings(#"{"zenzai":{"enable":true}}"#)
 
         #expect(settings?.zenzai?.enable == true)
         #expect(settings?.zenzai?.profile == nil)
+    }
+
+    /// Per-key tolerance for a WRONGLY TYPED key, which `Optional` alone did
+    /// not give: the synthesized decoder threw on the first mismatch and took
+    /// the whole document with it. Same fixture as the Rust-side regression
+    /// (`a_wrongly_typed_value_costs_only_its_own_field`) so the two readers
+    /// are pinned to the same behaviour.
+    @Test("a wrongly typed value costs only its own key")
+    func wrongTypesDegradePerKey() {
+        let settings = decodeSettings(
+            #"{"zenzai":{"enable":"true","profile":"keep me","inference_limit":"5","topic":42}}"#
+        )
+
+        #expect(settings != nil, "the document is still readable")
+        #expect(settings?.zenzai?.enable == nil, "a quoted bool is not a bool")
+        #expect(settings?.zenzai?.inference_limit == nil, "a quoted number either")
+        #expect(settings?.zenzai?.topic == nil, "nor is a number a string")
+        #expect(settings?.zenzai?.profile == "keep me", "and the rest survives")
+    }
+
+    /// A section of the wrong type costs the section, not the document.
+    @Test("a zenzai section that is not an object costs only that section")
+    func unusableSectionIsIgnored() {
+        let settings = decodeSettings(#"{"version":"0.1.0","zenzai":"on"}"#)
+
+        #expect(settings != nil)
+        #expect(settings?.zenzai == nil)
     }
 
     @Test("LoadConfig applies every key it was given")
@@ -230,10 +230,9 @@ struct EngineConfigTests {
     /// the user typed into the settings app.
     @Test("the inference limit and the v3 context keys are decoded")
     func advancedZenzaiKeysAreRead() {
-        let appData = AppData(#"{"zenzai":{"enable":true,"inference_limit":5,"topic":"ソフトウェア開発","style":"ですます調","preference":"漢字は控えめに"}}"#)
-        defer { appData.remove() }
-
-        let settings = loadSettingsFile(appDataPath: appData.path)
+        let settings = decodeSettings(
+            #"{"zenzai":{"enable":true,"inference_limit":5,"topic":"ソフトウェア開発","style":"ですます調","preference":"漢字は控えめに"}}"#
+        )
 
         #expect(settings?.zenzai?.inference_limit == 5)
         #expect(settings?.zenzai?.topic == "ソフトウェア開発")
@@ -243,12 +242,9 @@ struct EngineConfigTests {
 
     /// A settings file written before these keys existed. Same per-key
     /// tolerance as everything else: absent, not a failed parse.
-    @Test("a file without the advanced keys decodes with them absent")
+    @Test("a document without the advanced keys decodes with them absent")
     func advancedZenzaiKeysMayBeAbsent() {
-        let appData = AppData(#"{"zenzai":{"enable":true,"profile":"p"}}"#)
-        defer { appData.remove() }
-
-        let settings = loadSettingsFile(appDataPath: appData.path)
+        let settings = decodeSettings(#"{"zenzai":{"enable":true,"profile":"p"}}"#)
 
         #expect(settings?.zenzai?.enable == true)
         #expect(settings?.zenzai?.inference_limit == nil)
@@ -336,6 +332,99 @@ struct EngineConfigTests {
                     )
                 )
             )
+        }
+    }
+
+    /// The defaults are the Rust side's to define, and this side has its own
+    /// copy of every one of them. Nothing used to compare the two, so "the
+    /// default inference limit is 1" could stop being true here only — and the
+    /// symptom would be conversion behaving differently from what the settings
+    /// app shows, with no test failing anywhere.
+    ///
+    /// `fixtures/default-settings.json` is what the Rust `AppConfig::default()`
+    /// serializes to (its own test pins that end). Applying it to a fresh
+    /// `EngineConfig` must therefore change nothing.
+    @Test("the engine's defaults match the shared fixture")
+    func defaultsMatchTheSharedFixture() throws {
+        let fixture = URL(filePath: #filePath)
+            .deletingLastPathComponent()  // azookey-serverTests/
+            .deletingLastPathComponent()  // Tests/
+            .deletingLastPathComponent()  // server-swift/
+            .deletingLastPathComponent()  // the repository root
+            .appendingPathComponent("fixtures/default-settings.json")
+        let json = try String(contentsOf: fixture, encoding: .utf8)
+
+        withRestoredConfig {
+            config = EngineConfig()
+            let untouched = EngineConfig()
+
+            #expect(loadConfigThroughFFI(json))
+
+            #expect(config.zenzaiEnabled == untouched.zenzaiEnabled)
+            #expect(config.zenzaiProfile == untouched.zenzaiProfile)
+            #expect(config.zenzaiInferenceLimit == untouched.zenzaiInferenceLimit)
+            #expect(config.zenzaiTopic == untouched.zenzaiTopic)
+            #expect(config.zenzaiStyle == untouched.zenzaiStyle)
+            #expect(config.zenzaiPreference == untouched.zenzaiPreference)
+        }
+    }
+
+    /// One pass through the real export, from the text the Rust side sends to
+    /// the options the converter is handed. The pieces are covered above; this
+    /// is the seam between them, and it is the only thing that would catch a
+    /// `LoadConfig` that decoded a document and then applied nothing.
+    @Test("LoadConfig carries a document all the way into the conversion options")
+    func loadConfigReachesTheOptions() {
+        withRestoredConfig {
+            execURL = URL(filePath: #filePath).deletingLastPathComponent()
+            config = EngineConfig()
+
+            let applied = loadConfigThroughFFI(
+                #"""
+                {"version":"0.1.0","zenzai":{"enable":true,"profile":"私は猫だ",
+                 "backend":"cpu","inference_limit":3,"topic":"話題","style":"文体",
+                 "preference":"好み"}}
+                """#
+            )
+
+            #expect(applied)
+            #expect(
+                getOptions(context: "吾輩は").zenzaiMode == .on(
+                    weight: execURL.appendingPathComponent("zenz.gguf"),
+                    inferenceLimit: 3,
+                    requestRichCandidates: true,
+                    personalizationMode: nil,
+                    versionDependentMode: .v3(
+                        .init(
+                            profile: "私は猫だ",
+                            topic: "話題",
+                            style: "文体",
+                            preference: "好み",
+                            leftSideContext: "吾輩は"
+                        )
+                    )
+                )
+            )
+        }
+    }
+
+    /// Switching Zenzai on has to take effect without restarting the engine.
+    ///
+    /// The observable half is here: the options flip to `.on` on the next
+    /// conversion. The other half — loading the gguf during `LoadConfig`
+    /// instead of on the first keystroke after it — needs a live converter, so
+    /// it belongs to the `--ignored` smoke tests; `converter` is nil here and
+    /// the warm-up branch is skipped.
+    @Test("zenzai switched on at runtime reaches the options without a restart")
+    func enablingZenzaiTakesEffectImmediately() {
+        withRestoredConfig {
+            execURL = URL(filePath: #filePath).deletingLastPathComponent()
+            config = EngineConfig(zenzaiEnabled: false)
+            #expect(getOptions().zenzaiMode == .off)
+
+            #expect(loadConfigThroughFFI(#"{"zenzai":{"enable":true,"profile":"p"}}"#))
+
+            #expect(getOptions().zenzaiMode != .off, "no restart may be needed for this")
         }
     }
 }
