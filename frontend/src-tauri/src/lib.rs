@@ -9,7 +9,6 @@ use std::{
 
 #[derive(Debug)]
 pub struct AppState {
-    settings: Mutex<AppConfig>,
     // connected lazily: the server may not be running when the settings
     // app starts, and that must not crash or hang the app
     ipc: Mutex<Option<ipc::IPCService>>,
@@ -17,35 +16,30 @@ pub struct AppState {
 
 impl AppState {
     fn new() -> Self {
+        // creates or migrates settings.json once, at startup; every later
+        // read goes back to the file
+        AppConfig::new();
         AppState {
-            settings: Mutex::new(AppConfig::new()),
             ipc: Mutex::new(None),
         }
     }
 }
 
+/// Read from disk on every call rather than from a snapshot taken at
+/// startup. The frontend saves by reading the whole config, changing one
+/// key and writing it back, so a snapshot means anything edited elsewhere
+/// while the settings app is open — by hand, or by a future version of the
+/// app — is silently reverted the next time the user flips a switch.
 #[tauri::command]
-fn get_config(state: tauri::State<AppState>) -> AppConfig {
-    let config = state
-        .settings
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    config.clone()
+fn get_config() -> Result<AppConfig, String> {
+    AppConfig::try_read()
 }
 
 #[tauri::command]
 fn update_config(state: tauri::State<AppState>, new_config: AppConfig) -> Result<(), String> {
-    {
-        let mut config = state
-            .settings
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        // refused when settings.json was written by a newer build — report it
-        // instead of silently dropping the keys we do not know about, and
-        // leave the in-memory state matching what is on disk
-        new_config.write()?;
-        *config = new_config;
-    }
+    // refused when settings.json was written by a newer build — report it
+    // instead of silently dropping the keys we do not know about
+    new_config.write()?;
 
     // the settings file is already saved at this point; notifying the
     // server is best-effort and reported to the frontend on failure

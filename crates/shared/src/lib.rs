@@ -288,6 +288,28 @@ impl AppConfig {
         }
     }
 
+    /// Read for a caller that is going to write the result back — the
+    /// settings app does exactly that, one key at a time. A missing file is
+    /// still the defaults (first run, and writing them is correct), but an
+    /// unreadable or malformed one is an error here rather than the
+    /// defaults: handing those back would let the caller save them over
+    /// whatever the user actually had.
+    pub fn try_read() -> Result<Self, String> {
+        Self::try_read_in(&get_config_root())
+    }
+
+    /// The same, from a directory the caller names — see `read_in`.
+    pub fn try_read_in(config_root: &Path) -> Result<Self, String> {
+        match Self::load_from(config_root) {
+            LoadOutcome::Parsed(config) => Ok(config),
+            LoadOutcome::Missing => Ok(AppConfig::default()),
+            LoadOutcome::Malformed => Err(format!(
+                "{} could not be read; it is missing or not valid JSON",
+                config_root.join(SETTINGS_FILENAME).display()
+            )),
+        }
+    }
+
     fn load_from(config_root: &Path) -> LoadOutcome {
         let config_path = config_root.join(SETTINGS_FILENAME);
         if !config_path.exists() {
@@ -541,6 +563,32 @@ mod tests {
         assert_eq!(reread.zenzai.topic, "ソフトウェア開発");
         assert_eq!(reread.zenzai.style, "ですます調");
         assert_eq!(reread.zenzai.preference, "漢字は控えめに");
+    }
+
+    /// The settings app re-reads before every save, so what a failed read
+    /// returns decides whether a broken file gets overwritten with defaults
+    /// or reported.
+    #[test]
+    fn try_read_reports_a_broken_file_but_not_a_missing_one() {
+        let root = TempConfigRoot::new();
+
+        let missing = AppConfig::try_read_in(root.path()).expect("no file yet is not an error");
+        assert_eq!(missing.version, CONFIG_VERSION);
+
+        root.write_settings(r#"{"version":"#);
+        assert!(
+            AppConfig::try_read_in(root.path()).is_err(),
+            "defaults here would be saved over the user's file"
+        );
+
+        root.write_settings(r#"{"version":"0.1.0","zenzai":{"profile":"p"}}"#);
+        assert_eq!(
+            AppConfig::try_read_in(root.path())
+                .expect("a valid file reads")
+                .zenzai
+                .profile,
+            "p"
+        );
     }
 
     #[test]
