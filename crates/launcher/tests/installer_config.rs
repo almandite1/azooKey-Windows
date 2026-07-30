@@ -334,27 +334,193 @@ fn task_xml_declares_no_encoding() {
     );
 }
 
-/// The install side must chain the settings app with `/S`, the same switch
-/// the uninstall side already used.
+/// Issue #104: the settings app is shipped by Setup, not by a second
+/// installer chained from it.
 ///
-/// It passed `/q` — the MSI convention — which NSIS ignores, so Tauri's
-/// installer showed its wizard and asked for an install location a second
-/// time (issue #84). The two halves disagreeing is what made it easy to miss.
+/// The Tauri NSIS this replaces registered its own uninstall key, which is
+/// why "Azookey" appeared twice in Installed apps. Nothing about a chained
+/// installer fails loudly if it comes back — the product installs and runs
+/// exactly as before, with one extra ARP entry — so the two halves of the
+/// arrangement are pinned here: the exe is copied into `build/` where the
+/// `../build/*` glob will find it, and no NSIS setup is referenced at all.
 #[test]
-fn install_chains_the_settings_app_silently() {
+fn the_settings_app_is_shipped_not_chained() {
     let iss = read("Installer.iss");
-    let start = iss
-        .find("Dependency_Add('{#TauriSetupExe}'")
-        .expect("Installer.iss should chain the Tauri setup through Dependency_Add");
-    let call = &iss[start..start + 200.min(iss.len() - start)];
 
+    for gone in ["TauriSetupExe", "x64-setup"] {
+        assert!(
+            !iss.contains(gone),
+            "Installer.iss must not reference the Tauri NSIS bundle any more, \
+             or the duplicate Installed apps entry is back: found {gone}"
+        );
+    }
+
+    let makefile = workspace_file("Makefile.toml");
+    let binary = settings_app_binary();
     assert!(
-        call.contains("'/S'"),
-        "the chained NSIS installer must be passed /S; found: {call:?}"
+        makefile.contains(&format!("cp target/release/{binary} build")),
+        "post_build must copy the settings app into build/ — it is the only \
+         thing that puts it in front of the installer's ../build/* glob now"
+    );
+    // being in the required list is also what makes
+    // every_packaged_executable_is_on_the_signing_list demand it in SIGNING.md
+    assert!(
+        makefile.contains(&format!("\"build/{binary}\"")),
+        "the settings app must be in post_build's required-artifact list, or \
+         a build that quietly skipped it ships an installer without it"
+    );
+}
+
+/// Issue #104: WebView2 is now Inno's job, and nothing else's.
+///
+/// The chained Tauri NSIS was the product's only WebView2 bootstrap. ui.exe
+/// needs the runtime as much as the settings app does, so dropping the chain
+/// without picking this up leaves, on a machine without WebView2, an IME that
+/// starts and shows no candidate window — and says nothing about why. There is
+/// no runtime test for that; this line is the whole guard.
+#[test]
+fn webview2_is_bootstrapped_by_inno() {
+    let iss = read("Installer.iss");
+
+    let body = code_block(&iss, "function InitializeSetup");
+    assert!(
+        body.contains("Dependency_AddWebView2"),
+        "InitializeSetup must bootstrap WebView2 now that no installer is \
+         chained to do it: got {body}"
+    );
+}
+
+/// Issue #104: an upgrade has to remove what the chained NSIS left, or the
+/// second Installed apps entry outlives the installer that created it.
+///
+/// The mechanism is read, not just the call: the entry is the point, and the
+/// uninstaller and the shortcut are what would otherwise be orphaned in
+/// `{app}` and on every user's desktop. The key-existence guard matters as
+/// much — without it a first install would delete a same-named shortcut that
+/// belongs to somebody else.
+#[test]
+fn upgrade_removes_the_legacy_nsis_install() {
+    let iss = read("Installer.iss");
+
+    let prepare = code_block(&iss, "function PrepareToInstall(");
+    assert!(
+        prepare.contains("RemoveLegacyNsisSettingsApp"),
+        "the cleanup must run from PrepareToInstall, before the copies and \
+         also for a silent install: got {prepare}"
+    );
+
+    let body = code_block(&iss, "procedure RemoveLegacyNsisSettingsApp");
+    assert!(
+        body.contains("RegKeyExists("),
+        "the cleanup must be guarded on the legacy key existing, or a first \
+         install deletes files that are not ours: got {body}"
     );
     assert!(
-        !call.contains("'/q'"),
-        "/q is the MSI switch and NSIS ignores it, showing its wizard"
+        body.contains("RegDeleteKeyIncludingSubkeys") && body.contains("LegacyNsisKey"),
+        "the duplicate uninstall entry itself must be deleted — it is the \
+         whole point: got {body}"
+    );
+    assert!(
+        body.contains("RemoveQuotes("),
+        "NSIS stores InstallLocation quoted, and joining onto that names a \
+         path that exists nowhere: got {body}"
+    );
+    assert!(
+        body.contains("uninstall.exe"),
+        "the orphaned NSIS uninstaller must go with its entry: got {body}"
+    );
+    assert!(
+        body.contains("commondesktop") && body.contains("Azookey.lnk"),
+        "the desktop shortcut the silent chain created for all users must be \
+         removed; none is created in its place: got {body}"
+    );
+
+    assert!(
+        !iss.contains("UninstallAzookey"),
+        "the uninstall-time chain into the NSIS uninstaller must be gone: \
+         there is no longer a second installer to uninstall"
+    );
+}
+
+/// Issue #104: the start-menu shortcut has to survive the migration.
+///
+/// The old NSIS created a top-level all-users `Azookey.lnk`; `{autoprograms}`
+/// on an admin install is that same folder. The shortcut is therefore
+/// overwritten in place rather than duplicated — the SAME NAME is the
+/// migration, so it is what this asserts. Get it wrong and the upgrade leaves
+/// an orphan pointing at a file that may no longer be there.
+#[test]
+fn the_settings_app_gets_a_start_menu_shortcut() {
+    let iss = read("Installer.iss");
+
+    let section: String = iss
+        .split_once("\n[Icons]")
+        .expect("Installer.iss should have an [Icons] section")
+        .1
+        .lines()
+        .take_while(|l| !l.starts_with('['))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let entry = section
+        .lines()
+        .find(|l| l.starts_with("Name:"))
+        .unwrap_or_else(|| panic!("[Icons] must define a shortcut: got {section}"));
+
+    assert!(
+        entry.contains(r"{autoprograms}\"),
+        "the shortcut must land in the common Programs folder, where the old \
+         NSIS put its own: got {entry}"
+    );
+    assert!(
+        entry.contains(r#"Filename: "{app}\Azookey.exe""#),
+        "the shortcut must point at the settings app Setup installs: got {entry}"
+    );
+    // the .lnk is named after the Name: entry's last component
+    assert!(
+        entry.contains(r"{autoprograms}\{#MyAppName}"),
+        "the shortcut has to keep the old NSIS name (Azookey.lnk) — that is \
+         what makes the upgrade overwrite it instead of adding a second: got {entry}"
+    );
+}
+
+/// Issue #104: `tauri build` must not produce an installer.
+///
+/// The NSIS bundle is what registered the second uninstall key. Setup no
+/// longer references it, so a bundle coming back would not break anything
+/// visibly — it would just quietly reappear in Installed apps the next time
+/// somebody installed a build made from a tree where this flag was dropped.
+#[test]
+fn tauri_build_does_not_bundle() {
+    let makefile = workspace_file("Makefile.toml");
+
+    let task = makefile
+        .split_once("[tasks.build_tauri]")
+        .expect("Makefile.toml should have a build_tauri task")
+        .1;
+    let command = task
+        .lines()
+        .find(|l| l.contains("tauri build"))
+        .expect("build_tauri should run tauri build");
+
+    assert!(
+        command.contains("--no-bundle"),
+        "tauri build must be told not to bundle, or the NSIS installer that \
+         put a second Azookey in Installed apps comes back: got {command}"
+    );
+
+    let conf = workspace_file("frontend/src-tauri/tauri.conf.json");
+    let json: serde_json::Value = serde_json::from_str(&conf).expect("tauri.conf.json is JSON");
+    assert_eq!(
+        json.pointer("/bundle/active").and_then(|v| v.as_bool()),
+        Some(false),
+        "bundling must also be off in the config, so building the app by hand \
+         does not produce one either"
+    );
+    assert!(
+        json.pointer("/bundle/icon").is_some(),
+        "the icon list stays: tauri-build embeds the exe's icon from it, and \
+         the single Installed apps entry shows that icon"
     );
 }
 
@@ -691,8 +857,9 @@ fn install_kills_only_processes_from_the_install_directory() {
         "the path must be matched against the install directory as a \
          prefix: got {body}"
     );
-    // the two unambiguous names stay name-matched on purpose — the settings
-    // app does not even live under {app}
+    // the two unambiguous names stay name-matched on purpose — and for the
+    // settings app it also covers an upgrade from a build whose chained
+    // installer put it somewhere other than {app}
     for name in ["azookey-server.exe", "azookey.exe"] {
         assert!(
             body.contains(name),
@@ -829,60 +996,8 @@ fn build_glob_excludes_every_tip_dll_copy() {
     );
 }
 
-/// B22: the Tauri settings app runs its NSIS from Inno's elevated context.
-/// Without perMachine it defaults to currentUser and lands in the elevating
-/// ADMIN's %LOCALAPPDATA%/HKCU — the logon user can't launch it, the exact
-/// bug the machine-wide move (297a054) fixed everywhere else.
-#[test]
-fn tauri_settings_app_installs_per_machine() {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/src-tauri/tauri.conf.json");
-    let conf = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-    let json: serde_json::Value = serde_json::from_str(&conf).expect("tauri.conf.json is JSON");
-
-    assert_eq!(
-        json.pointer("/bundle/windows/nsis/installMode")
-            .and_then(|v| v.as_str()),
-        Some("perMachine"),
-        "the settings app must install perMachine, or it lands in the \
-         elevating admin's profile"
-    );
-}
-
-/// B22: the Inno uninstaller chains into the settings app's NSIS
-/// uninstaller. With perMachine its uninstall key is in HKLM (HKCU only as
-/// a legacy fallback), the stored quoted path must be unquoted for
-/// ShellExec's Filename, and NSIS is only silent with /S.
-#[test]
-fn uninstall_chains_the_settings_app_from_hklm_silently() {
-    let iss = read("Installer.iss");
-    let start = iss
-        .find("procedure UninstallAzookey")
-        .expect("Installer.iss should define UninstallAzookey");
-    let rest = &iss[start..];
-    let end = rest[1..]
-        .find("\nprocedure ")
-        .map(|i| i + 1)
-        .unwrap_or(rest.len());
-    let proc_body = &rest[..end];
-
-    assert!(
-        proc_body.contains("RegQueryStringValue(HKLM,"),
-        "UninstallAzookey must read the perMachine (HKLM) uninstall key"
-    );
-    assert!(
-        proc_body.contains("RemoveQuotes(UninstallString)"),
-        "the quoted UninstallString must be unquoted for ShellExec's Filename"
-    );
-    assert!(
-        proc_body.contains("'/S'"),
-        "the NSIS uninstaller must be passed /S to actually run silently"
-    );
-}
-
 /// The product version is single-sourced from [workspace.package] in the
-/// root Cargo.toml. The installer must take its versions from the
+/// root Cargo.toml. The installer must take its version from the
 /// generated Version.iss (written by the build_installer task), and the
 /// Tauri config must not pin its own copy — omitting "version" makes
 /// Tauri fall back to src-tauri's (workspace-inherited) Cargo version.
@@ -896,10 +1011,6 @@ fn product_version_is_single_sourced() {
     assert!(
         !iss.contains("#define MyAppVersion \""),
         "MyAppVersion must not be hardcoded in Installer.iss"
-    );
-    assert!(
-        !iss.contains("#define TauriAppVersion \""),
-        "TauriAppVersion must not be hardcoded in Installer.iss"
     );
 
     let tauri_conf_path =
