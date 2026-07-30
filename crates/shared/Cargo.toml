@@ -12,6 +12,10 @@ tonic = { workspace = true }
 tonic-prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# the settings diagnostics used eprintln!, which the settings app (a GUI
+# subsystem binary with no console) threw away — and it is the process whose
+# user most needs to hear that their file was moved aside
+tracing = { workspace = true }
 # rt-multi-thread: `pipe::blocking_channels` builds the runtime its callers
 # (the TIP, the settings app) block on
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "time"] }
