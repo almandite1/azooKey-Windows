@@ -5,6 +5,12 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "opener:default"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://github.com/almandite1/azooKey-Windows/releases" },
+        { "url": "https://discord.com/invite/dY9gHuyZN5" }
+      ]
+    }
   ]
 }

@@ -9,7 +9,20 @@
       // touch the class list after React mounts, which is one white flash late.
       // the storage key and the class names must match theme-provider.tsx.
       (function () {
-        var t = localStorage.getItem("vite-ui-theme") || "system";
+        // the allow-list matters: classList.add THROWS on a value with a
+        // space in it, and this whole script would die with it -- bringing
+        // back the flash it is here to prevent, silently. Kept in step with
+        // readStoredTheme in components/theme-provider.tsx, which cannot be
+        // imported from here.
+        var t;
+        try {
+          t = localStorage.getItem("vite-ui-theme");
+        } catch (e) {
+          t = null;
+        }
+        if (t !== "light" && t !== "dark" && t !== "system") {
+          t = "system";
+        }
         if (t === "system") {
           t = window.matchMedia("(prefers-color-scheme: dark)").matches
             ? "dark"

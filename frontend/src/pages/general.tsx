@@ -1,30 +1,12 @@
-import { useEffect, useState } from "react";
 import { Switch } from "@/components/ui/switch";
 import { Puzzle } from "lucide-react";
-import { readConfig, updateConfig } from "@/lib/config";
+import { useConfigKey } from "@/hooks/use-config";
 
 export const General = () => {
-    const [pluginsEnabled, setPluginsEnabled] = useState(false);
-
-    useEffect(() => {
-        readConfig().then((data) => {
-            if (data) {
-                setPluginsEnabled(data.plugins.enable);
-            }
-        });
-    }, []);
-
-    // the server re-reads this on every UpdateConfig and resets its circuit
-    // breaker with it, so the switch takes effect on the next keystroke
-    const handlePluginsChange = async () => {
-        const data = await updateConfig((config) => {
-            config.plugins.enable = !pluginsEnabled;
-        });
-
-        if (data) {
-            setPluginsEnabled(data.plugins.enable);
-        }
-    };
+    // the switch reports the value it is moving TO; computing it from the
+    // previous React state instead is what lost one of two fast clicks, and
+    // what made the switch disagree with a file changed elsewhere
+    const plugins = useConfigKey<boolean>("plugins.enable", false);
 
     return (
         <div className="space-y-8">
@@ -41,7 +23,12 @@ export const General = () => {
                             プラグインが変換候補を追加できるようになります
                         </p>
                     </div>
-                    <Switch id="plugins-enable" aria-describedby="plugins-enable-description" checked={pluginsEnabled} onCheckedChange={handlePluginsChange} />
+                    <Switch
+                        id="plugins-enable"
+                        aria-describedby="plugins-enable-description"
+                        checked={plugins.value}
+                        onCheckedChange={(checked) => void plugins.commit(checked)}
+                    />
                 </div>
             </section>
         </div>

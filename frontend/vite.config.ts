@@ -36,4 +36,13 @@ export default defineConfig(async () => ({
       ignored: ["**/src-tauri/**"],
     },
   },
+
+  test: {
+    // the components under test are a settings UI: they need a DOM, and
+    // jsdom is enough for everything here (no WebView2, no canvas)
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/test/setup.ts"],
+    include: ["src/**/*.test.{ts,tsx}"],
+  },
 }));
