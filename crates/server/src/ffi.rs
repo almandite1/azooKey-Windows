@@ -48,7 +48,10 @@ unsafe extern "C" {
     pub(crate) fn ClearText(session: i64);
     pub(crate) fn GetComposedText(session: i64, lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     pub(crate) fn RemoveSession(session: i64);
-    pub(crate) fn LoadConfig();
+    /// Takes the settings document as text and reports whether it was
+    /// applied — see the header for why it is not the engine that reads the
+    /// file. `false` means the engine kept the configuration it had.
+    pub(crate) fn LoadConfig(json: *const c_char) -> bool;
     pub(crate) fn FreeString(ptr: *mut c_char);
     pub(crate) fn FreeComposedText(listPtr: *mut *mut FFICandidate, length: c_int);
 }

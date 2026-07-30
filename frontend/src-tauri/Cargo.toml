@@ -26,3 +26,8 @@ serde_json = { workspace = true }
 shared = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+# this is a GUI subsystem binary with no console, so shared's settings
+# diagnostics ("your file was moved aside") had nowhere to go
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,16 @@
+{
+  "version": "0.1.0",
+  "zenzai": {
+    "enable": false,
+    "profile": "",
+    "backend": "cpu",
+    "inference_limit": 1,
+    "topic": "",
+    "style": "",
+    "preference": ""
+  },
+  "plugins": {
+    "enable": false,
+    "entries": []
+  }
+}

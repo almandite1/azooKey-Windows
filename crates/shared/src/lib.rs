@@ -34,20 +34,20 @@ pub mod proto {
         tonic::include_file_descriptor_set!("azookey_service_descriptor");
 }
 
-fn get_config_root() -> PathBuf {
-    // APPDATA is always set on a normal Windows session; fall back to a
-    // relative path rather than panicking in whichever process loads us
-    let appdata = PathBuf::from(std::env::var("APPDATA").unwrap_or_default());
-    appdata.join("Azookey")
-}
-
-/// `%APPDATA%\Azookey` — where per-user CONFIGURATION belongs, for the
-/// files this crate does not own itself (`AppConfig` reaches the same
-/// directory through the private helper above).
+/// `%APPDATA%\Azookey` — where per-user CONFIGURATION belongs, including the
+/// settings file `AppConfig` owns.
 ///
 /// `None` when `APPDATA` is unset or empty, so a caller picks its own
 /// answer rather than silently reading a root-relative `Azookey` folder.
 /// Same reasoning as [`local_data_root`], and the same shape.
+///
+/// There used to be a second, private helper for the `AppConfig` methods
+/// that answered the same question with `unwrap_or_default()`, i.e. with a
+/// RELATIVE path. So an environment without `APPDATA` gave three different
+/// answers depending on which door you came in by: a relative `Azookey`
+/// directory here, `None` in this function, and `nil` in the Swift reader.
+/// One of those silently reads and writes settings next to the current
+/// directory, which is nobody's profile.
 pub fn config_root() -> Option<PathBuf> {
     config_root_in(std::env::var_os("APPDATA"))
 }
@@ -64,7 +64,7 @@ pub fn config_root_in(base: Option<std::ffi::OsString>) -> Option<PathBuf> {
 }
 
 /// `%LOCALAPPDATA%\Azookey` — where per-user RUNTIME state belongs: logs,
-/// crash dumps, the WebView2 profile. Deliberately not `get_config_root`:
+/// crash dumps, the WebView2 profile. Deliberately not [`config_root`]:
 /// that one is `%APPDATA%` (roaming), which is for settings a user would
 /// want to follow them between machines, not for a browser profile.
 ///
@@ -87,6 +87,25 @@ fn local_data_root_in(base: Option<std::ffi::OsString>) -> Option<PathBuf> {
 
 const SETTINGS_FILENAME: &str = "settings.json";
 const SETTINGS_BACKUP_FILENAME: &str = "settings.json.bak";
+
+/// How many corrupt settings files are kept aside before one is dropped.
+///
+/// There used to be exactly one, under a fixed name, and that lost the only
+/// copy of the user's real settings: corrupt once and the working file is
+/// preserved as `.bak`; hand-edit the fresh defaults, corrupt them too, and
+/// the second corrupt file overwrites the first backup. The numbered slots
+/// below fix that, and when they are all full it is the NEWEST that goes —
+/// see `back_up_unreadable_settings`.
+const MAX_SETTINGS_BACKUPS: usize = 5;
+
+/// How many times the model may re-run to improve one conversion.
+///
+/// Lives here because three places have to agree on it: this crate clamps
+/// what it writes, the Swift engine clamps what it reads, and the settings
+/// app offers presets inside the range. Only the engine used to bound it,
+/// which meant any `u32` at all could be persisted and travel to the
+/// converter — a limit of four billion is a hang, not a setting.
+pub const ZENZAI_INFERENCE_LIMIT: std::ops::RangeInclusive<u32> = 1..=10;
 
 /// Schema version of `settings.json`, independent of the application version
 /// in `workspace.package` — bump it only when the settings schema itself
@@ -127,8 +146,57 @@ fn is_newer_than_current(stored: &str) -> bool {
 enum LoadOutcome {
     Missing,
     Parsed(AppConfig),
-    /// Unreadable or invalid JSON. The file must not be silently overwritten.
+    /// Unreadable, or not JSON at all. The file must not be silently
+    /// overwritten. Note how narrow this is now: a file that parses as JSON
+    /// always comes back `Parsed`, however wrong its contents, because the
+    /// decoding below falls back key by key.
     Malformed,
+}
+
+/// One leaf setting, taken from the JSON object it lives in, falling back to
+/// its default when the key is absent OR holds the wrong type.
+///
+/// The whole reason this exists rather than `serde_json::from_str::<AppConfig>`:
+/// serde fails the ENTIRE parse on one type mismatch. `"inference_limit": "5"`
+/// — a plausible hand-edit, and settings.json is documented as hand-editable —
+/// made the file unreadable, which made the next start move it aside and write
+/// the defaults. One quoted number cost the user every setting they had. The
+/// `#[serde(default)]` attributes never covered this; they only ever covered a
+/// key being ABSENT, which is why the doc comment claiming per-field tolerance
+/// was half true.
+///
+/// This is also the semantics the Swift reader has always had (its fields are
+/// all `Optional` and applied one at a time), so the two ends of the same file
+/// now agree.
+fn lenient_field<T: serde::de::DeserializeOwned>(
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+    section: &str,
+    default: T,
+) -> T {
+    let Some(value) = object.and_then(|object| object.get(key)) else {
+        return default;
+    };
+    match serde_json::from_value(value.clone()) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::warn!(
+                "settings.json: {section}{key} is not a usable value ({error}); \
+                 keeping the default for it and leaving every other setting alone"
+            );
+            default
+        }
+    }
+}
+
+/// The object at `key`, or `None` when the key is absent or is not an object.
+/// A section that is not an object leaves every setting in it at its default,
+/// rather than taking the rest of the file down with it.
+fn lenient_section<'a>(
+    object: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    object.and_then(|object| object.get(key))?.as_object()
 }
 
 /// Field names are mirrored by the Swift engine's `SettingsFile` decoder
@@ -164,10 +232,32 @@ impl Default for ZenzaiConfig {
             enable: false,
             profile: "".to_string(),
             backend: "cpu".to_string(),
-            inference_limit: 1,
+            inference_limit: *ZENZAI_INFERENCE_LIMIT.start(),
             topic: "".to_string(),
             style: "".to_string(),
             preference: "".to_string(),
+        }
+    }
+}
+
+impl ZenzaiConfig {
+    /// Decoded one key at a time, so a single unusable value costs only
+    /// itself — see [`lenient_field`].
+    fn from_json(object: Option<&serde_json::Map<String, serde_json::Value>>) -> Self {
+        let default = ZenzaiConfig::default();
+        ZenzaiConfig {
+            enable: lenient_field(object, "enable", "zenzai.", default.enable),
+            profile: lenient_field(object, "profile", "zenzai.", default.profile),
+            backend: lenient_field(object, "backend", "zenzai.", default.backend),
+            inference_limit: lenient_field(
+                object,
+                "inference_limit",
+                "zenzai.",
+                default.inference_limit,
+            ),
+            topic: lenient_field(object, "topic", "zenzai.", default.topic),
+            style: lenient_field(object, "style", "zenzai.", default.style),
+            preference: lenient_field(object, "preference", "zenzai.", default.preference),
         }
     }
 }
@@ -207,6 +297,41 @@ pub struct PluginsConfig {
     pub entries: Vec<PluginEntry>,
 }
 
+impl PluginsConfig {
+    fn from_json(object: Option<&serde_json::Map<String, serde_json::Value>>) -> Self {
+        let default = PluginsConfig::default();
+        PluginsConfig {
+            enable: lenient_field(object, "enable", "plugins.", default.enable),
+            // element by element, not as one array: an entry somebody
+            // mistyped should cost that entry, not the list. An entry with
+            // no usable id is dropped rather than defaulted — a nameless
+            // plugin identifies nothing.
+            entries: match object.and_then(|object| object.get("entries")) {
+                Some(serde_json::Value::Array(items)) => items
+                    .iter()
+                    .filter_map(|item| match serde_json::from_value(item.clone()) {
+                        Ok(entry) => Some(entry),
+                        Err(error) => {
+                            tracing::warn!(
+                                "settings.json: dropping an unusable plugins.entries \
+                                 element ({error}); the rest of the list is kept"
+                            );
+                            None
+                        }
+                    })
+                    .collect(),
+                Some(_) => {
+                    tracing::warn!(
+                        "settings.json: plugins.entries is not a list; treating it as empty"
+                    );
+                    Vec::new()
+                }
+                None => default.entries,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct AppConfig {
@@ -225,44 +350,107 @@ impl Default for AppConfig {
     }
 }
 
+/// The config directory, or an explanation of why there is none. Every
+/// no-argument `AppConfig` entry point goes through this rather than
+/// inventing a relative fallback (see [`config_root`]).
+fn config_root_or_error() -> Result<PathBuf, String> {
+    config_root().ok_or_else(|| {
+        "APPDATA is not set, so there is no per-user configuration directory to \
+         read or write settings in"
+            .to_string()
+    })
+}
+
 impl AppConfig {
-    /// Persist to `settings.json`, refusing to overwrite a file written by a
-    /// newer build of the settings schema — rewriting it would drop every key
-    /// this build does not know about.
+    /// This build's canonical form of these settings: the version stamped and
+    /// every bounded value inside its range.
+    ///
+    /// One function so that what goes into the file and what goes to the
+    /// engine cannot differ — they are the same document, produced here.
+    fn normalized(&self) -> AppConfig {
+        let mut config = AppConfig {
+            // whatever version the caller happens to be holding, what lands
+            // on disk is this build's schema — the settings app round-trips
+            // the whole config through the frontend, version field included
+            version: CONFIG_VERSION.to_string(),
+            ..self.clone()
+        };
+        // Bounded here, not only by the reader. The engine clamps what it
+        // decodes, but that is across an FFI boundary: until this existed, any
+        // u32 the frontend or a hand-edit produced was persisted verbatim and
+        // only the far side saved us.
+        config.zenzai.inference_limit = config.zenzai.inference_limit.clamp(
+            *ZENZAI_INFERENCE_LIMIT.start(),
+            *ZENZAI_INFERENCE_LIMIT.end(),
+        );
+        config
+    }
+
+    /// These settings as the JSON text the engine is handed.
+    ///
+    /// The engine used to open `settings.json` for itself, which meant one
+    /// `UpdateConfig` read the file twice — once here, once over the FFI
+    /// boundary — and a save landing between the two reads applied half of one
+    /// version and half of the other. Now there is a single read, and the
+    /// engine is given exactly the document this build would have written.
+    pub fn to_engine_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.normalized())
+            .map_err(|e| format!("failed to serialize settings for the engine: {e}"))
+    }
+
+    /// Persist to `settings.json`, refusing to overwrite a file this build
+    /// cannot account for — one written by a newer schema (whose unknown keys
+    /// serializing through this build would drop), or one that is not JSON at
+    /// all (which might be either).
     pub fn write(&self) -> Result<(), String> {
-        self.write_to(&get_config_root())
+        self.write_to(&config_root_or_error()?)
     }
 
     fn write_to(&self, config_root: &Path) -> Result<(), String> {
         let config_path = config_root.join(SETTINGS_FILENAME);
 
-        if let LoadOutcome::Parsed(stored) = Self::load_from(config_root)
-            && is_newer_than_current(&stored.version)
-        {
-            return Err(format!(
-                "{} was written by a newer version ({}) than this build supports ({}); \
-                 refusing to overwrite it",
-                config_path.display(),
-                stored.version,
-                CONFIG_VERSION
-            ));
+        match Self::load_from(config_root) {
+            LoadOutcome::Parsed(stored) if is_newer_than_current(&stored.version) => {
+                return Err(format!(
+                    "{} was written by a newer version ({}) than this build supports ({}); \
+                     refusing to overwrite it",
+                    config_path.display(),
+                    stored.version,
+                    CONFIG_VERSION
+                ));
+            }
+            // The newer-version guard above can only fire on a file we could
+            // read the version out of. A file that is not JSON has no version
+            // to check, and a schema change is exactly the kind of thing that
+            // would make a future file unreadable to this build — so the guard
+            // used to be skipped precisely when it mattered most, and the file
+            // was overwritten. Recovery from a broken file belongs to `new_in`,
+            // which backs it up first; a plain save must not do it silently.
+            LoadOutcome::Malformed => {
+                return Err(format!(
+                    "{} is not valid JSON; refusing to overwrite it. Restart the IME \
+                     to have it moved aside and replaced with the defaults.",
+                    config_path.display()
+                ));
+            }
+            LoadOutcome::Parsed(_) | LoadOutcome::Missing => {}
         }
 
-        // whatever version the caller happens to be holding, what lands on
-        // disk is this build's schema — the settings app round-trips the
-        // whole config through the frontend, version field included
-        let stamped = AppConfig {
-            version: CONFIG_VERSION.to_string(),
-            ..self.clone()
-        };
-        let config_str = serde_json::to_string_pretty(&stamped)
+        let config_str = serde_json::to_string_pretty(&self.normalized())
             .map_err(|e| format!("failed to serialize settings: {e}"))?;
         // write-then-rename rather than a plain write: fs::write truncates
         // first, so a crash or power loss mid-write leaves a half-file that
         // the next start reads as Malformed and replaces with the defaults,
         // taking the .bak with it. Rename on Windows replaces the existing
         // file, and both paths are in the same directory so it stays atomic.
-        let tmp_path = config_root.join(format!("{SETTINGS_FILENAME}.tmp"));
+        //
+        // The pid in the name is what makes that true across PROCESSES. One
+        // shared `settings.json.tmp` was used by the launcher's startup
+        // migration, the settings app and every save path; two of them writing
+        // at once interleaved into one truncated file, and the rename then
+        // published it — manufacturing exactly the corruption the temp file
+        // exists to prevent.
+        let tmp_path = config_root.join(format!("{SETTINGS_FILENAME}.tmp-{}", std::process::id()));
         std::fs::write(&tmp_path, config_str)
             .map_err(|e| format!("failed to write {}: {e}", tmp_path.display()))?;
         std::fs::rename(&tmp_path, &config_path).map_err(|e| {
@@ -274,7 +462,13 @@ impl AppConfig {
     /// Read the stored settings, falling back to defaults for anything that
     /// cannot be read. Never writes.
     pub fn read() -> Self {
-        Self::read_in(&get_config_root())
+        match config_root_or_error() {
+            Ok(root) => Self::read_in(&root),
+            Err(reason) => {
+                tracing::warn!("{reason}; running with the default settings");
+                AppConfig::default()
+            }
+        }
     }
 
     /// The same, from a directory the caller names. Public for the same
@@ -295,7 +489,7 @@ impl AppConfig {
     /// defaults: handing those back would let the caller save them over
     /// whatever the user actually had.
     pub fn try_read() -> Result<Self, String> {
-        Self::try_read_in(&get_config_root())
+        Self::try_read_in(&config_root_or_error()?)
     }
 
     /// The same, from a directory the caller names — see `read_in`.
@@ -310,6 +504,13 @@ impl AppConfig {
         }
     }
 
+    /// Two-stage decode: is this JSON at all, and then what can be salvaged
+    /// from it.
+    ///
+    /// Only the first stage can fail. Once the text parses as JSON, every
+    /// setting is taken out of it individually and a value this build cannot
+    /// use costs nothing but itself — which is the difference between "you
+    /// quoted a number" and "your settings are gone".
     fn load_from(config_root: &Path) -> LoadOutcome {
         let config_path = config_root.join(SETTINGS_FILENAME);
         if !config_path.exists() {
@@ -320,7 +521,7 @@ impl AppConfig {
         let config_str = match std::fs::read_to_string(&config_path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("failed to read {}: {e}", config_path.display());
+                tracing::warn!("failed to read {}: {e}", config_path.display());
                 return LoadOutcome::Malformed;
             }
         };
@@ -328,12 +529,27 @@ impl AppConfig {
         // rejects one — without this a hand-edit through Notepad looks like a
         // corrupt file and costs the user their settings
         let config_str = config_str.strip_prefix('\u{feff}').unwrap_or(&config_str);
-        match serde_json::from_str(config_str) {
-            Ok(config) => LoadOutcome::Parsed(config),
+        let value: serde_json::Value = match serde_json::from_str(config_str) {
+            Ok(value) => value,
             Err(e) => {
-                eprintln!("invalid {}: {e}", config_path.display());
-                LoadOutcome::Malformed
+                tracing::warn!("invalid {}: {e}", config_path.display());
+                return LoadOutcome::Malformed;
             }
+        };
+        LoadOutcome::Parsed(Self::from_json(value.as_object()))
+    }
+
+    /// Everything this build understands, taken out of a parsed settings
+    /// document key by key. A document that is not an object at all (a bare
+    /// array, a number) leaves every setting at its default.
+    fn from_json(object: Option<&serde_json::Map<String, serde_json::Value>>) -> Self {
+        AppConfig {
+            // read straight off the document rather than through the struct:
+            // the version is what decides whether this build may write the
+            // file back, so it has to survive anything else being unusable
+            version: lenient_field(object, "version", "", CONFIG_VERSION.to_string()),
+            zenzai: ZenzaiConfig::from_json(lenient_section(object, "zenzai")),
+            plugins: PluginsConfig::from_json(lenient_section(object, "plugins")),
         }
     }
 
@@ -342,14 +558,20 @@ impl AppConfig {
     /// read-only: writing it back would serialize it through this build's
     /// schema and silently drop the keys we do not know about.
     pub fn new() -> Self {
-        Self::new_in(&get_config_root())
+        match config_root_or_error() {
+            Ok(root) => Self::new_in(&root),
+            Err(reason) => {
+                tracing::warn!("{reason}; running with the default settings");
+                AppConfig::default()
+            }
+        }
     }
 
     fn new_in(config_root: &Path) -> Self {
         if !config_root.exists()
             && let Err(e) = std::fs::create_dir_all(config_root)
         {
-            eprintln!("failed to create {}: {e}", config_root.display());
+            tracing::warn!("failed to create {}: {e}", config_root.display());
             return AppConfig::default();
         }
 
@@ -362,34 +584,26 @@ impl AppConfig {
             LoadOutcome::Malformed => {
                 // preserve whatever the user had before replacing it — the
                 // file is the only copy of their settings
-                let from = config_root.join(SETTINGS_FILENAME);
-                let to = config_root.join(SETTINGS_BACKUP_FILENAME);
-                if let Err(e) = std::fs::rename(&from, &to) {
+                if !back_up_unreadable_settings(config_root) {
                     // nothing was backed up, so do not overwrite either
-                    eprintln!(
-                        "failed to back up {} to {}: {e}; leaving it untouched and \
-                         running with defaults",
-                        from.display(),
-                        to.display()
-                    );
                     return AppConfig::default();
                 }
-                eprintln!("backed up unreadable settings to {}", to.display());
                 let config = AppConfig::default();
                 config.log_write_failure(config_root);
                 config
             }
             LoadOutcome::Parsed(mut config) => {
                 if is_newer_than_current(&config.version) {
-                    eprintln!(
+                    tracing::warn!(
                         "settings.json version {} is newer than this build ({}); \
                          using it read-only",
-                        config.version, CONFIG_VERSION
+                        config.version,
+                        CONFIG_VERSION
                     );
                 } else if config.version != CONFIG_VERSION {
-                    // older schema: serde already filled in the fields it did
-                    // not have, so stamping the current version persists the
-                    // migration
+                    // older schema: the decode already filled in the fields it
+                    // did not have, so stamping the current version persists
+                    // the migration
                     config.version = CONFIG_VERSION.to_string();
                     config.log_write_failure(config_root);
                 }
@@ -402,9 +616,51 @@ impl AppConfig {
     /// so it is logged rather than propagated.
     fn log_write_failure(&self, config_root: &Path) {
         if let Err(e) = self.write_to(config_root) {
-            eprintln!("{e}");
+            tracing::warn!("{e}");
         }
     }
+}
+
+/// Moves an unreadable `settings.json` aside. True when it is safe to write a
+/// fresh one, i.e. when the old bytes are somewhere.
+///
+/// The first backup keeps the plain `.bak` name and is never overwritten;
+/// later ones take `-2`, `-3`, … up to [`MAX_SETTINGS_BACKUPS`]. When the
+/// slots are full it is the LAST one that is reused, which is the opposite of
+/// what "rotate" usually means and is the entire point: the oldest backup was
+/// taken from a file that had been working, and each one after it is a copy of
+/// something already broken. Dropping the oldest would be a slower version of
+/// the bug this replaced — one fixed name, overwritten by the second
+/// corruption, taking the user's real settings with it.
+fn back_up_unreadable_settings(config_root: &Path) -> bool {
+    let from = config_root.join(SETTINGS_FILENAME);
+
+    let mut to = config_root.join(SETTINGS_BACKUP_FILENAME);
+    for slot in 2..=MAX_SETTINGS_BACKUPS {
+        if !to.exists() {
+            break;
+        }
+        to = config_root.join(format!("{SETTINGS_BACKUP_FILENAME}-{slot}"));
+    }
+    if to.exists() {
+        tracing::warn!(
+            "every settings backup slot is taken; replacing the newest ({}) and \
+             keeping the older ones",
+            to.display()
+        );
+    }
+
+    if let Err(e) = std::fs::rename(&from, &to) {
+        tracing::warn!(
+            "failed to back up {} to {}: {e}; leaving it untouched and \
+             running with defaults",
+            from.display(),
+            to.display()
+        );
+        return false;
+    }
+    tracing::info!("backed up unreadable settings to {}", to.display());
+    true
 }
 
 #[cfg(test)]
@@ -588,6 +844,278 @@ mod tests {
                 .zenzai
                 .profile,
             "p"
+        );
+    }
+
+    /// The bug this whole two-stage decode exists for: one quoted number used
+    /// to fail the entire parse, which moved the file aside and wrote the
+    /// defaults. settings.json is documented as hand-editable, so "you typed
+    /// `"5"` instead of `5`" must cost that one setting and nothing else.
+    #[test]
+    fn a_wrongly_typed_value_costs_only_its_own_field() {
+        let root = TempConfigRoot::new();
+        root.write_settings(
+            r#"{
+                 "version": "0.1.0",
+                 "zenzai": {
+                   "enable": "true",
+                   "profile": "keep me",
+                   "backend": "cuda",
+                   "inference_limit": "5",
+                   "topic": 42
+                 },
+                 "plugins": { "enable": true, "entries": [] }
+               }"#,
+        );
+
+        let config = AppConfig::new_in(root.path());
+
+        // the three unusable values fell back, one by one
+        assert!(!config.zenzai.enable, "a quoted bool is not a bool");
+        assert_eq!(config.zenzai.inference_limit, 1, "a quoted number either");
+        assert_eq!(config.zenzai.topic, "", "nor is a number a string");
+        // ...and everything around them survived, which is the point
+        assert_eq!(config.zenzai.profile, "keep me");
+        assert_eq!(config.zenzai.backend, "cuda");
+        assert!(config.plugins.enable);
+        assert!(
+            !root.path().join(SETTINGS_BACKUP_FILENAME).exists(),
+            "a usable file must not be treated as corrupt"
+        );
+    }
+
+    /// A section that is not an object, and a document that is not an object,
+    /// are the same class of mistake: they cost the settings inside them and
+    /// nothing else.
+    #[test]
+    fn an_unusable_section_does_not_take_the_file_with_it() {
+        let root = TempConfigRoot::new();
+        root.write_settings(r#"{"version":"0.1.0","zenzai":"on","plugins":{"enable":true}}"#);
+
+        let config = AppConfig::new_in(root.path());
+
+        assert!(!config.zenzai.enable, "the whole section fell back");
+        assert_eq!(config.zenzai.backend, "cpu");
+        assert!(config.plugins.enable, "the other section was untouched");
+        assert_eq!(config.version, CONFIG_VERSION);
+    }
+
+    /// Only text that is not JSON at all is Malformed now. The distinction
+    /// matters because Malformed is the path that moves the user's file aside.
+    #[test]
+    fn only_unparsable_text_counts_as_malformed() {
+        let root = TempConfigRoot::new();
+
+        root.write_settings("{not json at all");
+        assert!(matches!(
+            AppConfig::load_from(root.path()),
+            LoadOutcome::Malformed
+        ));
+
+        // valid JSON, wrong shape from top to bottom: still readable
+        root.write_settings("[1, 2, 3]");
+        assert!(matches!(
+            AppConfig::load_from(root.path()),
+            LoadOutcome::Parsed(_)
+        ));
+    }
+
+    /// A plugins list with one bad element keeps the good ones. Nothing reads
+    /// `entries` in this build, which is exactly why it is worth pinning: the
+    /// day something does, a hand-edit should not silently empty the list.
+    #[test]
+    fn one_unusable_plugin_entry_does_not_empty_the_list() {
+        let root = TempConfigRoot::new();
+        root.write_settings(
+            r#"{"plugins":{"entries":[{"id":"dates","enabled":true},{"id":5},{"id":"emoji","enabled":false}]}}"#,
+        );
+
+        let config = AppConfig::new_in(root.path());
+
+        let ids: Vec<&str> = config
+            .plugins
+            .entries
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["dates", "emoji"]);
+    }
+
+    /// The newer-version guard could only ever fire on a file whose version
+    /// this build could read. A schema change is the thing most likely to make
+    /// a future file unreadable here — so the guard was skipped in precisely
+    /// the case it exists for, and the file was overwritten.
+    #[test]
+    fn writing_over_an_unparsable_file_is_refused() {
+        let root = TempConfigRoot::new();
+        let original = "{this is not json";
+        root.write_settings(original);
+
+        let result = AppConfig::default().write_to(root.path());
+
+        assert!(
+            result.is_err(),
+            "an unreadable file must not be overwritten"
+        );
+        assert_eq!(
+            root.read_settings(),
+            original,
+            "and its bytes must still be there"
+        );
+    }
+
+    /// Corrupt twice and the FIRST backup — the one taken from a file that had
+    /// been working — has to survive. It used to be overwritten by the second
+    /// corrupt file, which is how the only copy of the real settings was lost.
+    #[test]
+    fn a_second_corruption_keeps_the_first_backup() {
+        let root = TempConfigRoot::new();
+        root.write_settings("{the real settings, corrupted");
+        AppConfig::new_in(root.path());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(SETTINGS_BACKUP_FILENAME))
+                .expect("the first backup exists"),
+            "{the real settings, corrupted"
+        );
+
+        root.write_settings("{corrupted again, and worthless");
+        AppConfig::new_in(root.path());
+
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(SETTINGS_BACKUP_FILENAME))
+                .expect("the first backup is still there"),
+            "{the real settings, corrupted",
+            "the oldest backup is the valuable one and must not be replaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(format!("{SETTINGS_BACKUP_FILENAME}-2")))
+                .expect("the second backup went to its own slot"),
+            "{corrupted again, and worthless"
+        );
+    }
+
+    /// The slots are bounded, and when they are full the oldest still wins.
+    #[test]
+    fn the_backup_slots_are_capped_and_the_oldest_survives() {
+        let root = TempConfigRoot::new();
+
+        for i in 0..MAX_SETTINGS_BACKUPS + 3 {
+            root.write_settings(&format!("{{corruption number {i}"));
+            AppConfig::new_in(root.path());
+        }
+
+        let backups = std::fs::read_dir(root.path())
+            .expect("read the config root")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(SETTINGS_BACKUP_FILENAME)
+            })
+            .count();
+        assert_eq!(backups, MAX_SETTINGS_BACKUPS, "the slots are bounded");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(SETTINGS_BACKUP_FILENAME))
+                .expect("the first backup survived every later corruption"),
+            "{corruption number 0"
+        );
+    }
+
+    /// Two processes saving at once used to interleave into one shared
+    /// `settings.json.tmp`, and the rename then published the mixture — the
+    /// temp file manufactured the corruption it exists to prevent.
+    #[test]
+    fn the_staging_file_is_private_to_this_process() {
+        let root = TempConfigRoot::new();
+
+        AppConfig::default().write_to(root.path()).expect("write");
+
+        assert!(
+            !root
+                .path()
+                .join(format!("{SETTINGS_FILENAME}.tmp"))
+                .exists(),
+            "the shared name must not be used at all"
+        );
+        let staged = std::fs::read_dir(root.path())
+            .expect("read the config root")
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{SETTINGS_FILENAME}.tmp"))
+            });
+        assert!(!staged, "and the rename must leave nothing behind");
+    }
+
+    /// Only the reader bounded this, and the reader is on the other side of an
+    /// FFI boundary: until it was clamped here, any u32 at all was persisted.
+    #[test]
+    fn an_out_of_range_inference_limit_is_clamped_before_it_is_stored() {
+        let root = TempConfigRoot::new();
+        let mut config = AppConfig::default();
+
+        config.zenzai.inference_limit = u32::MAX;
+        config.write_to(root.path()).expect("write");
+        assert_eq!(
+            AppConfig::read_in(root.path()).zenzai.inference_limit,
+            *ZENZAI_INFERENCE_LIMIT.end()
+        );
+
+        config.zenzai.inference_limit = 0;
+        config.write_to(root.path()).expect("write");
+        assert_eq!(
+            AppConfig::read_in(root.path()).zenzai.inference_limit,
+            *ZENZAI_INFERENCE_LIMIT.start()
+        );
+    }
+
+    /// The defaults are Rust's to define, and the Swift engine has its own
+    /// copy of every one of them. Nothing compared the two, so "the default
+    /// inference limit is 1" could stop being true on one side only — and the
+    /// symptom would be conversion behaving differently from what the settings
+    /// app shows, with no test failing anywhere.
+    ///
+    /// Both suites read this file: here it is compared against what this build
+    /// serializes, and in `config_tests.swift` it is applied to a fresh
+    /// `EngineConfig` and expected to change nothing.
+    #[test]
+    fn the_defaults_match_the_shared_fixture() {
+        let fixture = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/default-settings.json"),
+        )
+        .expect("read fixtures/default-settings.json");
+
+        let expected: serde_json::Value =
+            serde_json::from_str(&fixture).expect("the fixture is JSON");
+        let actual: serde_json::Value =
+            serde_json::to_value(AppConfig::default()).expect("serialize the defaults");
+
+        assert_eq!(
+            actual, expected,
+            "the defaults changed; update fixtures/default-settings.json and check that the \
+             Swift engine's EngineConfig still agrees with it"
+        );
+    }
+
+    /// The public twin of `local_data_root_in`, which had tests while this one
+    /// had none — and this is the one the settings file hangs off.
+    #[test]
+    fn config_root_is_the_azookey_folder_under_the_given_base() {
+        assert_eq!(
+            config_root_in(Some(r"C:\Users\someone\AppData\Roaming".into()))
+                .expect("a set base yields a root"),
+            Path::new(r"C:\Users\someone\AppData\Roaming\Azookey")
+        );
+        assert_eq!(
+            config_root_in(None),
+            None,
+            "no base must be reported as none, not as a relative path"
+        );
+        assert_eq!(
+            config_root_in(Some("".into())),
+            None,
+            "an empty base is the same as no base"
         );
     }
 

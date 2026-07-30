@@ -295,7 +295,9 @@ mod extraction {
     #[test]
     fn the_c_header_yields_the_declared_functions() {
         let surface = c_header_surface(HEADER);
-        assert_eq!(surface.get("LoadConfig"), Some(&0));
+        // one parameter, the settings document as text: the engine no longer
+        // opens settings.json itself, so this RPC reads it once (#105)
+        assert_eq!(surface.get("LoadConfig"), Some(&1));
         assert_eq!(surface.get("Initialize"), Some(&1));
         assert_eq!(surface.get("ShrinkText"), Some(&2));
         assert_eq!(surface.get("AppendText"), Some(&3));

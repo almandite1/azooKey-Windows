@@ -35,11 +35,49 @@ import ffi
     return reading(state)
 }
 
+/// One conversion, thrown away, so that whatever the current options need
+/// loading is loaded before a keystroke waits on it.
+///
+/// The expensive part is the zenz model: gguf load and the first inference run
+/// on a cold model take seconds, and every FFI call is serialized onto the
+/// server's single thread — so that cost lands on whichever keystroke happens
+/// to be first, with the whole desktop's typing behind it.
+@MainActor private func warmUpConverter(_ engine: KanaKanjiConverter) {
+    var warmup = ComposingText()
+    warmup.insertAtCursorPosition("a", inputStyle: .roman2kana)
+    _ = engine.requestCandidates(warmup, options: getOptions())
+
+    // a missing/corrupt zenz.gguf degrades silently to non-neural
+    // conversion inside the converter; surface its status in the log
+    if !engine.zenzStatus.isEmpty {
+        enginePrint(level: .info, "zenzai status: \(engine.zenzStatus)")
+    }
+}
+
 @_cdecl("LoadConfig")
-@MainActor public func load_config() {
-    // only the keys that are present are overridden, so a partial file keeps
-    // the current values — see applySettings
-    applySettings(loadSettingsFile())
+@MainActor public func load_config(json: UnsafePointer<CChar>) -> Bool {
+    guard let settings = decodeSettings(String(cString: json)) else {
+        // nothing applied: the caller reports the failure rather than letting
+        // the settings app claim the save took effect
+        return false
+    }
+
+    let wasEnabled = config.zenzaiEnabled
+    // only the keys that are present are overridden, so a partial document
+    // keeps the current values — see applySettings
+    applySettings(settings)
+
+    // Turning Zenzai on at runtime used to leave the gguf load for the first
+    // keystroke after it, which blocks the single-threaded server for seconds
+    // with every application's typing behind it. Warm-up used to happen only
+    // in Initialize, i.e. only for a session that started with Zenzai already
+    // on. `converter` is nil when this runs before Initialize (the startup
+    // order), and that case is covered by Initialize's own warm-up.
+    if !wasEnabled, config.zenzaiEnabled, let engine = converter {
+        enginePrint(level: .info, "zenzai was switched on; warming the model up now")
+        warmUpConverter(engine)
+    }
+    return true
 }
 
 @_cdecl("Initialize")
@@ -49,7 +87,9 @@ import ffi
     let path = String(cString: path)
     execURL = URL(filePath: path)
 
-    load_config()
+    // NOT load_config: the engine no longer reads settings.json, so the Rust
+    // side applies the configuration before calling this — which it must,
+    // because the warm-up below builds its options out of it.
 
     // the dictionary belongs to the converter instance now, so this is the
     // earliest point it can be built: `path` is where the installer put
@@ -60,16 +100,7 @@ import ffi
     )
     converter = engine
 
-    // warm up the converter (and the zenzai model when enabled)
-    var warmup = ComposingText()
-    warmup.insertAtCursorPosition("a", inputStyle: .roman2kana)
-    _ = engine.requestCandidates(warmup, options: getOptions())
-
-    // a missing/corrupt zenz.gguf degrades silently to non-neural
-    // conversion inside the converter; surface its status in the log
-    if !engine.zenzStatus.isEmpty {
-        enginePrint(level: .info, "zenzai status: \(engine.zenzStatus)")
-    }
+    warmUpConverter(engine)
 }
 
 @_cdecl("AppendText")
@@ -146,8 +177,19 @@ import ffi
     converter?.stopComposition()
 }
 
+/// Copies the candidates into a C array of pointers for the caller to hand
+/// back to `FreeComposedText`.
+///
+/// Every slot is initialized, which the loop alone did not do: an empty list
+/// still allocates one slot (`max(count, 1)` — `allocate(capacity: 0)` is not
+/// something to rely on), and that slot was left holding whatever the
+/// allocator had. Nothing read it, because the length out-parameter says zero,
+/// but "correct as long as nobody looks" is not a property to leave in an FFI
+/// buffer.
 func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
-    let pointer = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>.allocate(capacity: max(list.count, 1))
+    let capacity = max(list.count, 1)
+    let pointer = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>.allocate(capacity: capacity)
+    pointer.initialize(repeating: nil, count: capacity)
     for (i, item) in list.enumerated() {
         let element = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
         element.initialize(to: item)
