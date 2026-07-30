@@ -18,15 +18,33 @@ const ThemeProviderContext = createContext<ThemeProviderState | undefined>(
   undefined
 )
 
+const THEMES: readonly Theme[] = ["light", "dark", "system"]
+
+/// localStorage holds whatever anyone put there, and the value was cast to
+/// `Theme` and used unchecked. That is not only a wrong theme: the pre-paint
+/// script in index.html passes it to `classList.add`, which THROWS on a value
+/// containing a space — taking the whole inline script with it, so the flash
+/// it exists to prevent comes back and the failure is invisible.
+///
+/// The same allow-list is spelled out in index.html, which cannot import this.
+export function readStoredTheme(storageKey: string, fallback: Theme): Theme {
+  let stored: string | null = null
+  try {
+    stored = localStorage.getItem(storageKey)
+  } catch {
+    // storage can be unavailable (a locked-down webview); the default is fine
+    return fallback
+  }
+  return THEMES.includes(stored as Theme) ? (stored as Theme) : fallback
+}
+
 export function ThemeProvider({
   children,
   defaultTheme = "system",
   storageKey = "vite-ui-theme",
   ...props
 }: ThemeProviderProps) {
-  const [theme, setTheme] = useState<Theme>(
-    () => (localStorage.getItem(storageKey) as Theme) || defaultTheme
-  )
+  const [theme, setTheme] = useState<Theme>(() => readStoredTheme(storageKey, defaultTheme))
 
   useLayoutEffect(() => {
     const root = window.document.documentElement

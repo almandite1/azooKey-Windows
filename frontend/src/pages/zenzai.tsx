@@ -12,7 +12,8 @@ import {
 import { useEffect, useState } from "react";
 import { toast } from "sonner"
 import { invoke } from '@tauri-apps/api/core';
-import { readConfig, updateConfig } from "@/lib/config";
+import { useConfigKey } from "@/hooks/use-config";
+import type { ConfigKey } from "@/lib/config";
 
 // the reason a backend is unavailable used to live in a tooltip, but that put
 // a <button> around the role="option" -- which cost the item its accessible
@@ -38,32 +39,39 @@ const BackendSelectItem = ({
     )
 }
 
-// the engine clamps to 1..10; these are the round numbers inside that range,
+// the engine accepts 1..10; these are the round numbers inside that range,
 // not a separate policy
 const inferenceLimits = [1, 3, 5, 10];
+
+const backends = [
+    { value: "cpu", name: "CPU (非推奨)", reason: "" },
+    { value: "cuda", name: "CUDA (NVIDIA GPU)", reason: "CUDA Toolkit 12をインストールする必要があります" },
+    { value: "vulkan", name: "Vulkan", reason: "お使いのPCはVulkanに対応していません" },
+];
 
 /// One of the three v3 context strings. They differ only in wording, and the
 /// engine treats them identically: a short hint, or an empty string for
 /// "say nothing".
 const ContextInput = ({
     id,
+    configKey,
     icon,
     title,
     description,
     placeholder,
-    value,
     disabled,
-    onChange,
 }: {
     id: string;
+    configKey: ConfigKey;
     icon: React.ReactNode;
     title: string;
     description: string;
     placeholder: string;
-    value: string;
     disabled: boolean;
-    onChange: (value: string) => void;
 }) => {
+    // typing is debounced and flushed on blur: it used to write the file on
+    // every keystroke, and each write is an RPC to a single-threaded engine
+    const field = useConfigKey<string>(configKey, "");
     return (
         <div className="space-y-4 rounded-md border p-4">
             <div className="flex items-center space-x-4">
@@ -81,24 +89,20 @@ const ContextInput = ({
                 id={id}
                 aria-describedby={`${id}-description`}
                 placeholder={placeholder}
-                value={value}
+                value={field.value}
                 disabled={disabled}
-                onChange={(event) => onChange(event.target.value)}
+                onChange={(event) => field.onType(event.target.value)}
+                onBlur={field.flush}
             />
         </div>
     )
 }
 
 export const Zenzai = () => {
-    const [value, setValue] = useState({
-        enable: false,
-        profile: "",
-        backend: "",
-        inferenceLimit: 1,
-        topic: "",
-        style: "",
-        preference: "",
-    });
+    const enable = useConfigKey<boolean>("zenzai.enable", false);
+    const profile = useConfigKey<string>("zenzai.profile", "");
+    const backend = useConfigKey<string>("zenzai.backend", "cpu");
+    const inferenceLimit = useConfigKey<number>("zenzai.inference_limit", 1);
 
     const [capability, setCapability] = useState({
         cpu: true,
@@ -106,87 +110,34 @@ export const Zenzai = () => {
         vulkan: false,
     });
 
-    // Load config on component mount
     useEffect(() => {
-        readConfig().then((data) => {
-            // Keep default values if config fetch fails
-            if (!data) return;
-            const zenzai = data.zenzai;
-            setValue({
-                enable: zenzai.enable,
-                profile: zenzai.profile,
-                backend: zenzai.backend,
-                inferenceLimit: zenzai.inference_limit,
-                topic: zenzai.topic,
-                style: zenzai.style,
-                preference: zenzai.preference,
+        invoke<{ cpu: boolean; cuda: boolean; vulkan: boolean }>("check_capability")
+            .then(setCapability)
+            // without this the rejection was unhandled and the list silently
+            // stayed CPU-only, which looks identical to "your machine has no GPU"
+            .catch(() => {
+                setCapability({ cpu: true, cuda: false, vulkan: false });
+                toast("利用可能なバックエンドを判定できませんでした", {
+                    description: "CPUのみ選択できます",
+                });
             });
-        });
-
-        invoke("check_capability").then((capability: any) => {
-            setCapability({
-                cpu: capability["cpu"],
-                cuda: capability["cuda"],
-                vulkan: capability["vulkan"],
-            });
-        })
     }, []);
 
-    const handleZenzaiChange = async () => {
-        const data = await updateConfig((data) => {
-            data.zenzai.enable = !value.enable;
-        });
+    const capabilityOf = (value: string) =>
+        value === "cuda" ? capability.cuda : value === "vulkan" ? capability.vulkan : capability.cpu;
 
-        if (data) {
-            setValue((prev) => ({ ...prev, enable: data.zenzai.enable }));
-        }
-    };
+    // A stored value outside the presets must still be visible. The engine
+    // accepts any of 1..10 and settings.json is hand-editable, so a saved 7
+    // used to render as an empty combobox -- and picking anything then threw
+    // the 7 away without ever having shown it.
+    const limitOptions = inferenceLimits.includes(inferenceLimit.value)
+        ? inferenceLimits
+        : [...inferenceLimits, inferenceLimit.value].sort((a, b) => a - b);
+    const backendOptions = backends.some((b) => b.value === backend.value)
+        ? backends
+        : [...backends, { value: backend.value, name: backend.value, reason: "" }];
 
-    const handleProfileChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
-        const newProfile = event.target.value;
-        setValue((prev) => ({ ...prev, profile: newProfile }));
-
-        updateConfig((data) => {
-            data.zenzai.profile = newProfile;
-        });
-    };
-
-    const handleBackendChange = async (backend: string) => {
-        const data = await updateConfig((data) => {
-            data.zenzai.backend = backend;
-        });
-
-        if (data) {
-            setValue((prev) => ({ ...prev, backend }));
-            toast("バックエンドが変更されました", {
-                description: "変更を適用するには、PCを再起動してください",
-                duration: 10000,
-            });
-        }
-    };
-
-    const handleInferenceLimitChange = async (limit: string) => {
-        const parsed = Number(limit);
-        const data = await updateConfig((data) => {
-            data.zenzai.inference_limit = parsed;
-        });
-
-        if (data) {
-            setValue((prev) => ({ ...prev, inferenceLimit: parsed }));
-        }
-    };
-
-    // one handler for all three v3 context strings: the key on the config is
-    // the only thing that differs
-    const handleContextChange = (
-        key: "topic" | "style" | "preference"
-    ) => (next: string) => {
-        setValue((prev) => ({ ...prev, [key]: next }));
-
-        updateConfig((data) => {
-            data.zenzai[key] = next;
-        });
-    };
+    const disabled = !enable.value;
 
     return (
         <div className="space-y-8">
@@ -203,7 +154,12 @@ export const Zenzai = () => {
                             Zenzaiを有効にして、変換精度を向上させます
                         </p>
                     </div>
-                    <Switch id="zenzai-enable" aria-describedby="zenzai-enable-description" checked={value.enable} onCheckedChange={handleZenzaiChange} />
+                    <Switch
+                        id="zenzai-enable"
+                        aria-describedby="zenzai-enable-description"
+                        checked={enable.value}
+                        onCheckedChange={(checked) => void enable.commit(checked)}
+                    />
                 </div>
                 <div className="space-y-4 rounded-md border p-4">
                     <div className="flex items-center space-x-4 ">
@@ -217,7 +173,15 @@ export const Zenzai = () => {
                             </p>
                         </div>
                     </div>
-                    <Textarea id="zenzai-profile" aria-describedby="zenzai-profile-description" placeholder="例）山田太郎、数学科の学生。" value={value.profile} disabled={!value.enable} onChange={handleProfileChange} />
+                    <Textarea
+                        id="zenzai-profile"
+                        aria-describedby="zenzai-profile-description"
+                        placeholder="例）山田太郎、数学科の学生。"
+                        value={profile.value}
+                        disabled={disabled}
+                        onChange={(event) => profile.onType(event.target.value)}
+                        onBlur={profile.flush}
+                    />
                 </div>
                 <div className="flex items-center space-x-4 rounded-md border p-4">
                     <Cpu aria-hidden="true" />
@@ -231,14 +195,33 @@ export const Zenzai = () => {
                             Zenzaiを利用するバックエンドを選択します
                         </p>
                     </div>
-                    <Select disabled={!value.enable} value={value.backend} onValueChange={handleBackendChange}>
+                    <Select
+                        disabled={disabled}
+                        value={backend.value}
+                        onValueChange={(value) => {
+                            void backend.commit(value).then((outcome) => {
+                                if (outcome.saved) {
+                                    toast("バックエンドが変更されました", {
+                                        description: "変更を適用するには、PCを再起動してください",
+                                        duration: 10000,
+                                    });
+                                }
+                            });
+                        }}
+                    >
                         <SelectTrigger id="zenzai-backend" className="w-48" aria-labelledby="zenzai-backend-label zenzai-backend" aria-describedby="zenzai-backend-description">
                             <SelectValue placeholder="バックエンドを選択" />
                         </SelectTrigger>
                         <SelectContent>
-                            <BackendSelectItem name="CPU (非推奨)" value="cpu" disabled={!capability.cpu} reason="" />
-                            <BackendSelectItem name="CUDA (NVIDIA GPU)" value="cuda" disabled={!capability.cuda} reason="CUDA Toolkit 12をインストールする必要があります" />
-                            <BackendSelectItem name="Vulkan" value="vulkan" disabled={!capability.vulkan} reason="お使いのPCはVulkanに対応していません" />
+                            {backendOptions.map((option) => (
+                                <BackendSelectItem
+                                    key={option.value}
+                                    name={option.name}
+                                    value={option.value}
+                                    disabled={!capabilityOf(option.value)}
+                                    reason={option.reason}
+                                />
+                            ))}
                         </SelectContent>
                     </Select>
                 </div>
@@ -255,12 +238,16 @@ export const Zenzai = () => {
                             大きいほど変換品質が上がり、変換が遅くなります（既定: 1）
                         </p>
                     </div>
-                    <Select disabled={!value.enable} value={String(value.inferenceLimit)} onValueChange={handleInferenceLimitChange}>
+                    <Select
+                        disabled={disabled}
+                        value={String(inferenceLimit.value)}
+                        onValueChange={(value) => void inferenceLimit.commit(Number(value))}
+                    >
                         <SelectTrigger id="zenzai-inference-limit" className="w-48" aria-labelledby="zenzai-inference-limit-label zenzai-inference-limit" aria-describedby="zenzai-inference-limit-description">
                             <SelectValue placeholder="推論上限を選択" />
                         </SelectTrigger>
                         <SelectContent>
-                            {inferenceLimits.map((limit) => (
+                            {limitOptions.map((limit) => (
                                 <SelectItem key={limit} value={String(limit)}>{limit}</SelectItem>
                             ))}
                         </SelectContent>
@@ -268,33 +255,30 @@ export const Zenzai = () => {
                 </div>
                 <ContextInput
                     id="zenzai-topic"
+                    configKey="zenzai.topic"
                     icon={<MessageSquare aria-hidden="true" />}
                     title="話題"
                     description="いま書いている内容の話題を10〜20文字程度で設定します"
                     placeholder="例）ソフトウェア開発"
-                    value={value.topic}
-                    disabled={!value.enable}
-                    onChange={handleContextChange("topic")}
+                    disabled={disabled}
                 />
                 <ContextInput
                     id="zenzai-style"
+                    configKey="zenzai.style"
                     icon={<Type aria-hidden="true" />}
                     title="文体"
                     description="文章のスタイルを10〜20文字程度で設定します"
                     placeholder="例）ですます調"
-                    value={value.style}
-                    disabled={!value.enable}
-                    onChange={handleContextChange("style")}
+                    disabled={disabled}
                 />
                 <ContextInput
                     id="zenzai-preference"
+                    configKey="zenzai.preference"
                     icon={<Heart aria-hidden="true" />}
                     title="好み"
                     description="変換の好みを10〜20文字程度で設定します"
                     placeholder="例）漢字は控えめに"
-                    value={value.preference}
-                    disabled={!value.enable}
-                    onChange={handleContextChange("preference")}
+                    disabled={disabled}
                 />
             </section>
         </div>

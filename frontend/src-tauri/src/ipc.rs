@@ -36,25 +36,66 @@ impl IPCService {
     }
 }
 
+/// Why an `update_config` call did not succeed, in the only distinction the
+/// caller acts on: whether this channel is worth keeping.
+pub enum NotifyFailure {
+    /// The connection is gone. The channel is dropped so the next call builds
+    /// a fresh one.
+    ConnectionLost(String),
+    /// The server was reached and did not finish the job — it timed out, or
+    /// it answered with an error. The channel is fine and stays.
+    Rejected(String),
+}
+
+impl NotifyFailure {
+    pub fn message(&self) -> &str {
+        match self {
+            NotifyFailure::ConnectionLost(message) | NotifyFailure::Rejected(message) => message,
+        }
+    }
+
+    pub fn connection_lost(&self) -> bool {
+        matches!(self, NotifyFailure::ConnectionLost(_))
+    }
+}
+
 // implement methods to interact with kkc server
 impl IPCService {
-    /// NOTE: unlike the TIP, this does not classify the failure with
-    /// `shared::pipe::is_transport_failure` — every error, timeout or
-    /// rejection alike, is reported to the settings UI the same way. That is
-    /// deliberate for now: the settings app has one RPC and nothing to
-    /// recover, so telling "the server is gone" from "the server said no"
-    /// would change what the user is shown without changing what they can do
-    /// about it. Revisit together with the settings app's error surface.
-    pub fn update_config(&mut self) -> anyhow::Result<()> {
+    /// Tells the server to re-read the settings file.
+    ///
+    /// The failure is classified because the caller does something different
+    /// with each: everything used to be treated as a dead connection, so a
+    /// server merely being SLOW — the engine is single-threaded, and a
+    /// conversion in flight holds it — cost the channel. The next keystroke
+    /// in a settings text field then rebuilt a whole tokio runtime, which is
+    /// the expensive half of the freeze that was blamed on the timeout.
+    /// `crates/shared/src/pipe.rs` makes the same distinction for the TIP and
+    /// says why the timeout is not evidence of a lost connection.
+    pub fn update_config(&mut self) -> Result<(), NotifyFailure> {
         let mut client = self.azookey_client.clone();
         self.runtime.block_on(async move {
             let request = tonic::Request::new(shared::proto::UpdateConfigRequest {});
-            time::timeout(RPC_TIMEOUT, client.update_config(request))
-                .await
-                .map_err(|_| anyhow::anyhow!("request to azookey server timed out"))?
-                .map_err(anyhow::Error::from)
-        })?;
-
-        Ok(())
+            match time::timeout(RPC_TIMEOUT, client.update_config(request)).await {
+                Err(_) => Err(NotifyFailure::Rejected(
+                    "the IME did not answer in time; it will pick the settings up when it \
+                     next starts"
+                        .to_string(),
+                )),
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(status)) => {
+                    let message = status.message().to_string();
+                    if shared::pipe::is_transport_failure(&status) {
+                        Err(NotifyFailure::ConnectionLost(format!(
+                            "cannot reach the IME ({message}); it will pick the settings up \
+                             when it next starts"
+                        )))
+                    } else {
+                        Err(NotifyFailure::Rejected(format!(
+                            "the IME refused the settings: {message}"
+                        )))
+                    }
+                }
+            }
+        })
     }
 }

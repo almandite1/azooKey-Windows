@@ -1,37 +1,73 @@
 import { invoke } from "@tauri-apps/api/core";
-import { toast } from "sonner";
 
-/// The settings file is the source of truth and every page edits a
-/// different corner of it, so both of these go to disk rather than to a
-/// snapshot: two pages open at once (or a hand edit) must not revert each
-/// other.
+/// The settings document, mirroring `shared::AppConfig` on the Rust side.
+/// Hand-written, and held to the Rust struct by a key-name test — this was
+/// `any` everywhere, so a typo in a key path was a runtime no-op that looked
+/// exactly like a setting that does not work.
 
-/// Read the whole config, or null when it could not be read -- callers keep
-/// their defaults in that case rather than showing values that are not what
-/// is stored.
-export const readConfig = async (): Promise<any | null> => {
+export interface ZenzaiConfig {
+    enable: boolean;
+    profile: string;
+    backend: string;
+    inference_limit: number;
+    topic: string;
+    style: string;
+    preference: string;
+}
+
+export interface PluginsConfig {
+    enable: boolean;
+    entries: { id: string; enabled: boolean }[];
+}
+
+export interface AppConfig {
+    version: string;
+    zenzai: ZenzaiConfig;
+    plugins: PluginsConfig;
+}
+
+/// Every settable key, spelled the way `patch_config` expects. A union rather
+/// than a string: the Rust side rejects a path it does not recognise, and
+/// finding that out at compile time is better than as a toast.
+export type ConfigKey =
+    | `zenzai.${keyof ZenzaiConfig}`
+    | "plugins.enable";
+
+/// What a save achieved. The two halves are separate because they fail
+/// separately: writing the file and telling the running IME about it.
+export interface SaveOutcome {
+    saved: boolean;
+    notified: boolean;
+    error?: string;
+}
+
+/// Reads the whole document. Throws when it cannot be read, which is a state
+/// the UI has to show rather than paper over — see the recovery banner.
+export const readConfig = async (): Promise<AppConfig> =>
+    await invoke<AppConfig>("get_config");
+
+/// Changes one key. The read-modify-write happens on the Rust side under a
+/// lock, so two of these cannot lose each other's change the way the old
+/// "read the whole document, edit it, send it back" round trip could.
+export const patchConfig = async (
+    key: ConfigKey,
+    value: unknown
+): Promise<SaveOutcome> => {
     try {
-        return await invoke<any>("get_config");
-    } catch {
-        return null;
+        return await invoke<SaveOutcome>("patch_config", { keyPath: key, value });
+    } catch (error) {
+        // the command itself refused: nothing was written
+        return { saved: false, notified: false, error: String(error) };
     }
 };
 
-/// Save one change: re-read, apply, write the whole config back. Returns
-/// what was written, or null if the save failed -- the caller uses that to
-/// decide whether to move its own state.
-export const updateConfig = async (
-    updater: (config: any) => void
-): Promise<any | null> => {
+/// Moves an unreadable settings.json aside and starts from the defaults.
+/// Destructive, so it is only ever called from the recovery banner, after the
+/// user has been told what is wrong and has chosen this.
+export const resetConfig = async (): Promise<SaveOutcome> => {
     try {
-        const data = await invoke<any>("get_config");
-        updater(data);
-        await invoke("update_config", { newConfig: data });
-        return data;
+        return await invoke<SaveOutcome>("reset_config");
     } catch (error) {
-        // the reason matters here: a settings.json written by a newer
-        // version is refused rather than overwritten
-        toast(`設定の更新に失敗しました: ${error}`);
-        return null;
+        return { saved: false, notified: false, error: String(error) };
     }
 };
