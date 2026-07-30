@@ -1,10 +1,23 @@
 <!doctype html>
-<html lang="en">
+<html lang="ja">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri + React + Typescript</title>
+    <title>Azookey</title>
+    <script>
+      // paint the right theme from the first frame; ThemeProvider only gets to
+      // touch the class list after React mounts, which is one white flash late.
+      // the storage key and the class names must match theme-provider.tsx.
+      (function () {
+        var t = localStorage.getItem("vite-ui-theme") || "system";
+        if (t === "system") {
+          t = window.matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light";
+        }
+        document.documentElement.classList.add(t);
+      })();
+    </script>
   </head>
 
   <body>

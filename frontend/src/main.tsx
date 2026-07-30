@@ -3,7 +3,7 @@ import ReactDOM from "react-dom/client";
 import "./index.css";
 import { SidebarProvider } from "@/components/ui/sidebar"
 import { ThemeProvider } from "@/components/theme-provider"
-import { BrowserRouter, Routes, Route } from "react-router";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router";
 import { AppSidebar } from "@/components/app-sidebar"
 
 import { General } from "@/pages/general"
@@ -14,21 +14,24 @@ import { Toaster } from "@/components/ui/sonner"
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <SidebarProvider>
-      <BrowserRouter>
-        <AppSidebar />
-        <main className="w-full p-6">
-          <ThemeProvider defaultTheme="system" storageKey="vite-ui-theme">
+    {/* the provider has to sit above the sidebar too, or useTheme() there
+        silently reads the context default instead of the real theme */}
+    <ThemeProvider defaultTheme="system" storageKey="vite-ui-theme">
+      <SidebarProvider>
+        <BrowserRouter>
+          <AppSidebar />
+          <main className="w-full p-6">
             <Routes>
               <Route path="/" element={<General />} />
               <Route path="/appearance" element={<Appearance />} />
               <Route path="/zenzai" element={<Zenzai />} />
               <Route path="/about" element={<About />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
-            <Toaster />
-          </ThemeProvider>
-        </main>
-      </BrowserRouter>
-    </SidebarProvider>
+          </main>
+        </BrowserRouter>
+      </SidebarProvider>
+      <Toaster />
+    </ThemeProvider>
   </React.StrictMode>,
 );
