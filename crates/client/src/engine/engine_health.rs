@@ -120,6 +120,19 @@ pub fn tooltip(health: EngineHealth) -> Option<&'static str> {
     }
 }
 
+/// The same news, as one line of a menu (issue #98).
+///
+/// Separate from [`tooltip`] because a menu row is not a tooltip: it cannot
+/// wrap, and a sentence long enough to explain itself would stretch the popup
+/// across the screen. So this says what is wrong and the tooltip on the same
+/// item says what to do about it.
+pub fn menu_notice(health: EngineHealth) -> Option<&'static str> {
+    match health {
+        EngineHealth::Unreachable => Some("変換エンジンに接続できません"),
+        EngineHealth::Reachable | EngineHealth::Unknown => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -193,5 +206,36 @@ mod tests {
     fn the_tooltip_names_the_launcher() {
         let text = tooltip(EngineHealth::Unreachable).unwrap();
         assert!(text.contains("launcher.exe"), "{text}");
+    }
+
+    /// The menu row appears in exactly the same states as the tooltip: one
+    /// surface saying the engine is gone while the other says nothing would be
+    /// worse than either alone.
+    #[test]
+    fn the_menu_row_appears_exactly_when_the_tooltip_does() {
+        for health in [
+            EngineHealth::Unknown,
+            EngineHealth::Reachable,
+            EngineHealth::Unreachable,
+        ] {
+            assert_eq!(
+                menu_notice(health).is_some(),
+                tooltip(health).is_some(),
+                "{health:?}"
+            );
+        }
+    }
+
+    /// It has to fit on one line of a popup menu, which is the reason it is
+    /// not the tooltip text.
+    #[test]
+    fn the_menu_row_is_short_enough_for_a_menu() {
+        let text = menu_notice(EngineHealth::Unreachable).unwrap();
+        let characters = text.chars().count();
+        assert!(
+            characters <= 24,
+            "{characters} characters is a paragraph: {text}"
+        );
+        assert!(!text.contains('\n'));
     }
 }

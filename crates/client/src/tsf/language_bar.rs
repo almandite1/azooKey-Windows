@@ -6,8 +6,8 @@ use windows::{
             TextServices::{
                 GUID_LBI_INPUTMODE, ITfLangBarItem_Impl, ITfLangBarItemButton,
                 ITfLangBarItemButton_Impl, ITfLangBarItemMgr, ITfLangBarItemSink, ITfMenu,
-                ITfSource_Impl, ITfThreadMgr, TF_LANGBARITEMINFO, TF_LBI_STYLE_BTN_BUTTON,
-                TfLBIClick,
+                ITfSource_Impl, ITfThreadMgr, TF_LANGBARITEMINFO, TF_LBI_CLK_RIGHT,
+                TF_LBI_STYLE_BTN_BUTTON, TfLBIClick,
             },
             WindowsAndMessaging::{HICON, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW},
         },
@@ -25,7 +25,11 @@ use crate::{
 
 use anyhow::Result;
 
-use super::factory::TextServiceFactory_Impl;
+use super::{
+    factory::TextServiceFactory_Impl,
+    langbar_menu::{self, MenuItem},
+    settings_app,
+};
 
 impl TextServiceFactory_Impl {
     /// Adds our mode button to the host's language bar. Extracted so the
@@ -50,6 +54,42 @@ impl TextServiceFactory_Impl {
                 .RemoveItem(&self.this::<ITfLangBarItemButton>()?)?;
         }
         Ok(())
+    }
+
+    /// The right-click half of `OnClick`: opens the context menu at `at` and
+    /// acts on what was picked.
+    ///
+    /// **No borrow of the state may be alive across `show_menu`.** It runs its
+    /// own message loop, so TSF callbacks re-enter this thread while the menu
+    /// is open and a re-entrant borrow fails — the same care `apply_input_mode`
+    /// takes around `update_lang_bar`. Hence the mode is read, cloned, and the
+    /// borrow dropped, before anything is drawn.
+    fn show_langbar_menu(&self, at: POINT) -> Result<()> {
+        let mode = self.borrow()?.input_mode.clone();
+        let entries = langbar_menu::menu_entries(&mode, engine_health::get());
+
+        let Some(chosen) = langbar_menu::show_menu(&entries, at)? else {
+            return Ok(());
+        };
+
+        match chosen {
+            // The same road the left-click toggle takes, so a mode picked from
+            // the menu ends the composition, publishes to the compartments and
+            // refreshes the icon exactly like every other way of switching.
+            MenuItem::Kana => self.set_input_mode_from_menu(InputMode::Kana),
+            MenuItem::Latin => self.set_input_mode_from_menu(InputMode::Latin),
+            // Not `?`: a settings app that will not start is logged where it
+            // happens and never becomes an HRESULT the host has to make sense
+            // of after a menu click.
+            MenuItem::Settings => {
+                settings_app::open();
+                Ok(())
+            }
+        }
+    }
+
+    fn set_input_mode_from_menu(&self, mode: InputMode) -> Result<()> {
+        self.handle_action(&[ClientAction::SetIMEMode(mode)], CompositionState::None)
     }
 }
 
@@ -124,8 +164,19 @@ impl ITfLangBarItem_Impl for TextServiceFactory_Impl {
 }
 
 impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
+    /// Both buttons arrive here — the right one as `TF_LBI_CLK_RIGHT`, the
+    /// left one as `TF_LBI_CLK_LEFT` (measured; see `langbar_menu`). The
+    /// argument used to be discarded, which is why a right-click did nothing
+    /// but toggle the mode like every other click (issue #98).
     #[macros::anyhow]
-    fn OnClick(&self, _click: TfLBIClick, _pt: &POINT, _prcarea: *const RECT) -> Result<()> {
+    fn OnClick(&self, click: TfLBIClick, pt: &POINT, _prcarea: *const RECT) -> Result<()> {
+        // `pt` is in screen coordinates, which is what TrackPopupMenuEx wants.
+        if click == TF_LBI_CLK_RIGHT {
+            return self.show_langbar_menu(*pt);
+        }
+
+        // Left, and anything else a host invents: the toggle this button has
+        // always done. Deliberately unchanged — it is the gesture people use.
         let mode = {
             match self.borrow()?.input_mode {
                 InputMode::Latin => InputMode::Kana,
@@ -139,13 +190,21 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
         Ok(())
     }
 
-    // this method should not be called
+    // Never called. Windows 11's notification area does not use the ITfMenu
+    // pathway at all: measured on a VM (2026-07-30) with `dwStyle` set to
+    // TF_LBI_STYLE_BTN_BUTTON and to TF_LBI_STYLE_BTN_MENU in turn, and
+    // InitMenu arrived zero times either way while the click itself reached
+    // OnClick both times. That measurement is why the menu is drawn by
+    // `langbar_menu` instead of being described to the OS here, and why
+    // `INFO.dwStyle` above is left as it is.
     #[macros::anyhow]
     fn InitMenu(&self, _pmenu: windows_core::Ref<'_, ITfMenu>) -> Result<()> {
         Ok(())
     }
 
-    // this method should not be called
+    // Never called either: it is the other half of InitMenu, and the OS only
+    // asks about a menu it built itself. Our own menu's selection comes back
+    // as the return value of TrackPopupMenuEx (`langbar_menu::show_menu`).
     #[macros::anyhow]
     fn OnMenuSelect(&self, _w_id: u32) -> Result<()> {
         Ok(())

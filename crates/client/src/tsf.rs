@@ -5,8 +5,10 @@ pub(super) mod factory;
 #[cfg(test)]
 mod fakes;
 pub(super) mod key_event_sink;
+pub(super) mod langbar_menu;
 pub(super) mod language_bar;
 pub(super) mod preserved_key;
+pub(super) mod settings_app;
 pub(super) mod surrounded_text;
 #[cfg(test)]
 pub(super) mod test_support;
