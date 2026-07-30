@@ -526,6 +526,151 @@ fn install_stops_the_running_stack_before_copying() {
     );
 }
 
+/// Issue #100: the TIP is loaded into every process that accepts text input
+/// — Explorer, the shell's search host, every editor and browser — and none
+/// of those are ours to stop. `DeleteFile` on a mapped image fails with
+/// ERROR_ACCESS_DENIED, so an upgrade could not replace `azookey.dll`: Setup
+/// offered "retry", which never succeeds, or "skip", which leaves the OLD
+/// TIP registered with everything else new. Renaming a mapped image *is*
+/// allowed, so the old file is moved aside before the copies instead.
+///
+/// The test reads the mechanism, not just the call: a helper that only tried
+/// harder to delete would satisfy the name and fix nothing.
+#[test]
+fn install_moves_the_in_use_tip_dll_aside() {
+    let iss = read("Installer.iss");
+
+    let prepare = code_block(&iss, "function PrepareToInstall(");
+    assert!(
+        prepare.contains("MakeWayForTheTip"),
+        "the DLLs must be moved aside from PrepareToInstall, which runs \
+         before the copies and also for a silent install: got {prepare}"
+    );
+
+    let move_aside = code_block(&iss, "function MoveAsideInUseFile");
+    assert!(
+        move_aside.contains("RenameFile"),
+        "the file has to be RENAMED; deleting it is the operation that \
+         already fails: got {move_aside}"
+    );
+
+    let make_way = code_block(&iss, "procedure MakeWayForTheTip");
+    for dll in ["azookey.dll", "azookey32.dll", "vcruntime140.dll"] {
+        assert!(
+            make_way.contains(dll),
+            "{dll} must be moved aside too — Setup is a 32-bit process and can \
+             hold the 32-bit TIP itself, and the host maps the TIP's MSVC \
+             runtime out of {{app}} with it: got {make_way}"
+        );
+    }
+
+    // a renamed file that is still loaded cannot be deleted either, so the
+    // leftovers are somebody's job later: the next upgrade, and the uninstall
+    let sweep = code_block(&iss, "procedure SweepMovedAsideFiles");
+    assert!(
+        sweep.contains("FindFirst") && sweep.contains("DeleteFile"),
+        "the leftovers must be swept by a later run: got {sweep}"
+    );
+    assert!(
+        make_way.contains("SweepMovedAsideFiles"),
+        "the sweep must run on every upgrade, or the moved-aside copies \
+         accumulate one per install: got {make_way}"
+    );
+
+    let uninstall_delete: String = iss
+        .split_once("[UninstallDelete]")
+        .expect("Installer.iss should have an [UninstallDelete] section")
+        .1
+        .lines()
+        .take_while(|l| !l.starts_with('['))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        uninstall_delete
+            .lines()
+            .any(|l| l.starts_with("Type:") && l.contains(".dll.old-*")),
+        "the last install has no next upgrade to sweep after it: got \
+         {uninstall_delete}"
+    );
+}
+
+/// The move-aside list has to cover what the TIP *pulls in*, not just the TIP.
+///
+/// msctf loads an in-proc TIP with the DLL's own directory on the search path,
+/// so a host application maps `{app}\vcruntime140.dll` along with the TIP —
+/// the same lock `post_build` documents for `build/`. Moving only the two TIP
+/// DLLs aside got the copies past `azookey.dll` and then failed on
+/// `vcruntime140.dll` with the identical DeleteFile error 5 (measured in the
+/// VM, 2026-07-30).
+///
+/// Derived from the DLL's own bytes rather than restated here: the names in a
+/// PE import table are plain ASCII, so every `*.dll` the TIP names and that we
+/// ship beside it must appear in `MakeWayForTheTip`. A stray match from an
+/// unrelated string only makes this stricter, never laxer.
+#[test]
+fn the_move_aside_list_covers_what_the_tip_loads_beside_itself() {
+    let build = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build");
+    let tip = build.join("azookey_windows.dll");
+    let Ok(bytes) = std::fs::read(&tip) else {
+        // a fresh checkout has no build/; CI runs the tests after the build,
+        // and this is the only test here that needs a built artifact
+        eprintln!("skipped: {} has not been built", tip.display());
+        return;
+    };
+
+    let shipped: Vec<String> = std::fs::read_dir(&build)
+        .expect("build/ exists, its DLL was just read")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_lowercase())
+        .filter(|name| name.ends_with(".dll"))
+        .collect();
+
+    let make_way = code_block(&read("Installer.iss"), "procedure MakeWayForTheTip").to_lowercase();
+
+    let mut checked = 0;
+    for name in dll_names_in(&bytes) {
+        // the TIP itself is installed under another name and handled by it
+        if !shipped.contains(&name) || name == "azookey_windows.dll" {
+            continue;
+        }
+        checked += 1;
+        assert!(
+            make_way.contains(&name),
+            "the TIP imports {name} and we ship it next to the TIP, so a host \
+             application maps it out of the install directory too — it has to \
+             be moved aside with the TIP, or the upgrade dies on it: got \
+             {make_way}"
+        );
+    }
+    assert!(
+        checked > 0,
+        "the TIP is expected to name at least one DLL we ship beside it \
+         (vcruntime140.dll); finding none means this test stopped looking"
+    );
+}
+
+/// The `*.dll` names appearing as ASCII in a PE image — its import table
+/// stores them as plain, NUL-terminated strings.
+fn dll_names_in(bytes: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut current = String::new();
+    for &byte in bytes {
+        let c = byte as char;
+        if byte.is_ascii_alphanumeric() || "_-.+".contains(c) {
+            current.push(c.to_ascii_lowercase());
+        } else {
+            if current.ends_with(".dll") && current.len() > 4 {
+                names.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Issue #57: taskkill can only match an image NAME, and `ui.exe` and
 /// `launcher.exe` are generic enough to belong to something else entirely,
 /// so `/IM` reached every one of them on the machine. Ownership is decided

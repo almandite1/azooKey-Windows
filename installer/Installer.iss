@@ -145,6 +145,12 @@ Type: files; Name: "{app}\launch.vbs"
 ; (issue #54) let WebView2 create its profile next to the exe, and a folder
 ; Setup never installed is a folder Setup never removes.
 Type: filesandordirs; Name: "{app}\ui.exe.WebView2"
+; An upgrade renames a TIP DLL it cannot delete out of the way rather than
+; failing on it (MoveAsideInUseFile, #100), and sweeps the leftovers on the
+; next upgrade. The last install never gets a next one, so they are removed
+; here — and whatever is still loaded right now is deferred to the restart
+; UninstallNeedRestart already asks for.
+Type: files; Name: "{app}\*.dll.old-*"
 
 [UninstallRun]
 ; stop the running IME processes first, or their exe/dll files stay locked
@@ -437,11 +443,138 @@ begin
     Log('Timed out waiting for the running stack to exit; the file copies may hit locked files');
 end;
 
+// Moves a file that cannot be deleted out of the way, so the copy that
+// follows lands on a free name. True means the path is clear afterwards.
+//
+// The TIP is loaded into every process that accepts text input, and none of
+// them are ours: measured during an upgrade, {app}\azookey.dll was mapped
+// into three explorer.exe, the Start menu's SearchHost.exe, and every
+// application text had been typed into. Deleting a file whose image is
+// mapped fails with ERROR_ACCESS_DENIED (5), which is the "DeleteFile error:
+// code 5" dialog Setup showed on every upgrade (#100). Retry could never
+// succeed, and Restart Manager does find those applications — measured, it
+// names the shell and the store apps by title — but it cannot close the shell,
+// and closing it would only make it reload the DLL when it comes back.
+//
+// Renaming works where deleting does not: NTFS allows a mapped image to be
+// renamed within its directory. Processes holding the old image keep running
+// from the renamed file until they exit, everything started afterwards loads
+// the new one, and the registered path never changes, so the regserver flag
+// on the [Files] entries still registers what it should.
+//
+// Measured on Windows 11 against a loaded DLL: DeleteFile -> 5, MoveFile ->
+// success, and the renamed file still refuses to be deleted while it is
+// loaded. That last part is why the leftovers are swept on the NEXT upgrade
+// rather than this one.
+function MoveAsideInUseFile(const Path: String): Boolean;
+var
+  I: Integer;
+  MovedTo: String;
+begin
+  Result := True;
+  if not FileExists(Path) then
+    exit;
+  // the ordinary case: nothing has it loaded, so leave no leftover behind
+  if DeleteFile(Path) then
+    exit;
+
+  for I := 1 to 50 do
+  begin
+    MovedTo := Path + '.old-' + IntToStr(I);
+    // a leftover from an earlier upgrade that is still loaded keeps its
+    // name; take the next one
+    if FileExists(MovedTo) then
+      if not DeleteFile(MovedTo) then
+        Continue;
+    if RenameFile(Path, MovedTo) then
+    begin
+      Log('Moved the in-use ' + Path + ' aside as ' + MovedTo);
+      exit;
+    end;
+  end;
+
+  Log('Could not move ' + Path + ' aside; the copy will hit a locked file');
+  Result := False;
+end;
+
+// Deletes what earlier upgrades moved aside, once nothing has it loaded any
+// more. Best effort by design: a file still mapped into a long-lived process
+// fails here and is retried by the next upgrade, and by [UninstallDelete] at
+// the end of the product's life.
+procedure SweepMovedAsideFiles(const Dir: String);
+var
+  Rec: TFindRec;
+begin
+  if not FindFirst(AddBackslash(Dir) + '*.dll.old-*', Rec) then
+    exit;
+  try
+    repeat
+      if DeleteFile(AddBackslash(Dir) + Rec.Name) then
+        Log('Removed the leftover ' + Rec.Name);
+    until not FindNext(Rec);
+  finally
+    FindClose(Rec);
+  end;
+end;
+
+// Everything a host application can be holding — which is more than the TIP.
+//
+// msctf loads an in-proc TIP with the DLL's own directory on the search path,
+// so the MSVC runtime the TIP imports is resolved out of {app} and mapped into
+// the host as well. post_build documents the same lock for build/, where the
+// DLL is registered from during development: "every process that loaded the
+// IME holds build/vcruntime140.dll through the DLL search path". Measured in
+// the VM with the shell, a store app and Notepad holding the TIP: moving only
+// the two TIP DLLs aside got the copies past azookey.dll and then failed on
+// vcruntime140.dll with the identical DeleteFile error 5.
+//
+// So the whole MSVC runtime group goes with them. Every name below is shipped
+// unconditionally by [Files] — the two TIP entries and the build/* glob — so
+// freeing one is safe: whatever is deleted or moved aside, the copies put
+// back. That is the property to preserve when editing this list; a file Setup
+// does not reinstall must not be added here.
+//
+// Not the Swift runtime or the engine's own DLLs: those are loaded by
+// azookey-server.exe, which is ours and has just been stopped.
+//
+// azookey32.dll matters as much as azookey.dll: Setup is itself a 32-bit
+// process, so with azooKey as the active IME the wizard can be holding the
+// 32-bit TIP in its own process — "close the other applications first" was
+// never a workaround the user could have found.
+procedure MakeWayForTheTip();
+var
+  Dir: String;
+begin
+  Dir := ExpandConstant('{app}');
+  // nothing to move on a first install
+  if not DirExists(Dir) then
+    exit;
+  SweepMovedAsideFiles(Dir);
+  Dir := AddBackslash(Dir);
+
+  MoveAsideInUseFile(Dir + 'azookey.dll');
+  MoveAsideInUseFile(Dir + 'azookey32.dll');
+
+  MoveAsideInUseFile(Dir + 'vcruntime140.dll');
+  MoveAsideInUseFile(Dir + 'vcruntime140_1.dll');
+  MoveAsideInUseFile(Dir + 'vcruntime140_threads.dll');
+  MoveAsideInUseFile(Dir + 'msvcp140.dll');
+  MoveAsideInUseFile(Dir + 'msvcp140_1.dll');
+  MoveAsideInUseFile(Dir + 'msvcp140_2.dll');
+  MoveAsideInUseFile(Dir + 'msvcp140_atomic_wait.dll');
+  MoveAsideInUseFile(Dir + 'msvcp140_codecvt_ids.dll');
+  MoveAsideInUseFile(Dir + 'vccorlib140.dll');
+  MoveAsideInUseFile(Dir + 'concrt140.dll');
+end;
+
 // Runs just before the file copies, and unlike a wizard-page hook it also
 // runs for a silent install.
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   StopRunningStack();
+  // after the kill, which frees every file that is ours to free, and before
+  // the copies, which is the whole point
+  MakeWayForTheTip();
   Result := '';
 end;
 
