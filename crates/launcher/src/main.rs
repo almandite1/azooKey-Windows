@@ -67,33 +67,53 @@ async fn main() -> anyhow::Result<()> {
     // application until re-login, so both children are supervised: exits
     // are restarted with backoff, and a health-check watchdog kills a child
     // that stops answering (the kill then flows into the same restart path)
-    let server_handle = tokio::spawn(supervisor::run_supervisor(
-        "azookey-server.exe",
-        "[server]",
-        shared::pipe::server_pipe(),
-    ));
-    let ui_handle = tokio::spawn(supervisor::run_supervisor(
-        "ui.exe",
-        "[ui]",
-        shared::pipe::ui_pipe(),
-    ));
-    // The third child is supervised the same way but is NOT allowed to take
-    // the launcher down with it: an absent plugin host is what the server
-    // already expects whenever the feature is off, so losing it costs the
-    // user their add-on candidates and nothing else. Started unconditionally
-    // rather than only when plugins.enable is set — otherwise turning the
-    // feature on in the settings app would appear to do nothing until the
-    // next logon, since the server reloads that setting live and the
-    // launcher does not.
-    let plugin_handle = tokio::spawn(supervisor::run_optional_supervisor(
-        "plugin-host.exe",
-        "[plugin-host]",
-        shared::pipe::plugin_pipe(),
-    ));
+    // One table, because the three children differ only in these five things
+    // and everything else about supervising them is identical. `fatal` used to
+    // be expressed as which of two near-identical functions was called, and
+    // the plugin host is NOT allowed to take the launcher down with it: an
+    // absent plugin host is what the server already expects whenever the
+    // feature is off, so losing it costs the user their add-on candidates and
+    // nothing else.
+    //
+    // The plugin host is started unconditionally rather than only when
+    // plugins.enable is set — otherwise turning the feature on in the settings
+    // app would appear to do nothing until the next logon, since the server
+    // reloads that setting live and the launcher does not.
+    let children = vec![
+        supervisor::SupervisedChild {
+            exe: "azookey-server.exe",
+            prefix: "[server]",
+            pipe: shared::pipe::server_pipe(),
+            fatal: true,
+            // reads a dictionary and the zenz model before it answers anything
+            startup_grace: policy::STARTUP_GRACE,
+        },
+        supervisor::SupervisedChild {
+            exe: "ui.exe",
+            prefix: "[ui]",
+            pipe: shared::pipe::ui_pipe(),
+            fatal: true,
+            startup_grace: policy::STARTUP_GRACE,
+        },
+        supervisor::SupervisedChild {
+            exe: "plugin-host.exe",
+            prefix: "[plugin-host]",
+            pipe: shared::pipe::plugin_pipe(),
+            fatal: false,
+            // opens a pipe and serves builtins; the engine's two minutes meant
+            // a broken host cost ten before it was even given up on
+            startup_grace: policy::FAST_STARTUP_GRACE,
+        },
+    ];
 
-    let _ = server_handle.await;
-    let _ = ui_handle.await;
-    let _ = plugin_handle.await;
+    let handles: Vec<_> = children
+        .into_iter()
+        .map(|child| tokio::spawn(supervisor::run_supervisor(child)))
+        .collect();
+
+    for handle in handles {
+        let _ = handle.await;
+    }
 
     Ok(())
 }

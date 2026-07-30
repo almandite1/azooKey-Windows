@@ -59,26 +59,54 @@ fn every_supervised_binary_is_packaged() {
     assert!(makefile.contains("cp target/$str/launcher.exe build"));
 }
 
-/// The plugin host must be spawned by the NON-fatal supervisor.
+/// Which children may take the launcher down with them, in both directions.
 ///
-/// Swapping it for `run_supervisor` compiles, passes every other test,
-/// and quietly converts "the add-ons are gone" into "the IME is gone" —
-/// the launcher exits, and the job object takes the engine and the
-/// candidate window with it. There is no runtime test that could catch
-/// that without staging a crash loop, so the wiring is read instead.
+/// Marking the plugin host fatal compiles, passes every other test, and
+/// quietly converts "the add-ons are gone" into "the IME is gone" — the
+/// launcher exits, and the job object takes the engine and the candidate
+/// window with it. The other direction is just as quiet and was never
+/// checked: a server marked non-fatal means a dead engine leaves the
+/// launcher alive holding the single-instance mutex, so nothing can restart
+/// it and there is no input at all until the next logon.
 #[test]
-fn the_plugin_host_is_supervised_non_fatally() {
+fn only_the_children_the_ime_needs_are_fatal() {
+    let children = supervised_children();
+    assert_eq!(
+        children.len(),
+        3,
+        "expected the three supervised children: {children:?}"
+    );
+
+    for (exe, fatal) in children {
+        let expected = exe != "plugin-host.exe";
+        assert_eq!(
+            fatal, expected,
+            "{exe} has the wrong fatal flag: the IME cannot work without the \
+             server or the UI, and must keep working without the plugin host"
+        );
+    }
+}
+
+/// The plugin host must not inherit the engine's startup grace.
+///
+/// 120 seconds is the time the conversion engine needs to read a dictionary
+/// and a model. The plugin host opens a pipe and serves builtins, so a broken
+/// one used to get two minutes per attempt and five attempts before the
+/// supervisor gave up — about ten minutes of an IME with no add-ons, then
+/// permanent silence.
+#[test]
+fn the_plugin_host_gets_a_short_startup_grace() {
     let main = workspace_file("crates/launcher/src/main.rs");
 
-    let call = main
-        .split("supervisor::run")
-        .find(|section| section.contains("plugin-host.exe"))
+    let entry = main
+        .split("SupervisedChild {")
+        .find(|entry| entry.contains("plugin-host.exe"))
         .expect("main.rs should supervise plugin-host.exe");
 
     assert!(
-        call.starts_with("_optional_supervisor("),
-        "plugin-host.exe must go through run_optional_supervisor, or losing \
-         it takes the whole IME down: got {call:.60}"
+        entry.contains("FAST_STARTUP_GRACE"),
+        "the plugin host loads nothing and must not wait on the engine's \
+         allowance: got {entry:.400}"
     );
 }
 
@@ -235,12 +263,33 @@ fn workspace_file(relative: &str) -> String {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
-/// The executable names the launcher spawns, read out of its own source.
-fn supervised_binaries() -> Vec<String> {
+/// The supervised children, read out of the launcher's own table: the
+/// executable name and whether giving up on it ends the launcher.
+///
+/// Derived rather than restated here. A hardcoded list stays green when a
+/// fourth child is added and not packaged, which is the whole failure the
+/// caller guards against.
+fn supervised_children() -> Vec<(String, bool)> {
     workspace_file("crates/launcher/src/main.rs")
-        .split("supervisor::run")
+        .split("SupervisedChild {")
         .skip(1)
-        .filter_map(|section| section.split('"').nth(1).map(str::to_string))
+        .filter_map(|entry| {
+            let exe = entry
+                .split_once("exe: \"")?
+                .1
+                .split_once('"')?
+                .0
+                .to_string();
+            let fatal = entry.split_once("fatal: ")?.1.starts_with("true");
+            Some((exe, fatal))
+        })
+        .collect()
+}
+
+fn supervised_binaries() -> Vec<String> {
+    supervised_children()
+        .into_iter()
+        .map(|(exe, _)| exe)
         .collect()
 }
 
@@ -619,7 +668,10 @@ fn uninstall_removes_the_legacy_webview2_profile() {
     // line — splitting on a bare '[' would stop at the "[Code]" inside the
     // very first comment
     let section: String = iss
-        .split_once("[UninstallDelete]")
+        .split_once(
+            "
+[UninstallDelete]",
+        )
         .expect("Installer.iss should have an [UninstallDelete] section")
         .1
         .lines()
@@ -744,7 +796,10 @@ fn install_moves_the_in_use_tip_dll_aside() {
     );
 
     let uninstall_delete: String = iss
-        .split_once("[UninstallDelete]")
+        .split_once(
+            "
+[UninstallDelete]",
+        )
         .expect("Installer.iss should have an [UninstallDelete] section")
         .1
         .lines()
@@ -754,9 +809,52 @@ fn install_moves_the_in_use_tip_dll_aside() {
     assert!(
         uninstall_delete
             .lines()
-            .any(|l| l.starts_with("Type:") && l.contains(".dll.old-*")),
+            .any(|l| l.starts_with("Type:") && l.contains("{#MovedAsideGlob}")),
         "the last install has no next upgrade to sweep after it: got \
          {uninstall_delete}"
+    );
+}
+
+/// The rename, the sweep and the uninstall-time delete must all be built from
+/// ONE definition of the suffix.
+///
+/// They were three separate string literals. Changing any one of them leaves
+/// the other two looking for a name nothing produces — and the symptom is
+/// silent: files accumulate in the install directory, and the last one keeps
+/// {app} from ever being removed.
+#[test]
+fn the_moved_aside_name_has_a_single_definition() {
+    let iss = read("Installer.iss");
+
+    assert!(
+        iss.contains(r#"#define MovedAsideSuffix ".old-""#),
+        "the suffix should be defined once, at the top"
+    );
+    assert!(
+        iss.contains("#define MovedAsideGlob"),
+        "and the glob that finds those files should be built from it"
+    );
+
+    // the rename writes it, the sweep looks for it, the uninstall removes it
+    let move_aside = code_block(&iss, "function MoveAsideInUseFile");
+    assert!(
+        move_aside.contains("{#MovedAsideSuffix}"),
+        "the rename must use the shared suffix: got {move_aside}"
+    );
+    let sweep = code_block(&iss, "procedure SweepMovedAsideFiles");
+    assert!(
+        sweep.contains("{#MovedAsideGlob}"),
+        "the sweep must use the shared glob: got {sweep}"
+    );
+
+    // ...and no literal survives anywhere else
+    assert!(
+        !iss.contains(".dll.old-*"),
+        "a literal copy of the glob has come back"
+    );
+    assert!(
+        !iss.contains("'.old-'"),
+        "a literal copy of the suffix has come back"
     );
 }
 
@@ -927,7 +1025,10 @@ fn process_teardown_is_not_de_elevated() {
     let iss = read("Installer.iss");
 
     let start = iss
-        .find("[UninstallRun]")
+        .find(
+            "
+[UninstallRun]",
+        )
         .expect("Installer.iss should have an [UninstallRun] section");
     let rest = &iss[start..];
     let end = rest[1..].find("\n[").map(|i| i + 1).unwrap_or(rest.len());
@@ -994,6 +1095,161 @@ fn build_glob_excludes_every_tip_dll_copy() {
         excludes.split(',').any(|p| p.trim() == "*.bak"),
         "the build/* glob must exclude *.bak: got {excludes}"
     );
+}
+
+/// The x86 Visual C++ redistributable was never installed on any machine,
+/// and nothing about that was visible.
+///
+/// Every x86 helper in CodeDependencies.iss chooses between an x86 and an x64
+/// value with `Dependency_String`, which picks by `Is64BitInstallMode` — and
+/// this installer is one. So the "x86" call checked whether the X64
+/// redistributable was present, found it, and skipped. The 32-bit TIP
+/// (azookey32.dll, loaded into 32-bit applications) then fails to load for
+/// want of its CRT, and the host quietly falls back to another IME.
+///
+/// `Dependency_ForceX86` is the upstream switch that makes those helpers mean
+/// what they say. It is one line, easy to drop in a refactor, and its absence
+/// costs nothing that anyone would report as this bug.
+#[test]
+fn the_x86_runtime_is_bootstrapped_as_x86() {
+    let iss = read("Installer.iss");
+    let body = code_block(&iss, "function InitializeSetup");
+
+    let x86_call = body
+        .find("Dependency_AddVC2015To2022x86")
+        .expect("InitializeSetup should bootstrap the x86 runtime");
+    let before = &body[..x86_call];
+    let after = &body[x86_call..];
+
+    assert!(
+        before.contains("Dependency_ForceX86 := True;"),
+        "the x86 call must be forced to x86, or it checks the x64 product and \
+         skips: got {body}"
+    );
+    assert!(
+        after.contains("Dependency_ForceX86 := False;"),
+        "and it must be turned off again, or every later check is x86 too: \
+         got {body}"
+    );
+    // the x64 call must NOT be inside the forced window
+    let x64_call = body
+        .find("Dependency_AddVC2015To2022x64")
+        .expect("InitializeSetup should bootstrap the x64 runtime");
+    assert!(
+        x64_call < x86_call,
+        "the x64 call has to stay outside the forced-x86 window: got {body}"
+    );
+}
+
+/// The single Installed apps entry shows the settings app's icon; without
+/// this it gets Setup's generic one (#104).
+#[test]
+fn the_uninstall_entry_has_an_icon() {
+    let iss = read("Installer.iss");
+    assert!(
+        iss.contains(r"UninstallDisplayIcon={app}\Azookey.exe"),
+        "the ARP entry must point at something with a face"
+    );
+}
+
+/// The settings app is shipped by the build/* glob now, so an exclusion that
+/// caught it would remove it from the installer entirely — and the shortcut
+/// [Icons] creates would point at nothing.
+#[test]
+fn the_build_glob_does_not_exclude_the_settings_app() {
+    let iss = read("Installer.iss");
+
+    let glob_line = iss
+        .lines()
+        .find(|l| l.contains(r#"Source: "../build/*""#))
+        .expect("Installer.iss should have a build/* glob");
+    let excludes = glob_line
+        .split_once("Excludes: \"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(list, _)| list)
+        .expect("the build/* glob should carry an Excludes list");
+
+    for pattern in excludes.split(',') {
+        let prefix = pattern.trim().split('*').next().unwrap_or_default();
+        assert!(
+            prefix.is_empty() || !"Azookey.exe".starts_with(prefix),
+            "the exclusion {pattern} would drop the settings app from the installer"
+        );
+    }
+}
+
+/// The order inside PrepareToInstall is load-bearing and reads as arbitrary.
+///
+/// The stack has to be stopped before anything tries to move its files; the
+/// legacy cleanup deletes files at paths [Files] is about to write, so it has
+/// to come before the copies and after the settings app has been stopped.
+#[test]
+fn prepare_to_install_does_things_in_the_order_that_works() {
+    let iss = read("Installer.iss");
+    let body = code_block(&iss, "function PrepareToInstall(");
+
+    let at = |needle: &str| {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("PrepareToInstall should call {needle}: got {body}"))
+    };
+
+    assert!(
+        at("StopRunningStack") < at("MakeWayForTheTip"),
+        "nothing may be moved aside while its process still holds it"
+    );
+    assert!(
+        at("StopRunningStack") < at("RemoveLegacyNsisSettingsApp"),
+        "the settings app has to be stopped before its old copy is deleted"
+    );
+}
+
+/// The legacy cleanup deletes a desktop shortcut and nothing creates one.
+/// An [Icons] entry for the desktop would be undone on every upgrade, which
+/// is worse than either choice on its own.
+#[test]
+fn no_desktop_shortcut_is_created() {
+    let iss = read("Installer.iss");
+
+    let section: String = iss
+        .split_once("\n[Icons]")
+        .expect("Installer.iss should have an [Icons] section")
+        .1
+        .lines()
+        .take_while(|l| !l.starts_with('['))
+        .filter(|l| l.starts_with("Name:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !section.contains("desktop"),
+        "the legacy cleanup removes the desktop shortcut; creating one here \
+         would fight it every upgrade: got {section}"
+    );
+}
+
+/// Everything moved aside has to be put back by the same install.
+///
+/// `MakeWayForTheTip` frees files so the copies can land. A name that is
+/// moved aside but NOT reinstalled is simply deleted from the user's machine
+/// — the DLL disappears and the IME loses whatever needed it.
+#[test]
+fn every_file_moved_aside_is_reinstalled() {
+    let iss = read("Installer.iss");
+    let make_way = code_block(&iss, "procedure MakeWayForTheTip");
+
+    for line in make_way.lines() {
+        let Some(rest) = line.trim().strip_prefix("MoveAsideInUseFile(Dir + '") else {
+            continue;
+        };
+        let name = rest.split('\'').next().unwrap_or_default();
+        // the two TIP DLLs are installed under other names by their own
+        // [Files] entries; everything else comes from the build/* glob
+        let placed_by_name = name == "azookey.dll" || name == "azookey32.dll";
+        assert!(
+            placed_by_name || iss.contains(r#"Source: "../build/*""#),
+            "{name} is moved aside but nothing reinstalls it"
+        );
+    }
 }
 
 /// The product version is single-sourced from [workspace.package] in the

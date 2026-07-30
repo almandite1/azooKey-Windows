@@ -23,6 +23,16 @@ pub(crate) const MAX_CONSECUTIVE_PING_FAILURES: u32 = 3;
 /// a child that never answers a single ping gets this long before it is
 /// declared hung (covers dictionary/model loading at startup)
 pub(crate) const STARTUP_GRACE: Duration = Duration::from_secs(120);
+
+/// The same allowance for a child that loads nothing.
+///
+/// 120 seconds is the conversion engine's number: it reads a dictionary and a
+/// multi-hundred-megabyte model before it can answer anything. The plugin
+/// host opens a pipe and serves builtins, so a broken one used to get two
+/// minutes of grace per attempt and five attempts before the supervisor gave
+/// up — about ten minutes of an IME with no add-ons, followed by permanent
+/// silence, for a process that should be answering in under a second.
+pub(crate) const FAST_STARTUP_GRACE: Duration = Duration::from_secs(15);
 /// give up when the watchdog kills a child this many times in a row
 /// without the child ever becoming healthy in between
 pub(crate) const MAX_CONSECUTIVE_WATCHDOG_KILLS: u32 = 5;
@@ -107,14 +117,26 @@ pub(crate) struct WatchdogPolicy {
     started_at: Instant,
     ever_succeeded: bool,
     consecutive_failures: u32,
+    /// How long this particular child may take to answer its first ping. A
+    /// parameter, not the constant, because the three children differ by an
+    /// order of magnitude in what they have to load — see
+    /// [`FAST_STARTUP_GRACE`]. Everything else about the policy is the same
+    /// for all of them.
+    startup_grace: Duration,
 }
 
 impl WatchdogPolicy {
+    #[cfg(test)]
     pub(crate) fn new(now: Instant) -> Self {
+        Self::with_startup_grace(now, STARTUP_GRACE)
+    }
+
+    pub(crate) fn with_startup_grace(now: Instant, startup_grace: Duration) -> Self {
         Self {
             started_at: now,
             ever_succeeded: false,
             consecutive_failures: 0,
+            startup_grace,
         }
     }
 
@@ -129,7 +151,7 @@ impl WatchdogPolicy {
             // startup grace: the pipe does not even exist while the child
             // is loading its dictionary/model, so failures don't count —
             // but a child that NEVER comes up is itself a hang
-            if now.duration_since(self.started_at) <= STARTUP_GRACE {
+            if now.duration_since(self.started_at) <= self.startup_grace {
                 return Verdict::Healthy;
             }
             return Verdict::Hung;

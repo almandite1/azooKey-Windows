@@ -9,6 +9,13 @@
 ; If iscc says the file is missing, run `cargo make build` instead of
 ; invoking iscc directly.
 #include "Version.iss"
+; What an in-use file is renamed to when it cannot be deleted (#100). Three
+; places have to agree on it -- the rename, the sweep that removes the
+; leftovers on the next upgrade, and the uninstall-time delete for the install
+; that never gets a next one -- and they were three separate string literals.
+; Changing one of them silently orphans every file the other two look for.
+#define MovedAsideSuffix ".old-"
+#define MovedAsideGlob "*.dll" + MovedAsideSuffix + "*"
 #define MyAppPublisher "fkunn1326"
 #define MyAppURL "https://github.com/fkunn1326/azooKey-Windows/"
 
@@ -163,7 +170,12 @@ Type: filesandordirs; Name: "{app}\ui.exe.WebView2"
 ; next upgrade. The last install never gets a next one, so they are removed
 ; here — and whatever is still loaded right now is deferred to the restart
 ; UninstallNeedRestart already asks for.
-Type: files; Name: "{app}\*.dll.old-*"
+Type: files; Name: "{app}\{#MovedAsideGlob}"
+; The legacy NSIS uninstaller, for a machine where the cleanup in
+; RemoveLegacyNsisSettingsApp never ran or could not delete it. Setup did not
+; install this file, so Setup would not otherwise remove it -- and one file
+; left behind keeps {app} itself from going.
+Type: files; Name: "{app}\uninstall.exe"
 
 [UninstallRun]
 ; stop the running IME processes first, or their exe/dll files stay locked
@@ -187,7 +199,22 @@ Filename: "schtasks"; \
 function InitializeSetup: Boolean;
 begin
   Dependency_AddVC2015To2022x64;
+  // Dependency_ForceX86 is not optional here, and its absence was invisible.
+  //
+  // Every x86 helper in CodeDependencies.iss picks between an x86 and an x64
+  // value with Dependency_String, and that chooses by Is64BitInstallMode —
+  // which this installer is. So the "x86" call checked whether the x64
+  // redistributable was installed, found it, and skipped: the 32-bit CRT was
+  // never bootstrapped on any machine. Nothing looked wrong, because the TIP
+  // that needs it (azookey32.dll, loaded into 32-bit applications) simply
+  // fails to load there and the host falls back to another IME.
+  //
+  // The same switch also picks the download's temp filename, so with neither
+  // redistributable present both entries were called vcredist2022_x64.exe and
+  // the second download overwrote the first — installing x64 twice.
+  Dependency_ForceX86 := True;
   Dependency_AddVC2015To2022x86;
+  Dependency_ForceX86 := False;
   // Not optional, and easy to lose: the Tauri NSIS this setup used to chain
   // was the product's ONLY WebView2 bootstrap. ui.exe draws the candidate
   // window in WebView2 as much as the settings app does, so without the
@@ -332,7 +359,13 @@ procedure RemoveLegacyNsisSettingsApp();
 var
   Location, AppDir, Desktop: String;
 begin
-  if not (RegKeyExists(HKLM, LegacyNsisKey) or RegKeyExists(HKCU, LegacyNsisKey)) then
+  // HKLM32 as well as HKLM: this setup runs in 64-bit install mode, so plain
+  // HKLM is the 64-bit view. The key has been measured there on a real
+  // machine, so this is not a fix for anything seen -- it is one line that
+  // closes the variant where some future or hand-made install lands in the
+  // WOW6432Node view and the entry then outlives every upgrade.
+  if not (RegKeyExists(HKLM, LegacyNsisKey) or RegKeyExists(HKLM32, LegacyNsisKey)
+          or RegKeyExists(HKCU, LegacyNsisKey)) then
     exit;
 
   Log('Found the legacy NSIS install of the settings app; removing it');
@@ -366,6 +399,8 @@ begin
   // the entry itself — the whole point
   if RegDeleteKeyIncludingSubkeys(HKLM, LegacyNsisKey) then
     Log('Removed the legacy uninstall entry from HKLM');
+  if RegDeleteKeyIncludingSubkeys(HKLM32, LegacyNsisKey) then
+    Log('Removed the legacy uninstall entry from the 32-bit HKLM view');
   if RegDeleteKeyIncludingSubkeys(HKCU, LegacyNsisKey) then
     Log('Removed the legacy uninstall entry from HKCU');
 
@@ -381,6 +416,11 @@ begin
   Desktop := ExpandConstant('{commondesktop}\Azookey.lnk');
   if DeleteFile(Desktop) then
     Log('Removed the desktop shortcut the silent chain created: ' + Desktop);
+  // and the per-user one, for an install made before the settings app went
+  // perMachine — the same installs whose uninstall key this looks for in HKCU
+  Desktop := ExpandConstant('{userdesktop}\Azookey.lnk');
+  if DeleteFile(Desktop) then
+    Log('Removed the per-user desktop shortcut: ' + Desktop);
 end;
 
 
@@ -547,7 +587,7 @@ begin
 
   for I := 1 to 50 do
   begin
-    MovedTo := Path + '.old-' + IntToStr(I);
+    MovedTo := Path + '{#MovedAsideSuffix}' + IntToStr(I);
     // a leftover from an earlier upgrade that is still loaded keeps its
     // name; take the next one
     if FileExists(MovedTo) then
@@ -560,7 +600,17 @@ begin
     end;
   end;
 
+  // Said out loud, like the startup task's failure: from here the [Files]
+  // copy hits a locked file and Setup shows its own "DeleteFile error, code
+  // 5" — which names no file and offers Retry, which cannot work. This is the
+  // only place that knows WHICH file is held and what would free it.
   Log('Could not move ' + Path + ' aside; the copy will hit a locked file');
+  MsgBox('次のファイルが他のアプリケーションに使用されているため、置き換えられません:' + #13#10 +
+         Path + #13#10#13#10 +
+         'azooKey で入力したことのあるアプリケーション (エクスプローラーを含む) が' + #13#10 +
+         'このファイルを保持しています。それらを閉じてから再試行するか、' + #13#10 +
+         'PC を再起動してからインストールし直してください。',
+         mbError, MB_OK);
   Result := False;
 end;
 
@@ -572,7 +622,7 @@ procedure SweepMovedAsideFiles(const Dir: String);
 var
   Rec: TFindRec;
 begin
-  if not FindFirst(AddBackslash(Dir) + '*.dll.old-*', Rec) then
+  if not FindFirst(AddBackslash(Dir) + '{#MovedAsideGlob}', Rec) then
     exit;
   try
     repeat
