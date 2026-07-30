@@ -260,6 +260,128 @@ async fn a_day_reading_gains_the_calendar_date() {
     clear(&mut client).await;
 }
 
+/// Borrows the real `settings.json` for the length of a test and puts it back.
+///
+/// These are the only tests here that write to the machine's configuration,
+/// and they have to: `UpdateConfig` is defined by what the file says, and
+/// there is no seam for it on the far side of a live server. The original
+/// bytes are restored on drop, including when a test panics — but a test
+/// process KILLED mid-run leaves whatever it wrote, so if that happens,
+/// restart the IME and it will move the file aside and start from defaults.
+struct BorrowedSettings {
+    path: std::path::PathBuf,
+    original: Option<String>,
+}
+
+impl BorrowedSettings {
+    fn take() -> Self {
+        let path = shared::config_root()
+            .expect("APPDATA must be set to run this test")
+            .join("settings.json");
+        let original = std::fs::read_to_string(&path).ok();
+        BorrowedSettings { path, original }
+    }
+
+    fn write(&self, contents: &str) {
+        std::fs::write(&self.path, contents).expect("write the settings fixture");
+    }
+}
+
+impl Drop for BorrowedSettings {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(original) => {
+                let _ = std::fs::write(&self.path, original);
+            }
+            // there was no file before us; leave none behind
+            None => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+async fn update_config(client: &mut Client) -> Result<(), tonic::Status> {
+    client
+        .update_config(shared::proto::UpdateConfigRequest {})
+        .await
+        .map(|_| ())
+}
+
+/// A settings file the server cannot read has to come back as an error.
+///
+/// It used to come back as success: `LoadConfig` was void, the Swift side kept
+/// its old values on a decode failure, and the RPC returned `Ok` unconditionally
+/// — so the settings app showed a success toast while conversion carried on
+/// with the configuration it already had. There was no way to observe that from
+/// outside the engine, which is why it needs a live one.
+#[tokio::test]
+#[ignore = "requires a running azookey-server; rewrites settings.json and restores it"]
+async fn update_config_reports_a_settings_file_it_cannot_read() {
+    let mut client = connect().await;
+    let settings = BorrowedSettings::take();
+
+    // valid JSON first: this must succeed, so that a failure below is about
+    // the broken file and not about the RPC being broken generally
+    settings.write(r#"{"version":"0.1.0","zenzai":{"enable":false},"plugins":{"enable":false}}"#);
+    update_config(&mut client)
+        .await
+        .expect("a readable settings file must reload cleanly");
+
+    settings.write("{this is not json");
+    let error = update_config(&mut client)
+        .await
+        .expect_err("a settings file that cannot be read must not report success");
+    assert!(
+        !error.message().is_empty(),
+        "the failure has to say something the settings app can show"
+    );
+}
+
+/// `plugins.enable` has to take effect on the next keystroke, not the next
+/// restart — and the engine's own reload does not carry it, so this is the
+/// half that only the Rust side does.
+///
+/// Deterministic because the date plugin's candidate either is or is not in
+/// the list; the zenzai keys change conversion in ways that are real but not
+/// assertable.
+#[tokio::test]
+#[ignore = "requires a running azookey-server AND plugin-host; rewrites settings.json and restores it"]
+async fn update_config_switches_the_plugin_hook_without_a_restart() {
+    let mut client = connect().await;
+    let settings = BorrowedSettings::take();
+
+    let today = chrono::Local::now().date_naive();
+    let expected = format!(
+        "{:04}/{:02}/{:02}",
+        chrono::Datelike::year(&today),
+        chrono::Datelike::month(&today),
+        chrono::Datelike::day(&today)
+    );
+    let date_is_offered =
+        |composing: &ComposingText| composing.suggestions.iter().any(|s| s.text == expected);
+
+    settings.write(r#"{"version":"0.1.0","zenzai":{"enable":false},"plugins":{"enable":true}}"#);
+    update_config(&mut client).await.expect("enable plugins");
+    clear(&mut client).await;
+    let on = type_keys(&mut client, "kyou").await;
+    clear(&mut client).await;
+    assert!(
+        date_is_offered(&on),
+        "with plugins on, {expected} should be offered for きょう; is plugin-host running?"
+    );
+
+    settings.write(r#"{"version":"0.1.0","zenzai":{"enable":false},"plugins":{"enable":false}}"#);
+    update_config(&mut client).await.expect("disable plugins");
+    clear(&mut client).await;
+    let off = type_keys(&mut client, "kyou").await;
+    clear(&mut client).await;
+    assert!(
+        !date_is_offered(&off),
+        "with plugins off the date must be gone without restarting the server"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a running azookey-server with its DLL environment"]
 async fn conversion_yields_the_expected_candidate() {
