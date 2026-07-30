@@ -11,37 +11,28 @@ import {
 import { useEffect, useState } from "react";
 import { toast } from "sonner"
 import { invoke } from '@tauri-apps/api/core';
-import {
-    Tooltip,
-    TooltipContent,
-    TooltipProvider,
-    TooltipTrigger,
-} from "@/components/ui/tooltip"
 
-const ToolTipSelectItem = ({
+// the reason a backend is unavailable used to live in a tooltip, but that put
+// a <button> around the role="option" -- which cost the item its accessible
+// name and broke arrow-key navigation. Say it inline instead.
+const BackendSelectItem = ({
     name,
     value,
     disabled,
-    tooltip
+    reason
 }: {
     name: string;
     value: string;
     disabled: boolean;
-    tooltip: string;
+    reason: string;
 }) => {
     return (
-        <TooltipProvider>
-            <Tooltip>
-                <TooltipTrigger>
-                    <SelectItem value={value} disabled={disabled}>
-                        {name}
-                    </SelectItem>
-                </TooltipTrigger>
-                {disabled && <TooltipContent side="left">
-                    {tooltip}
-                </TooltipContent>}
-            </Tooltip>
-        </TooltipProvider>
+        <SelectItem value={value} disabled={disabled}>
+            {name}
+            {disabled && reason && (
+                <span className="ml-2 text-xs text-muted-foreground">{reason}</span>
+            )}
+        </SelectItem>
     )
 }
 
@@ -173,10 +164,10 @@ export const Zenzai = () => {
                         <SelectTrigger className="w-48">
                             <SelectValue placeholder="バックエンドを選択" />
                         </SelectTrigger>
-                        <SelectContent className="flex flex-col">
-                            <ToolTipSelectItem name="CPU (非推奨)" value="cpu" disabled={!capability.cpu} tooltip="" />
-                            <ToolTipSelectItem name="CUDA (NVIDIA GPU)" value="cuda" disabled={!capability.cuda} tooltip="CUDA Toolkit 12をインストールする必要があります" />
-                            <ToolTipSelectItem name="Vulkan" value="vulkan" disabled={!capability.vulkan} tooltip="お使いのPCはVulkanに対応していません" />
+                        <SelectContent>
+                            <BackendSelectItem name="CPU (非推奨)" value="cpu" disabled={!capability.cpu} reason="" />
+                            <BackendSelectItem name="CUDA (NVIDIA GPU)" value="cuda" disabled={!capability.cuda} reason="CUDA Toolkit 12をインストールする必要があります" />
+                            <BackendSelectItem name="Vulkan" value="vulkan" disabled={!capability.vulkan} reason="お使いのPCはVulkanに対応していません" />
                         </SelectContent>
                     </Select>
                 </div>
