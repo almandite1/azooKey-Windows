@@ -125,6 +125,15 @@ fn the_settings_app_is_named_the_same_everywhere() {
         workspace_file("SIGNING.md").contains(&binary),
         "an unsigned settings app is the failure this list exists to prevent"
     );
+
+    // The TIP starts it too, from the language-bar menu (#98), and it is the
+    // reference furthest from the bundler: a rename would leave a menu item
+    // that quietly does nothing.
+    assert!(
+        workspace_file("crates/client/src/tsf/settings_app.rs").contains(&binary),
+        "the language-bar menu must start the settings app by the name it is \
+         actually built under"
+    );
 }
 
 /// The settings app's old name has to be deleted AND stopped.
