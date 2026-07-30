@@ -13,12 +13,10 @@ type ThemeProviderState = {
   setTheme: (theme: Theme) => void
 }
 
-const initialState: ThemeProviderState = {
-  theme: "system",
-  setTheme: () => null,
-}
-
-const ThemeProviderContext = createContext<ThemeProviderState>(initialState)
+// no default value: that is what makes the guard in useTheme reachable
+const ThemeProviderContext = createContext<ThemeProviderState | undefined>(
+  undefined
+)
 
 export function ThemeProvider({
   children,
@@ -32,20 +30,24 @@ export function ThemeProvider({
 
   useLayoutEffect(() => {
     const root = window.document.documentElement
+    const query = window.matchMedia("(prefers-color-scheme: dark)")
 
-    root.classList.remove("light", "dark")
-
-    if (theme === "system") {
-      const systemTheme = window.matchMedia("(prefers-color-scheme: dark)")
-        .matches
-        ? "dark"
-        : "light"
-
-      root.classList.add(systemTheme)
-      return
+    // the class list is also written by the inline script in index.html, which
+    // runs before paint to avoid a flash of the wrong theme on startup
+    const apply = () => {
+      root.classList.remove("light", "dark")
+      root.classList.add(
+        theme === "system" ? (query.matches ? "dark" : "light") : theme
+      )
     }
 
-    root.classList.add(theme)
+    apply()
+
+    if (theme !== "system") return
+
+    // follow the OS switching its colour mode while the app is running
+    query.addEventListener("change", apply)
+    return () => query.removeEventListener("change", apply)
   }, [theme])
 
   const value = {
