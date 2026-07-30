@@ -17,6 +17,7 @@
 //! left alone. That is the price of ever letting a recovered host back
 //! in without being told.
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -87,6 +88,16 @@ pub(crate) struct PluginClient {
     /// otherwise be reported per keystroke, and a log line that arrives
     /// thirty times a second is one nobody reads.
     reported_skew: AtomicBool,
+    /// Where `plugins.enable` is read from. `None` is the real per-user
+    /// configuration directory.
+    ///
+    /// The seam exists because these unit tests used to be decided by the
+    /// machine they ran on: `connect` ends with `reload_config`, which read
+    /// the actual `%APPDATA%\Azookey\settings.json`. Two tests worked around
+    /// it by storing `enabled` by hand afterwards, which meant nothing ever
+    /// exercised the read itself — and on a CI runner, with no settings file
+    /// at all, the "disabled" test passed vacuously.
+    config_root: Option<PathBuf>,
 }
 
 impl PluginClient {
@@ -95,6 +106,10 @@ impl PluginClient {
     }
 
     fn connect(pipe: String) -> Self {
+        Self::connect_in(pipe, None)
+    }
+
+    fn connect_in(pipe: String, config_root: Option<PathBuf>) -> Self {
         let channel = match shared::pipe::lazy_pipe_channel(pipe) {
             Ok(channel) => Some(channel),
             Err(e) => {
@@ -114,9 +129,18 @@ impl PluginClient {
                 open_until: None,
             }),
             reported_skew: AtomicBool::new(false),
+            config_root,
         };
         client.reload_config();
         client
+    }
+
+    /// The plugin settings as they are on disk right now.
+    fn plugins_config(&self) -> shared::PluginsConfig {
+        match &self.config_root {
+            Some(root) => shared::AppConfig::read_in(root).plugins,
+            None => shared::AppConfig::read().plugins,
+        }
     }
 
     /// Re-reads `plugins.enable`. Called at startup and whenever the
@@ -130,7 +154,7 @@ impl PluginClient {
     /// unasked and silent for the rest of the cooldown, and the only thing
     /// the user could see was that toggling had not helped.
     pub(crate) fn reload_config(&self) {
-        let plugins = shared::AppConfig::read().plugins;
+        let plugins = self.plugins_config();
         let enabled = plugins.enable;
         if self.enabled.swap(enabled, Ordering::Relaxed) != enabled {
             tracing::info!(enabled, "plugin hook switched");
@@ -382,11 +406,55 @@ mod tests {
         })
     }
 
-    /// Enabled without reading settings.json — these tests must not depend
-    /// on the machine's configuration.
+    /// A throwaway configuration directory holding a settings.json that says
+    /// what the test needs it to say.
+    ///
+    /// The point is that the client READS it, through the same code path the
+    /// server uses. These tests used to reach past that and set `enabled` by
+    /// hand, which left the read itself untested and let the machine's own
+    /// settings.json decide the outcome.
+    struct ConfigRoot(PathBuf);
+
+    impl ConfigRoot {
+        fn with_plugins(tag: &str, enable: bool) -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "azk-plugin-cfg-{}-{tag}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).expect("create the fixture config root");
+            std::fs::write(
+                dir.join("settings.json"),
+                format!(r#"{{"version":"0.1.0","plugins":{{"enable":{enable}}}}}"#),
+            )
+            .expect("write the fixture settings.json");
+            ConfigRoot(dir)
+        }
+
+        fn path(&self) -> PathBuf {
+            self.0.clone()
+        }
+    }
+
+    impl Drop for ConfigRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A client whose configuration says plugins are on — read from a
+    /// throwaway file, not stored past the code that reads it.
     fn client_for(base: &str) -> PluginClient {
-        let client = PluginClient::connect(format!(r"\\.\pipe\{base}"));
-        client.enabled.store(true, Ordering::Relaxed);
+        let config = ConfigRoot::with_plugins(base, true);
+        let client = PluginClient::connect_in(format!(r"\\.\pipe\{base}"), Some(config.path()));
+        // the fixture has to outlive `connect_in`'s read, and nothing after
+        // this reads it again
+        drop(config);
+        assert!(
+            client.enabled.load(Ordering::Relaxed),
+            "the fixture says plugins are enabled, so the client must have read that"
+        );
         client
     }
 
@@ -537,13 +605,16 @@ mod tests {
         let base = unique_pipe("disabled");
         let server = serve(&base, FakeHost::slow());
 
-        // Explicitly off, for the same reason `client_for` sets it
-        // explicitly on: `connect` ends with `reload_config`, which reads
-        // the real settings.json. Leaving it to do that made this test
-        // fail on a machine with plugins enabled and pass vacuously on one
-        // with no settings file at all — which is every CI runner.
-        let client = PluginClient::connect(format!(r"\\.\pipe\{base}"));
-        client.enabled.store(false, Ordering::Relaxed);
+        // Off because a file says so, not because the test reached in and set
+        // it. Reading the real settings.json made this fail on a machine with
+        // plugins enabled and pass vacuously on one with no settings file at
+        // all — which is every CI runner.
+        let config = ConfigRoot::with_plugins("disabled", false);
+        let client = PluginClient::connect_in(format!(r"\\.\pipe\{base}"), Some(config.path()));
+        assert!(
+            !client.enabled.load(Ordering::Relaxed),
+            "the fixture says plugins are off, so the client must have read that"
+        );
 
         let started = Instant::now();
         let offered = client.offer("きょう", &[spanning("今日", 4, 3)]).await;
@@ -718,6 +789,51 @@ mod tests {
         assert!(
             !client.breaker_is_open(Instant::now()),
             "a config reload must give the host another chance"
+        );
+    }
+
+    /// The whole path `plugins.enable` travels: a file on disk, the read that
+    /// `UpdateConfig` triggers, and the flag the keystroke path checks.
+    ///
+    /// Nothing covered this. `reload_config` read the machine's own
+    /// settings.json, so the two tests that needed a known state set the flag
+    /// by hand and the read was never exercised — the setting could have
+    /// stopped being wired to the file entirely and every test here would
+    /// still have passed.
+    #[tokio::test]
+    async fn the_hook_follows_the_file_across_a_reload() {
+        let config = ConfigRoot::with_plugins("follows-file", false);
+        let client = PluginClient::connect_in(
+            format!(r"\\.\pipe\{}", unique_pipe("follows-file")),
+            Some(config.path()),
+        );
+        assert!(
+            !client.enabled.load(Ordering::Relaxed),
+            "off in the file means off in the client"
+        );
+
+        std::fs::write(
+            config.path().join("settings.json"),
+            r#"{"version":"0.1.0","plugins":{"enable":true}}"#,
+        )
+        .expect("rewrite the fixture settings.json");
+        client.reload_config();
+
+        assert!(
+            client.enabled.load(Ordering::Relaxed),
+            "a reload must pick up what the settings app just wrote"
+        );
+
+        std::fs::write(
+            config.path().join("settings.json"),
+            r#"{"version":"0.1.0","plugins":{"enable":false}}"#,
+        )
+        .expect("rewrite the fixture settings.json");
+        client.reload_config();
+
+        assert!(
+            !client.enabled.load(Ordering::Relaxed),
+            "and it must follow the setting back off again"
         );
     }
 

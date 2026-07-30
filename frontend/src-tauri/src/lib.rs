@@ -1,4 +1,5 @@
 mod ipc;
+mod trace;
 
 use serde::{Deserialize, Serialize};
 use shared::AppConfig;
@@ -35,8 +36,39 @@ fn get_config() -> Result<AppConfig, String> {
     AppConfig::try_read()
 }
 
+/// The sections a save has to carry. `AppConfig` is deliberately tolerant of
+/// a settings FILE that is missing them — an older build wrote it, and the
+/// defaults are the right answer there. At this boundary the same tolerance
+/// means something else entirely: a payload that omits `zenzai` gets the
+/// defaults filled in and then WRITTEN, so a frontend bug that dropped a
+/// section from the request would quietly reset every setting in it.
+const REQUIRED_SECTIONS: [&str; 2] = ["zenzai", "plugins"];
+
+/// The config to save, or why this payload is not one.
+fn config_from_payload(payload: serde_json::Value) -> Result<AppConfig, String> {
+    let object = payload
+        .as_object()
+        .ok_or("the settings payload is not an object")?;
+    for section in REQUIRED_SECTIONS {
+        if !object
+            .get(section)
+            .is_some_and(serde_json::Value::is_object)
+        {
+            return Err(format!(
+                "the settings payload has no \"{section}\" section; refusing to save, \
+                 because writing it would reset every setting in it"
+            ));
+        }
+    }
+    serde_json::from_value(payload).map_err(|e| format!("the settings payload is unusable: {e}"))
+}
+
 #[tauri::command]
-fn update_config(state: tauri::State<AppState>, new_config: AppConfig) -> Result<(), String> {
+fn update_config(
+    state: tauri::State<AppState>,
+    new_config: serde_json::Value,
+) -> Result<(), String> {
+    let new_config = config_from_payload(new_config)?;
     // refused when settings.json was written by a newer build — report it
     // instead of silently dropping the keys we do not know about
     new_config.write()?;
@@ -113,6 +145,9 @@ fn check_capability() -> Capability {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // before AppState::new(), which is what migrates settings.json and so the
+    // first thing with something to report
+    trace::setup_logger();
     let app_state = AppState::new();
 
     tauri::Builder::default()
@@ -125,4 +160,66 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::config_from_payload;
+
+    /// A whole document saves, and the round trip keeps what it was given.
+    #[test]
+    fn a_complete_payload_is_accepted() {
+        let config = config_from_payload(serde_json::json!({
+            "version": "0.1.0",
+            "zenzai": {
+                "enable": true,
+                "profile": "p",
+                "backend": "cuda",
+                "inference_limit": 3,
+                "topic": "t",
+                "style": "s",
+                "preference": "f"
+            },
+            "plugins": { "enable": true, "entries": [] }
+        }))
+        .expect("a complete payload is savable");
+
+        assert!(config.zenzai.enable);
+        assert_eq!(config.zenzai.backend, "cuda");
+        assert_eq!(config.zenzai.inference_limit, 3);
+        assert!(config.plugins.enable);
+    }
+
+    /// The bug: `AppConfig` fills a missing section in with defaults, which is
+    /// right for a FILE an older build wrote and wrong for a request, because
+    /// the defaults then get written over what the user had.
+    #[test]
+    fn a_payload_missing_a_section_is_refused() {
+        for payload in [
+            serde_json::json!({ "version": "0.1.0", "plugins": { "enable": true } }),
+            serde_json::json!({ "version": "0.1.0", "zenzai": { "enable": true } }),
+            serde_json::json!({ "version": "0.1.0" }),
+        ] {
+            let error = config_from_payload(payload.clone())
+                .expect_err("an incomplete payload must not be saved");
+            assert!(
+                error.contains("refusing to save"),
+                "for {payload}: got {error}"
+            );
+        }
+    }
+
+    /// A section of the wrong shape is not a section. `serde(default)` would
+    /// not have caught this either — it would have failed the whole parse,
+    /// which is a worse message for the same refusal.
+    #[test]
+    fn a_section_that_is_not_an_object_is_refused() {
+        let error = config_from_payload(serde_json::json!({
+            "version": "0.1.0",
+            "zenzai": "on",
+            "plugins": { "enable": false }
+        }))
+        .expect_err("a payload whose section is not an object must not be saved");
+        assert!(error.contains("zenzai"), "got {error}");
+    }
 }

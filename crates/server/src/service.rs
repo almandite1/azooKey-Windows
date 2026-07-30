@@ -213,6 +213,50 @@ impl AzookeyService for MyAzookeyService {
 mod tests {
     use super::last_line_context;
 
+    /// `UpdateConfig` has to reload BOTH halves of the settings file, and
+    /// nothing was checking that it still did.
+    ///
+    /// The engine gets the zenzai keys over the FFI; `plugins.enable` is read
+    /// on this side, because the engine's reload does not carry it. Deleting
+    /// either call left the whole suite green — the engine half needs a live
+    /// engine to observe, and the plugin half needs a live host — while the
+    /// symptom for a user was a setting that saved and then did nothing until
+    /// they restarted.
+    ///
+    /// So the wiring is read instead, the same way `installer_config.rs` reads
+    /// the installer's. It cannot tell whether the calls WORK; it can tell
+    /// that both are still there, which is the failure that actually happened.
+    #[test]
+    fn update_config_reloads_the_engine_and_the_plugin_hook() {
+        const SOURCE: &str = include_str!("service.rs");
+
+        let start = SOURCE
+            .find("async fn update_config")
+            .expect("service.rs should implement update_config");
+        let rest = &SOURCE[start..];
+        // to the next method, or the end of the impl
+        let end = rest[1..]
+            .find("\n    async fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert!(
+            body.contains("load_config(&json)"),
+            "update_config must hand the settings to the engine: got {body}"
+        );
+        assert!(
+            body.contains("self.plugins.reload_config()"),
+            "update_config must also re-read plugins.enable, which the engine's \
+             reload does not carry: got {body}"
+        );
+        assert!(
+            body.contains("try_read"),
+            "the document must be read ONCE here and passed on, rather than \
+             read again on the far side of the FFI boundary: got {body}"
+        );
+    }
+
     #[test]
     fn last_line_context_takes_the_final_nonempty_line() {
         assert_eq!(last_line_context("前の行\r\n現在の行"), "現在の行");
