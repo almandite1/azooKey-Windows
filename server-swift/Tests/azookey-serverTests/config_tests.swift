@@ -178,10 +178,18 @@ struct EngineConfigTests {
             #expect(
                 options.zenzaiMode == .on(
                     weight: execURL.appendingPathComponent("zenz.gguf"),
-                    inferenceLimit: zenzaiInferenceLimit,
+                    inferenceLimit: 1,
                     requestRichCandidates: true,
                     personalizationMode: nil,
-                    versionDependentMode: .v3(.init(profile: "私は猫だ", leftSideContext: "吾輩は"))
+                    versionDependentMode: .v3(
+                        .init(
+                            profile: "私は猫だ",
+                            topic: "",
+                            style: "",
+                            preference: "",
+                            leftSideContext: "吾輩は"
+                        )
+                    )
                 )
             )
             #expect(options.zenzaiMode != .off)
@@ -199,10 +207,133 @@ struct EngineConfigTests {
             #expect(
                 getOptions().zenzaiMode == .on(
                     weight: execURL.appendingPathComponent("zenz.gguf"),
-                    inferenceLimit: zenzaiInferenceLimit,
+                    inferenceLimit: 1,
                     requestRichCandidates: true,
                     personalizationMode: nil,
-                    versionDependentMode: .v3(.init(profile: "p", leftSideContext: ""))
+                    versionDependentMode: .v3(
+                        .init(
+                            profile: "p",
+                            topic: "",
+                            style: "",
+                            preference: "",
+                            leftSideContext: ""
+                        )
+                    )
+                )
+            )
+        }
+    }
+
+    /// The keys the settings app grew after the first release. They are read
+    /// by field name out of a file the Rust side writes, so a rename on either
+    /// side shows up here rather than as conversion that quietly ignores what
+    /// the user typed into the settings app.
+    @Test("the inference limit and the v3 context keys are decoded")
+    func advancedZenzaiKeysAreRead() {
+        let appData = AppData(#"{"zenzai":{"enable":true,"inference_limit":5,"topic":"ソフトウェア開発","style":"ですます調","preference":"漢字は控えめに"}}"#)
+        defer { appData.remove() }
+
+        let settings = loadSettingsFile(appDataPath: appData.path)
+
+        #expect(settings?.zenzai?.inference_limit == 5)
+        #expect(settings?.zenzai?.topic == "ソフトウェア開発")
+        #expect(settings?.zenzai?.style == "ですます調")
+        #expect(settings?.zenzai?.preference == "漢字は控えめに")
+    }
+
+    /// A settings file written before these keys existed. Same per-key
+    /// tolerance as everything else: absent, not a failed parse.
+    @Test("a file without the advanced keys decodes with them absent")
+    func advancedZenzaiKeysMayBeAbsent() {
+        let appData = AppData(#"{"zenzai":{"enable":true,"profile":"p"}}"#)
+        defer { appData.remove() }
+
+        let settings = loadSettingsFile(appDataPath: appData.path)
+
+        #expect(settings?.zenzai?.enable == true)
+        #expect(settings?.zenzai?.inference_limit == nil)
+        #expect(settings?.zenzai?.topic == nil)
+        #expect(settings?.zenzai?.style == nil)
+        #expect(settings?.zenzai?.preference == nil)
+    }
+
+    @Test("the advanced keys reach the engine config")
+    func advancedKeysAreApplied() {
+        withRestoredConfig {
+            config = EngineConfig()
+
+            applySettings(
+                SettingsFile(
+                    zenzai: .init(
+                        inference_limit: 3,
+                        topic: "話題",
+                        style: "文体",
+                        preference: "好み"
+                    )
+                )
+            )
+
+            #expect(config.zenzaiInferenceLimit == 3)
+            #expect(config.zenzaiTopic == "話題")
+            #expect(config.zenzaiStyle == "文体")
+            #expect(config.zenzaiPreference == "好み")
+        }
+    }
+
+    /// settings.json is a text file the user can edit, and the settings app is
+    /// not the only thing that writes it. Nothing the file says may put the
+    /// engine outside the range it was tested at — a zero would mean no
+    /// inference at all, and a large one stalls the single-threaded server for
+    /// every application at once.
+    @Test("a hand-edited inference limit is clamped to the supported range")
+    func inferenceLimitIsClamped() {
+        withRestoredConfig {
+            config = EngineConfig()
+
+            applySettings(SettingsFile(zenzai: .init(inference_limit: 0)))
+            #expect(config.zenzaiInferenceLimit == 1)
+
+            applySettings(SettingsFile(zenzai: .init(inference_limit: -7)))
+            #expect(config.zenzaiInferenceLimit == 1)
+
+            applySettings(SettingsFile(zenzai: .init(inference_limit: 100)))
+            #expect(config.zenzaiInferenceLimit == 10)
+
+            applySettings(SettingsFile(zenzai: .init(inference_limit: 4)))
+            #expect(config.zenzaiInferenceLimit == 4, "a value in range is untouched")
+        }
+    }
+
+    /// The whole point of exposing these: what the user set has to end up in
+    /// the request the model sees.
+    @Test("the configured limit and context strings reach the conversion options")
+    func advancedKeysReachTheOptions() {
+        withRestoredConfig {
+            execURL = URL(filePath: #filePath).deletingLastPathComponent()
+            config = EngineConfig(
+                zenzaiEnabled: true,
+                zenzaiProfile: "私は猫だ",
+                zenzaiInferenceLimit: 10,
+                zenzaiTopic: "話題",
+                zenzaiStyle: "文体",
+                zenzaiPreference: "好み"
+            )
+
+            #expect(
+                getOptions(context: "吾輩は").zenzaiMode == .on(
+                    weight: execURL.appendingPathComponent("zenz.gguf"),
+                    inferenceLimit: 10,
+                    requestRichCandidates: true,
+                    personalizationMode: nil,
+                    versionDependentMode: .v3(
+                        .init(
+                            profile: "私は猫だ",
+                            topic: "話題",
+                            style: "文体",
+                            preference: "好み",
+                            leftSideContext: "吾輩は"
+                        )
+                    )
                 )
             )
         }

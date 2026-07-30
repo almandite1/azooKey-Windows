@@ -13,12 +13,31 @@ struct SettingsFile: Codable {
     struct Zenzai: Codable {
         var enable: Bool?
         var profile: String?
+        // snake_case because the JSON keys are whatever serde names the Rust
+        // fields, and matching them by eye beats a CodingKeys table that has
+        // to be kept in sync separately
+        var inference_limit: Int?
+        var topic: String?
+        var style: String?
+        var preference: String?
     }
 }
+
+/// Bounds for `inference_limit`. The floor is what the engine used while the
+/// value was hardcoded; the ceiling is the converter's own default, which is
+/// as high as anyone has reason to go. A hand-edited settings.json is the
+/// reason this is clamped rather than trusted: the server converts on a
+/// single thread, so an absurd limit stalls every application typing through
+/// the IME, not just the one that triggered it.
+let zenzaiInferenceLimitRange = 1...10
 
 struct EngineConfig {
     var zenzaiEnabled = false
     var zenzaiProfile = ""
+    var zenzaiInferenceLimit = zenzaiInferenceLimitRange.lowerBound
+    var zenzaiTopic = ""
+    var zenzaiStyle = ""
+    var zenzaiPreference = ""
 }
 
 /// Reads and decodes `%APPDATA%\Azookey\settings.json`, or returns nil when
@@ -54,11 +73,30 @@ func loadSettingsFile(appDataPath: String? = nil) -> SettingsFile? {
     if let profile = zenzai.profile {
         config.zenzaiProfile = profile
     }
+    if let limit = zenzai.inference_limit {
+        config.zenzaiInferenceLimit = min(
+            max(limit, zenzaiInferenceLimitRange.lowerBound),
+            zenzaiInferenceLimitRange.upperBound
+        )
+    }
+    if let topic = zenzai.topic {
+        config.zenzaiTopic = topic
+    }
+    if let style = zenzai.style {
+        config.zenzaiStyle = style
+    }
+    if let preference = zenzai.preference {
+        config.zenzaiPreference = preference
+    }
 }
 
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
     let zenzaiEnabled = config.zenzaiEnabled
     let zenzaiProfile = config.zenzaiProfile
+    let zenzaiInferenceLimit = config.zenzaiInferenceLimit
+    let zenzaiTopic = config.zenzaiTopic
+    let zenzaiStyle = config.zenzaiStyle
+    let zenzaiPreference = config.zenzaiPreference
     return ConvertRequestOptions(
         requireJapanesePrediction: .autoMix,
         requireEnglishPrediction: .disabled,
@@ -81,6 +119,9 @@ func loadSettingsFile(appDataPath: String? = nil) -> SettingsFile? {
             versionDependentMode: .v3(
                 .init(
                     profile: zenzaiProfile,
+                    topic: zenzaiTopic,
+                    style: zenzaiStyle,
+                    preference: zenzaiPreference,
                     leftSideContext: context
                 )
             )

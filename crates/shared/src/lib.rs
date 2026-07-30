@@ -144,6 +144,18 @@ pub struct ZenzaiConfig {
     pub enable: bool,
     pub profile: String,
     pub backend: String,
+    /// How many times the model may re-run to improve one conversion.
+    /// The engine clamps this to 1..=10; the default stays at what the
+    /// engine hardcoded before it was configurable, so upgrading does not
+    /// silently make everyone's typing slower.
+    pub inference_limit: u32,
+    /// The three v3 context strings, the same shape as `profile`: short
+    /// hints the model is given about what the user is writing about
+    /// (`topic`), how (`style`) and what they tend to prefer
+    /// (`preference`). Empty means "say nothing", as with `profile`.
+    pub topic: String,
+    pub style: String,
+    pub preference: String,
 }
 
 impl Default for ZenzaiConfig {
@@ -152,6 +164,10 @@ impl Default for ZenzaiConfig {
             enable: false,
             profile: "".to_string(),
             backend: "cpu".to_string(),
+            inference_limit: 1,
+            topic: "".to_string(),
+            style: "".to_string(),
+            preference: "".to_string(),
         }
     }
 }
@@ -269,6 +285,28 @@ impl AppConfig {
         match Self::load_from(config_root) {
             LoadOutcome::Parsed(config) => config,
             LoadOutcome::Missing | LoadOutcome::Malformed => AppConfig::default(),
+        }
+    }
+
+    /// Read for a caller that is going to write the result back — the
+    /// settings app does exactly that, one key at a time. A missing file is
+    /// still the defaults (first run, and writing them is correct), but an
+    /// unreadable or malformed one is an error here rather than the
+    /// defaults: handing those back would let the caller save them over
+    /// whatever the user actually had.
+    pub fn try_read() -> Result<Self, String> {
+        Self::try_read_in(&get_config_root())
+    }
+
+    /// The same, from a directory the caller names — see `read_in`.
+    pub fn try_read_in(config_root: &Path) -> Result<Self, String> {
+        match Self::load_from(config_root) {
+            LoadOutcome::Parsed(config) => Ok(config),
+            LoadOutcome::Missing => Ok(AppConfig::default()),
+            LoadOutcome::Malformed => Err(format!(
+                "{} could not be read; it is missing or not valid JSON",
+                config_root.join(SETTINGS_FILENAME).display()
+            )),
         }
     }
 
@@ -474,6 +512,83 @@ mod tests {
         assert_eq!(config.zenzai.backend, "cpu", "missing field gets a default");
         assert_eq!(config.version, CONFIG_VERSION);
         assert!(root.read_settings().contains(CONFIG_VERSION));
+    }
+
+    /// The zenzai keys added after the first release have to degrade the same
+    /// way `backend` did, and to the values the engine used while they were
+    /// still hardcoded — an upgrade must not change how conversion behaves
+    /// until the user asks it to.
+    #[test]
+    fn zenzai_keys_added_later_default_to_the_previous_behaviour() {
+        let root = TempConfigRoot::new();
+        root.write_settings(
+            r#"{"version":"0.1.0","zenzai":{"enable":true,"profile":"p","backend":"cuda"}}"#,
+        );
+
+        let config = AppConfig::new_in(root.path());
+
+        assert_eq!(
+            config.zenzai.inference_limit, 1,
+            "what the engine hardcoded"
+        );
+        assert_eq!(config.zenzai.topic, "");
+        assert_eq!(config.zenzai.style, "");
+        assert_eq!(config.zenzai.preference, "");
+        assert!(config.zenzai.enable, "the old keys still survive");
+        assert_eq!(config.zenzai.profile, "p");
+    }
+
+    /// The engine decodes this file itself, by field name, so the names have
+    /// to survive a round trip through disk exactly as spelled.
+    #[test]
+    fn the_zenzai_context_keys_round_trip() {
+        let root = TempConfigRoot::new();
+        let mut config = AppConfig::default();
+        config.zenzai.inference_limit = 5;
+        config.zenzai.topic = "ソフトウェア開発".to_string();
+        config.zenzai.style = "ですます調".to_string();
+        config.zenzai.preference = "漢字は控えめに".to_string();
+
+        config.write_to(root.path()).expect("write");
+
+        let stored = root.read_settings();
+        for key in ["inference_limit", "topic", "style", "preference"] {
+            assert!(
+                stored.contains(&format!("\"{key}\"")),
+                "the Swift decoder looks for {key} by name"
+            );
+        }
+        let reread = AppConfig::new_in(root.path());
+        assert_eq!(reread.zenzai.inference_limit, 5);
+        assert_eq!(reread.zenzai.topic, "ソフトウェア開発");
+        assert_eq!(reread.zenzai.style, "ですます調");
+        assert_eq!(reread.zenzai.preference, "漢字は控えめに");
+    }
+
+    /// The settings app re-reads before every save, so what a failed read
+    /// returns decides whether a broken file gets overwritten with defaults
+    /// or reported.
+    #[test]
+    fn try_read_reports_a_broken_file_but_not_a_missing_one() {
+        let root = TempConfigRoot::new();
+
+        let missing = AppConfig::try_read_in(root.path()).expect("no file yet is not an error");
+        assert_eq!(missing.version, CONFIG_VERSION);
+
+        root.write_settings(r#"{"version":"#);
+        assert!(
+            AppConfig::try_read_in(root.path()).is_err(),
+            "defaults here would be saved over the user's file"
+        );
+
+        root.write_settings(r#"{"version":"0.1.0","zenzai":{"profile":"p"}}"#);
+        assert_eq!(
+            AppConfig::try_read_in(root.path())
+                .expect("a valid file reads")
+                .zenzai
+                .profile,
+            "p"
+        );
     }
 
     #[test]
