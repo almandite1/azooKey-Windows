@@ -12,6 +12,7 @@ import { ConfigProvider } from "@/hooks/use-config"
 import { ConfigGate } from "@/components/config-gate"
 
 import { General } from "@/pages/general"
+import { Conversion } from "@/pages/conversion"
 import { Zenzai } from "@/pages/zenzai"
 import { About } from "@/pages/about"
 import { Toaster } from "@/components/ui/sonner"
@@ -29,6 +30,7 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
               <ConfigGate>
                 <Routes>
                   <Route path="/" element={<General />} />
+                  <Route path="/conversion" element={<Conversion />} />
                   <Route path="/zenzai" element={<Zenzai />} />
                   <Route path="/about" element={<About />} />
                   <Route path="*" element={<Navigate to="/" replace />} />

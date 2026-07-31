@@ -70,7 +70,7 @@ fn get_config() -> Result<AppConfig, String> {
 /// WRITE, the same tolerance means something else entirely: a document that
 /// has lost a section gets the defaults filled in and then persisted, which
 /// resets every setting in it.
-const REQUIRED_SECTIONS: [&str; 2] = ["zenzai", "plugins"];
+const REQUIRED_SECTIONS: [&str; 3] = ["zenzai", "conversion", "plugins"];
 
 /// The config to save, or why this document is not one.
 fn config_from_payload(payload: serde_json::Value) -> Result<AppConfig, String> {
@@ -323,6 +323,11 @@ mod tests {
                 "inference_limit": 1, "context_size": 1024,
                 "topic": "", "style": "", "preference": ""
             },
+            "conversion": {
+                "half_width_kana": false, "full_width_roman": false,
+                "english_in_roman_input": false, "typo_correction": "automatic",
+                "typography": false
+            },
             "plugins": { "enable": false, "entries": [] }
         })
     }
@@ -404,6 +409,13 @@ mod tests {
                 "style": "s",
                 "preference": "f"
             },
+            "conversion": {
+                "half_width_kana": true,
+                "full_width_roman": false,
+                "english_in_roman_input": false,
+                "typo_correction": "enabled",
+                "typography": false
+            },
             "plugins": { "enable": true, "entries": [] }
         }))
         .expect("a complete payload is savable");
@@ -412,6 +424,8 @@ mod tests {
         assert_eq!(config.zenzai.backend, "cuda");
         assert_eq!(config.zenzai.inference_limit, 3);
         assert_eq!(config.zenzai.context_size, 2048);
+        assert!(config.conversion.half_width_kana);
+        assert_eq!(config.conversion.typo_correction, "enabled");
         assert!(config.plugins.enable);
     }
 

@@ -304,6 +304,77 @@ struct EngineConfigTests {
         }
     }
 
+    /// The conversion section is applied even when there is no zenzai section.
+    ///
+    /// `applySettings` returns early when the document has no `zenzai` object,
+    /// and the settings app writes one key at a time -- so toggling any of
+    /// these sends a document that has `conversion` and nothing else. Reading
+    /// the sections in the wrong order would drop every one of them.
+    @Test("the conversion section applies on its own")
+    func conversionSectionAppliesWithoutZenzai() {
+        withRestoredConfig {
+            config = EngineConfig()
+
+            let settings = decodeSettings(
+                #"{"conversion":{"half_width_kana":true,"full_width_roman":true,"english_in_roman_input":true,"typo_correction":"disabled","typography":true}}"#
+            )
+            #expect(settings?.zenzai == nil, "the document really has no zenzai section")
+            applySettings(settings)
+
+            #expect(config.halfWidthKanaCandidate)
+            #expect(config.fullWidthRomanCandidate)
+            #expect(config.englishCandidateInRoman2KanaInput)
+            #expect(config.typoCorrection == .disabled)
+            #expect(config.typographyCandidates)
+        }
+    }
+
+    /// An unreadable mode must not change behaviour: it means "let the engine
+    /// decide", which is what the engine did before the setting existed.
+    @Test("an unknown typo correction mode falls back to automatic")
+    func unknownTypoCorrectionModeIsAutomatic() {
+        #expect(typoCorrectionMode("enabled") == .enabled)
+        #expect(typoCorrectionMode("disabled") == .disabled)
+        #expect(typoCorrectionMode("automatic") == .automatic)
+        #expect(typoCorrectionMode("Disabled") == .automatic, "spelled exactly, or not at all")
+        #expect(typoCorrectionMode("") == .automatic)
+        #expect(typoCorrectionMode(nil) == .automatic)
+    }
+
+    /// What the settings are for: they have to reach the request the converter
+    /// sees. Typography is the one that changes shape on the way -- off means
+    /// nil, which is how the engine keeps following the converter's own default
+    /// set, and on means naming that set plus the extra provider.
+    @Test("the conversion settings reach the conversion options")
+    func conversionSettingsReachTheOptions() {
+        withRestoredConfig {
+            config = EngineConfig()
+            let untouched = getOptions()
+            #expect(!untouched.halfWidthKanaCandidate)
+            #expect(!untouched.fullWidthRomanCandidate)
+            #expect(!untouched.englishCandidateInRoman2KanaInput)
+            #expect(untouched.typoCorrectionMode == .automatic)
+            let defaultProviderCount = KanaKanjiConverter.defaultSpecialCandidateProviders.count
+            #expect(untouched.specialCandidateProviders.count == defaultProviderCount)
+
+            applySettings(
+                decodeSettings(
+                    #"{"conversion":{"half_width_kana":true,"full_width_roman":true,"english_in_roman_input":true,"typo_correction":"enabled","typography":true}}"#
+                )
+            )
+            let options = getOptions()
+
+            #expect(options.halfWidthKanaCandidate)
+            #expect(options.fullWidthRomanCandidate)
+            #expect(options.englishCandidateInRoman2KanaInput)
+            #expect(options.typoCorrectionMode == .enabled)
+            #expect(
+                options.specialCandidateProviders.count == defaultProviderCount + 1,
+                "typography is added to the default set, not substituted for it"
+            )
+        }
+    }
+
     /// Same reasoning as the limit above, with a sharper edge: this number is
     /// handed to llama.cpp as `n_ctx` and `n_batch`, so an unbounded one is an
     /// allocation that can land in VRAM, and one below the floor is a cache too
@@ -388,6 +459,14 @@ struct EngineConfigTests {
             #expect(config.zenzaiProfile == untouched.zenzaiProfile)
             #expect(config.zenzaiInferenceLimit == untouched.zenzaiInferenceLimit)
             #expect(config.zenzaiContextSize == untouched.zenzaiContextSize)
+            #expect(config.halfWidthKanaCandidate == untouched.halfWidthKanaCandidate)
+            #expect(config.fullWidthRomanCandidate == untouched.fullWidthRomanCandidate)
+            #expect(
+                config.englishCandidateInRoman2KanaInput
+                    == untouched.englishCandidateInRoman2KanaInput
+            )
+            #expect(config.typoCorrection == untouched.typoCorrection)
+            #expect(config.typographyCandidates == untouched.typographyCandidates)
             #expect(config.zenzaiTopic == untouched.zenzaiTopic)
             #expect(config.zenzaiStyle == untouched.zenzaiStyle)
             #expect(config.zenzaiPreference == untouched.zenzaiPreference)

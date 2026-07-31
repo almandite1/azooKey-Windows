@@ -9,6 +9,7 @@ vi.mock("sonner", () => ({ toast: (...args: unknown[]) => toast(...args) }));
 
 import { ConfigProvider } from "@/hooks/use-config";
 import { General } from "@/pages/general";
+import { Conversion } from "@/pages/conversion";
 import { Zenzai } from "@/pages/zenzai";
 
 const config = (overrides: Record<string, unknown> = {}) => ({
@@ -23,6 +24,13 @@ const config = (overrides: Record<string, unknown> = {}) => ({
         style: "",
         preference: "",
         ...overrides,
+    },
+    conversion: {
+        half_width_kana: false,
+        full_width_roman: false,
+        english_in_roman_input: false,
+        typo_correction: "automatic",
+        typography: false,
     },
     plugins: { enable: false, entries: [] },
 });
@@ -190,6 +198,52 @@ describe("values outside the presets", () => {
 
         await waitFor(() =>
             expect(screen.getByRole("combobox", { name: /バックエンド/ })).toHaveTextContent("rocm")
+        );
+    });
+});
+
+/// `config()` spreads its overrides into the zenzai section, which is the one
+/// every other test needs; these need the section next to it.
+const withConversion = (overrides: Record<string, unknown> = {}) => {
+    const document = config();
+    return { ...document, conversion: { ...document.conversion, ...overrides } };
+};
+
+describe("the conversion settings", () => {
+    /// The key path is the whole risk here. A setting that writes
+    /// "zenzai.half_width_kana" is rejected by the Rust side and looks exactly
+    /// like a control that does nothing, so pin the path the switch sends.
+    it("writes the key it names", async () => {
+        const patches = withBackend(withConversion());
+        await renderPage(<Conversion />);
+
+        await userEvent.click(screen.getByRole("switch", { name: /半角カナ/ }));
+
+        await waitFor(() =>
+            expect(patches).toContainEqual({ key: "conversion.half_width_kana", value: true })
+        );
+    });
+
+    it("shows the stored state of each switch", async () => {
+        withBackend(withConversion({ full_width_roman: true, typography: true }));
+        await renderPage(<Conversion />);
+
+        await waitFor(() => expect(screen.getByRole("switch", { name: /全角英数/ })).toBeChecked());
+        expect(screen.getByRole("switch", { name: /装飾文字/ })).toBeChecked();
+        expect(screen.getByRole("switch", { name: /半角カナ/ })).not.toBeChecked();
+    });
+
+    /// settings.json is hand-editable and the engine accepts anything (it
+    /// treats what it does not know as "automatic"), so a value outside the
+    /// three presets must still be shown rather than silently replaced.
+    it("shows a stored typo correction mode that is not one of the presets", async () => {
+        withBackend(withConversion({ typo_correction: "aggressive" }));
+        await renderPage(<Conversion />);
+
+        await waitFor(() =>
+            expect(screen.getByRole("combobox", { name: /打ち間違いの訂正/ })).toHaveTextContent(
+                "aggressive"
+            )
         );
     });
 });

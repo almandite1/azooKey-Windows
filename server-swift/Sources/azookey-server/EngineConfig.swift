@@ -9,6 +9,15 @@ import Foundation
 // per-key instead of failing the whole parse.
 struct SettingsFile: Codable {
     var zenzai: Zenzai?
+    var conversion: Conversion?
+
+    struct Conversion: Codable {
+        var half_width_kana: Bool?
+        var full_width_roman: Bool?
+        var english_in_roman_input: Bool?
+        var typo_correction: String?
+        var typography: Bool?
+    }
 
     struct Zenzai: Codable {
         var enable: Bool?
@@ -54,9 +63,24 @@ extension SettingsFile.Zenzai {
     }
 }
 
+extension SettingsFile.Conversion {
+    enum CodingKeys: String, CodingKey {
+        case half_width_kana, full_width_roman, english_in_roman_input, typo_correction, typography
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        half_width_kana = try? container.decodeIfPresent(Bool.self, forKey: .half_width_kana)
+        full_width_roman = try? container.decodeIfPresent(Bool.self, forKey: .full_width_roman)
+        english_in_roman_input = try? container.decodeIfPresent(Bool.self, forKey: .english_in_roman_input)
+        typo_correction = try? container.decodeIfPresent(String.self, forKey: .typo_correction)
+        typography = try? container.decodeIfPresent(Bool.self, forKey: .typography)
+    }
+}
+
 extension SettingsFile {
     enum CodingKeys: String, CodingKey {
-        case zenzai
+        case zenzai, conversion
     }
 
     init(from decoder: Decoder) throws {
@@ -64,6 +88,7 @@ extension SettingsFile {
         // a `zenzai` that is not an object at all costs the section, not the
         // document — same as the Rust reader
         zenzai = try? container.decodeIfPresent(Zenzai.self, forKey: .zenzai)
+        conversion = try? container.decodeIfPresent(Conversion.self, forKey: .conversion)
     }
 }
 
@@ -88,8 +113,27 @@ let zenzaiInferenceLimitRange = 1...10
 /// and this range only has to be sane.
 let zenzaiContextSizeRange: ClosedRange<UInt32> = 512...4096
 
+/// `conversion.typo_correction` as the converter wants it. Anything the file
+/// does not spell correctly becomes `.automatic`, which is what the engine used
+/// before the setting existed — an unreadable value must not change behaviour.
+func typoCorrectionMode(_ name: String?) -> ConvertRequestOptions.TypoCorrectionMode {
+    switch name {
+    case "enabled": .enabled
+    case "disabled": .disabled
+    default: .automatic
+    }
+}
+
 struct EngineConfig {
     var zenzaiEnabled = false
+    // Every one of these defaults to what the engine did before it was
+    // settable, so the section can be added to a settings file without
+    // changing a single conversion.
+    var halfWidthKanaCandidate = false
+    var fullWidthRomanCandidate = false
+    var englishCandidateInRoman2KanaInput = false
+    var typoCorrection: ConvertRequestOptions.TypoCorrectionMode = .automatic
+    var typographyCandidates = false
     var zenzaiProfile = ""
     var zenzaiInferenceLimit = zenzaiInferenceLimitRange.lowerBound
     /// Same default as `ZenzaiConfig::default` on the Rust side.
@@ -130,7 +174,23 @@ func decodeSettings(_ json: String) -> SettingsFile? {
 /// is what the settings app relies on when it writes one key at a time.
 /// Split out of the `LoadConfig` export so it can be tested without a file.
 @MainActor func applySettings(_ settings: SettingsFile?) {
-    guard let zenzai = settings?.zenzai else { return }
+    guard let settings else { return }
+
+    // Applied before the zenzai section and independently of it. The guard
+    // below returns when there is no `zenzai` object, and a document that
+    // carries only `conversion` -- which is exactly what the settings app
+    // sends when one of these is toggled -- would otherwise be dropped whole.
+    if let conversion = settings.conversion {
+        if let value = conversion.half_width_kana { config.halfWidthKanaCandidate = value }
+        if let value = conversion.full_width_roman { config.fullWidthRomanCandidate = value }
+        if let value = conversion.english_in_roman_input {
+            config.englishCandidateInRoman2KanaInput = value
+        }
+        if let value = conversion.typo_correction { config.typoCorrection = typoCorrectionMode(value) }
+        if let value = conversion.typography { config.typographyCandidates = value }
+    }
+
+    guard let zenzai = settings.zenzai else { return }
     if let enable = zenzai.enable {
         config.zenzaiEnabled = enable
     }
@@ -179,15 +239,25 @@ func decodeSettings(_ json: String) -> SettingsFile? {
         requireJapanesePrediction: .autoMix,
         requireEnglishPrediction: .disabled,
         keyboardLanguage: .ja_JP,
+        englishCandidateInRoman2KanaInput: config.englishCandidateInRoman2KanaInput,
+        fullWidthRomanCandidate: config.fullWidthRomanCandidate,
+        halfWidthKanaCandidate: config.halfWidthKanaCandidate,
         learningType: .nothing,
         memoryDirectoryURL: placeholderDataDirectory,
         sharedContainerURL: placeholderDataDirectory,
         textReplacer: .init {
             return execURL.appendingPathComponent("EmojiDictionary").appendingPathComponent(emojiDictionaryFileName)
         },
-        // nil, not [] — the converter substitutes its own default set, which
-        // is what the engine used before the providers became an argument
-        specialCandidateProviders: nil,
+        // nil, not [] — the converter substitutes its own default set, which is
+        // what the engine used before the providers became an argument, and it
+        // means a set the converter grows upstream is picked up for free.
+        //
+        // Typography is the one provider outside that set, so asking for it
+        // means naming the whole list and giving that up. Only when it is
+        // switched on: with it off this stays nil and keeps following upstream.
+        specialCandidateProviders: config.typographyCandidates
+            ? KanaKanjiConverter.defaultSpecialCandidateProviders + [TypographySpecialCandidateProvider()]
+            : nil,
         // zenzai — read straight off `config`; this function is @MainActor, so
         // the six local copies that used to sit above it bought nothing but a
         // second place for a name to be wrong
@@ -211,6 +281,7 @@ func decodeSettings(_ json: String) -> SettingsFile? {
             contextSize: config.zenzaiContextSize
         ) : .off,
         preloadDictionary: true,
+        typoCorrectionMode: config.typoCorrection,
         metadata: .init(versionString: "Azookey for Windows")
     )
 }

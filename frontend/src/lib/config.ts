@@ -16,6 +16,15 @@ export interface ZenzaiConfig {
     preference: string;
 }
 
+export interface ConversionConfig {
+    half_width_kana: boolean;
+    full_width_roman: boolean;
+    english_in_roman_input: boolean;
+    /// "automatic" | "enabled" | "disabled"; anything else means automatic
+    typo_correction: string;
+    typography: boolean;
+}
+
 export interface PluginsConfig {
     enable: boolean;
     entries: { id: string; enabled: boolean }[];
@@ -24,6 +33,7 @@ export interface PluginsConfig {
 export interface AppConfig {
     version: string;
     zenzai: ZenzaiConfig;
+    conversion: ConversionConfig;
     plugins: PluginsConfig;
 }
 
@@ -32,6 +42,7 @@ export interface AppConfig {
 /// finding that out at compile time is better than as a toast.
 export type ConfigKey =
     | `zenzai.${keyof ZenzaiConfig}`
+    | `conversion.${keyof ConversionConfig}`
     | "plugins.enable";
 
 /// What a save achieved. The two halves are separate because they fail

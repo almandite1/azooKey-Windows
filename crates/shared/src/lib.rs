@@ -170,7 +170,10 @@ fn is_newer_than_current(stored: &str) -> bool {
 /// parse" — the two need very different handling.
 enum LoadOutcome {
     Missing,
-    Parsed(AppConfig),
+    /// Boxed because it dwarfs the other two variants, which carry nothing:
+    /// every `LoadOutcome` on the stack would otherwise be the size of a whole
+    /// settings document, and the document grows every time a section is added.
+    Parsed(Box<AppConfig>),
     /// Unreadable, or not JSON at all. The file must not be silently
     /// overwritten. Note how narrow this is now: a file that parses as JSON
     /// always comes back `Parsed`, however wrong its contents, because the
@@ -294,6 +297,87 @@ impl ZenzaiConfig {
     }
 }
 
+/// How the classic typo correction behaves. `automatic` leaves the choice to
+/// the converter, which is what the engine did before this was settable.
+///
+/// A string rather than an enum for the same reason `zenzai.backend` is one:
+/// settings.json is hand-editable, an unknown value must cost nothing, and the
+/// side that consumes it decides what to do with one. The engine maps anything
+/// it does not recognise back to `automatic`.
+pub const TYPO_CORRECTION_MODES: [&str; 3] = ["automatic", "enabled", "disabled"];
+
+/// What the converter is allowed to offer, beyond ordinary conversion.
+///
+/// Every default here reproduces the behaviour the engine had before these
+/// became settings, so adding the section changes nothing until somebody turns
+/// something on. Field names are mirrored by the Swift engine's `SettingsFile`
+/// decoder (server-swift/Sources/azookey-server/EngineConfig.swift) — keep them
+/// in sync when adding more.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct ConversionConfig {
+    /// Half-width katakana (ｱｲｳ) mixed into the candidate list.
+    pub half_width_kana: bool,
+    /// Full-width alphanumerics (ＡＢＣ) mixed into the candidate list.
+    pub full_width_roman: bool,
+    /// While typing romaji for kana, also read the raw romaji as an English
+    /// word. Catches the case of typing English without leaving Japanese mode.
+    pub english_in_roman_input: bool,
+    /// One of [`TYPO_CORRECTION_MODES`].
+    pub typo_correction: String,
+    /// Decorated letter candidates (𝐁𝐎𝐋𝐃, 𝒜𝓁𝓅𝒽𝒶). The converter only offers
+    /// these when what is being composed is entirely roman letters or digits,
+    /// so they cannot appear during ordinary Japanese conversion.
+    pub typography: bool,
+}
+
+impl Default for ConversionConfig {
+    fn default() -> Self {
+        ConversionConfig {
+            half_width_kana: false,
+            full_width_roman: false,
+            english_in_roman_input: false,
+            typo_correction: TYPO_CORRECTION_MODES[0].to_string(),
+            typography: false,
+        }
+    }
+}
+
+impl ConversionConfig {
+    /// Decoded one key at a time, so a single unusable value costs only
+    /// itself — see [`lenient_field`].
+    fn from_json(object: Option<&serde_json::Map<String, serde_json::Value>>) -> Self {
+        let default = ConversionConfig::default();
+        ConversionConfig {
+            half_width_kana: lenient_field(
+                object,
+                "half_width_kana",
+                "conversion.",
+                default.half_width_kana,
+            ),
+            full_width_roman: lenient_field(
+                object,
+                "full_width_roman",
+                "conversion.",
+                default.full_width_roman,
+            ),
+            english_in_roman_input: lenient_field(
+                object,
+                "english_in_roman_input",
+                "conversion.",
+                default.english_in_roman_input,
+            ),
+            typo_correction: lenient_field(
+                object,
+                "typo_correction",
+                "conversion.",
+                default.typo_correction,
+            ),
+            typography: lenient_field(object, "typography", "conversion.", default.typography),
+        }
+    }
+}
+
 /// One add-on the user has installed. Deliberately the smallest thing that
 /// can identify a plugin and say whether it runs: anything a plugin
 /// declares about itself (name, version, capabilities) belongs to its own
@@ -369,6 +453,7 @@ impl PluginsConfig {
 pub struct AppConfig {
     pub version: String,
     pub zenzai: ZenzaiConfig,
+    pub conversion: ConversionConfig,
     pub plugins: PluginsConfig,
 }
 
@@ -377,6 +462,7 @@ impl Default for AppConfig {
         AppConfig {
             version: CONFIG_VERSION.to_string(),
             zenzai: ZenzaiConfig::default(),
+            conversion: ConversionConfig::default(),
             plugins: PluginsConfig::default(),
         }
     }
@@ -513,7 +599,7 @@ impl AppConfig {
     /// the machine it runs on.
     pub fn read_in(config_root: &Path) -> Self {
         match Self::load_from(config_root) {
-            LoadOutcome::Parsed(config) => config,
+            LoadOutcome::Parsed(config) => *config,
             LoadOutcome::Missing | LoadOutcome::Malformed => AppConfig::default(),
         }
     }
@@ -531,7 +617,7 @@ impl AppConfig {
     /// The same, from a directory the caller names — see `read_in`.
     pub fn try_read_in(config_root: &Path) -> Result<Self, String> {
         match Self::load_from(config_root) {
-            LoadOutcome::Parsed(config) => Ok(config),
+            LoadOutcome::Parsed(config) => Ok(*config),
             LoadOutcome::Missing => Ok(AppConfig::default()),
             LoadOutcome::Malformed => Err(format!(
                 "{} could not be read; it is missing or not valid JSON",
@@ -572,7 +658,7 @@ impl AppConfig {
                 return LoadOutcome::Malformed;
             }
         };
-        LoadOutcome::Parsed(Self::from_json(value.as_object()))
+        LoadOutcome::Parsed(Box::new(Self::from_json(value.as_object())))
     }
 
     /// Everything this build understands, taken out of a parsed settings
@@ -585,6 +671,7 @@ impl AppConfig {
             // file back, so it has to survive anything else being unusable
             version: lenient_field(object, "version", "", CONFIG_VERSION.to_string()),
             zenzai: ZenzaiConfig::from_json(lenient_section(object, "zenzai")),
+            conversion: ConversionConfig::from_json(lenient_section(object, "conversion")),
             plugins: PluginsConfig::from_json(lenient_section(object, "plugins")),
         }
     }
@@ -643,7 +730,7 @@ impl AppConfig {
                     config.version = CONFIG_VERSION.to_string();
                     config.log_write_failure(config_root);
                 }
-                config
+                *config
             }
         }
     }
@@ -906,19 +993,34 @@ mod tests {
                    "inference_limit": "5",
                    "topic": 42
                  },
+                 "conversion": {
+                   "half_width_kana": "yes",
+                   "full_width_roman": true,
+                   "typo_correction": "disabled"
+                 },
                  "plugins": { "enable": true, "entries": [] }
                }"#,
         );
 
         let config = AppConfig::new_in(root.path());
 
-        // the three unusable values fell back, one by one
+        // the unusable values fell back, one by one
         assert!(!config.zenzai.enable, "a quoted bool is not a bool");
         assert_eq!(config.zenzai.inference_limit, 1, "a quoted number either");
         assert_eq!(config.zenzai.topic, "", "nor is a number a string");
+        assert!(
+            !config.conversion.half_width_kana,
+            "and the same rule holds one section over"
+        );
         // ...and everything around them survived, which is the point
         assert_eq!(config.zenzai.profile, "keep me");
         assert_eq!(config.zenzai.backend, "cuda");
+        assert!(config.conversion.full_width_roman);
+        assert_eq!(config.conversion.typo_correction, "disabled");
+        assert!(
+            !config.conversion.typography,
+            "a key the file never mentions keeps its default"
+        );
         assert!(config.plugins.enable);
         assert!(
             !root.path().join(SETTINGS_BACKUP_FILENAME).exists(),
@@ -1110,6 +1212,30 @@ mod tests {
             AppConfig::read_in(root.path()).zenzai.inference_limit,
             *ZENZAI_INFERENCE_LIMIT.start()
         );
+    }
+
+    /// Adding a settings section must not change how anything converts. Every
+    /// default in `conversion` is what the engine did before these were
+    /// settable, so an existing settings.json that has never heard of the
+    /// section behaves exactly as it did.
+    #[test]
+    fn the_conversion_defaults_are_the_engines_previous_behaviour() {
+        let root = TempConfigRoot::new();
+        root.write_settings(
+            r#"{"version":"0.1.0","zenzai":{"enable":true},"plugins":{"enable":true}}"#,
+        );
+
+        let config = AppConfig::new_in(root.path());
+
+        assert!(!config.conversion.half_width_kana);
+        assert!(!config.conversion.full_width_roman);
+        assert!(!config.conversion.english_in_roman_input);
+        assert!(!config.conversion.typography);
+        assert_eq!(
+            config.conversion.typo_correction, "automatic",
+            "the converter's own default, so the engine keeps deciding"
+        );
+        assert!(config.zenzai.enable, "the sections it does have still load");
     }
 
     /// Same reasoning as the inference limit, with a sharper edge: this number
