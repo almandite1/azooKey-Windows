@@ -27,6 +27,7 @@ beforeEach(() => {
                     profile: "",
                     backend: "cpu",
                     inference_limit: 1,
+                    context_size: 1024,
                     topic: "",
                     style: "",
                     preference: "",

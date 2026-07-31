@@ -320,7 +320,8 @@ mod tests {
             "version": "0.1.0",
             "zenzai": {
                 "enable": false, "profile": "", "backend": "cpu",
-                "inference_limit": 1, "topic": "", "style": "", "preference": ""
+                "inference_limit": 1, "context_size": 1024,
+                "topic": "", "style": "", "preference": ""
             },
             "plugins": { "enable": false, "entries": [] }
         })
@@ -398,6 +399,7 @@ mod tests {
                 "profile": "p",
                 "backend": "cuda",
                 "inference_limit": 3,
+                "context_size": 2048,
                 "topic": "t",
                 "style": "s",
                 "preference": "f"
@@ -409,6 +411,7 @@ mod tests {
         assert!(config.zenzai.enable);
         assert_eq!(config.zenzai.backend, "cuda");
         assert_eq!(config.zenzai.inference_limit, 3);
+        assert_eq!(config.zenzai.context_size, 2048);
         assert!(config.plugins.enable);
     }
 

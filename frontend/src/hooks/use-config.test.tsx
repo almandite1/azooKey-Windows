@@ -18,6 +18,7 @@ const config = (overrides: Record<string, unknown> = {}) => ({
         profile: "",
         backend: "cpu",
         inference_limit: 1,
+        context_size: 1024,
         topic: "",
         style: "",
         preference: "",

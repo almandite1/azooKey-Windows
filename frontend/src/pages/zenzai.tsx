@@ -1,7 +1,7 @@
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import { Bot, User, Cpu, Gauge, MessageSquare, Type, Heart } from "lucide-react";
+import { Bot, User, Cpu, Gauge, MessageSquare, Type, Heart, Ruler } from "lucide-react";
 import {
     Select,
     SelectContent,
@@ -42,6 +42,9 @@ const BackendSelectItem = ({
 // the engine accepts 1..10; these are the round numbers inside that range,
 // not a separate policy
 const inferenceLimits = [1, 3, 5, 10];
+
+// the engine accepts 512..4096; powers of two inside that range, same idea
+const contextSizes = [512, 1024, 2048, 4096];
 
 const backends = [
     { value: "cpu", name: "CPU (非推奨)", reason: "" },
@@ -103,6 +106,7 @@ export const Zenzai = () => {
     const profile = useConfigKey<string>("zenzai.profile", "");
     const backend = useConfigKey<string>("zenzai.backend", "cpu");
     const inferenceLimit = useConfigKey<number>("zenzai.inference_limit", 1);
+    const contextSize = useConfigKey<number>("zenzai.context_size", 1024);
 
     const [capability, setCapability] = useState({
         cpu: true,
@@ -133,6 +137,9 @@ export const Zenzai = () => {
     const limitOptions = inferenceLimits.includes(inferenceLimit.value)
         ? inferenceLimits
         : [...inferenceLimits, inferenceLimit.value].sort((a, b) => a - b);
+    const contextSizeOptions = contextSizes.includes(contextSize.value)
+        ? contextSizes
+        : [...contextSizes, contextSize.value].sort((a, b) => a - b);
     const backendOptions = backends.some((b) => b.value === backend.value)
         ? backends
         : [...backends, { value: backend.value, name: backend.value, reason: "" }];
@@ -249,6 +256,43 @@ export const Zenzai = () => {
                         <SelectContent>
                             {limitOptions.map((limit) => (
                                 <SelectItem key={limit} value={String(limit)}>{limit}</SelectItem>
+                            ))}
+                        </SelectContent>
+                    </Select>
+                </div>
+                <div className="flex items-center space-x-4 rounded-md border p-4">
+                    <Ruler aria-hidden="true" />
+                    <div className="flex-1 space-y-1">
+                        <p id="zenzai-context-size-label" className="text-sm font-medium leading-none">
+                            コンテキスト長
+                        </p>
+                        <p id="zenzai-context-size-description" className="text-xs text-muted-foreground">
+                            一度に扱えるトークン数です。これを超える長さの入力はZenzaiを使わずに変換されます（既定: 1024）
+                        </p>
+                    </div>
+                    <Select
+                        disabled={disabled}
+                        value={String(contextSize.value)}
+                        onValueChange={(value) => {
+                            // like the backend, this is only read while the model
+                            // is being loaded, so saying nothing would look like
+                            // the setting had no effect
+                            void contextSize.commit(Number(value)).then((outcome) => {
+                                if (outcome.saved) {
+                                    toast("コンテキスト長が変更されました", {
+                                        description: "変更を適用するには、PCを再起動してください",
+                                        duration: 10000,
+                                    });
+                                }
+                            });
+                        }}
+                    >
+                        <SelectTrigger id="zenzai-context-size" className="w-48" aria-labelledby="zenzai-context-size-label zenzai-context-size" aria-describedby="zenzai-context-size-description">
+                            <SelectValue placeholder="コンテキスト長を選択" />
+                        </SelectTrigger>
+                        <SelectContent>
+                            {contextSizeOptions.map((size) => (
+                                <SelectItem key={size} value={String(size)}>{size}</SelectItem>
                             ))}
                         </SelectContent>
                     </Select>

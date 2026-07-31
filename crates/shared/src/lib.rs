@@ -107,6 +107,17 @@ const MAX_SETTINGS_BACKUPS: usize = 5;
 /// converter — a limit of four billion is a hang, not a setting.
 pub const ZENZAI_INFERENCE_LIMIT: std::ops::RangeInclusive<u32> = 1..=10;
 
+/// How many tokens of KV cache the model gets, and with it the largest
+/// composition the model can be asked about at all.
+///
+/// Bounded for the same reasons as the inference limit, and the far end is
+/// harsher: the value is handed to llama.cpp as `n_ctx` and `n_batch`, so a
+/// wild number is an allocation, potentially in VRAM. The floor is what the
+/// converter hardcoded before it was configurable; anything longer than the
+/// cache is not evaluated by the model at all and falls back to statistical
+/// conversion, so a small value degrades quality rather than breaking.
+pub const ZENZAI_CONTEXT_SIZE: std::ops::RangeInclusive<u32> = 512..=4096;
+
 /// Schema version of `settings.json`, independent of the application version
 /// in `workspace.package` — bump it only when the settings schema itself
 /// changes, and add the corresponding migration to `AppConfig::new`.
@@ -217,6 +228,11 @@ pub struct ZenzaiConfig {
     /// engine hardcoded before it was configurable, so upgrading does not
     /// silently make everyone's typing slower.
     pub inference_limit: u32,
+    /// KV cache size in tokens. Read once, when the engine loads the model,
+    /// so a change needs a restart to take effect — the same deal as
+    /// `backend`, and for a related reason: swapping the model out at
+    /// runtime tears down the llama backend underneath the replacement.
+    pub context_size: u32,
     /// The three v3 context strings, the same shape as `profile`: short
     /// hints the model is given about what the user is writing about
     /// (`topic`), how (`style`) and what they tend to prefer
@@ -233,6 +249,7 @@ impl Default for ZenzaiConfig {
             profile: "".to_string(),
             backend: "cpu".to_string(),
             inference_limit: *ZENZAI_INFERENCE_LIMIT.start(),
+            context_size: 1024,
             topic: "".to_string(),
             style: "".to_string(),
             preference: "".to_string(),
@@ -255,6 +272,7 @@ impl ZenzaiConfig {
                 "zenzai.",
                 default.inference_limit,
             ),
+            context_size: lenient_field(object, "context_size", "zenzai.", default.context_size),
             topic: lenient_field(object, "topic", "zenzai.", default.topic),
             style: lenient_field(object, "style", "zenzai.", default.style),
             preference: lenient_field(object, "preference", "zenzai.", default.preference),
@@ -383,6 +401,10 @@ impl AppConfig {
             *ZENZAI_INFERENCE_LIMIT.start(),
             *ZENZAI_INFERENCE_LIMIT.end(),
         );
+        config.zenzai.context_size = config
+            .zenzai
+            .context_size
+            .clamp(*ZENZAI_CONTEXT_SIZE.start(), *ZENZAI_CONTEXT_SIZE.end());
         config
     }
 
@@ -808,7 +830,13 @@ mod tests {
         config.write_to(root.path()).expect("write");
 
         let stored = root.read_settings();
-        for key in ["inference_limit", "topic", "style", "preference"] {
+        for key in [
+            "inference_limit",
+            "context_size",
+            "topic",
+            "style",
+            "preference",
+        ] {
             assert!(
                 stored.contains(&format!("\"{key}\"")),
                 "the Swift decoder looks for {key} by name"
@@ -1067,6 +1095,29 @@ mod tests {
         assert_eq!(
             AppConfig::read_in(root.path()).zenzai.inference_limit,
             *ZENZAI_INFERENCE_LIMIT.start()
+        );
+    }
+
+    /// Same reasoning as the inference limit, with a sharper edge: this number
+    /// becomes llama.cpp's `n_ctx` and `n_batch`, so an unbounded one is an
+    /// allocation that can land in VRAM.
+    #[test]
+    fn an_out_of_range_context_size_is_clamped_before_it_is_stored() {
+        let root = TempConfigRoot::new();
+        let mut config = AppConfig::default();
+
+        config.zenzai.context_size = u32::MAX;
+        config.write_to(root.path()).expect("write");
+        assert_eq!(
+            AppConfig::read_in(root.path()).zenzai.context_size,
+            *ZENZAI_CONTEXT_SIZE.end()
+        );
+
+        config.zenzai.context_size = 1;
+        config.write_to(root.path()).expect("write");
+        assert_eq!(
+            AppConfig::read_in(root.path()).zenzai.context_size,
+            *ZENZAI_CONTEXT_SIZE.start()
         );
     }
 
