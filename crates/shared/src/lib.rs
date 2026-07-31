@@ -116,6 +116,13 @@ pub const ZENZAI_INFERENCE_LIMIT: std::ops::RangeInclusive<u32> = 1..=10;
 /// converter hardcoded before it was configurable; anything longer than the
 /// cache is not evaluated by the model at all and falls back to statistical
 /// conversion, so a small value degrades quality rather than breaking.
+///
+/// This is a sanity bound, not the real ceiling. The engine clamps again to
+/// what the loaded model was trained on — gpt2 position embeddings are a
+/// table sized to the training context, and reading past it is not a
+/// quality question — which for the zenz weights that ship here is 1024.
+/// The range stays wider so a longer-context model would not need a change
+/// on this side.
 pub const ZENZAI_CONTEXT_SIZE: std::ops::RangeInclusive<u32> = 512..=4096;
 
 /// Schema version of `settings.json`, independent of the application version

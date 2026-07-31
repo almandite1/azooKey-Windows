@@ -81,6 +81,11 @@ let zenzaiInferenceLimitRange = 1...10
 /// allocation that may land in VRAM. Input longer than the cache is not
 /// evaluated by the model at all — the converter falls back to statistical
 /// conversion — so a small value costs quality, not correctness.
+///
+/// The converter clamps once more, to the training context of the model it
+/// loads (1024 for the zenz weights shipped here), because that is what sizes
+/// gpt2's position embedding table. So the effective ceiling is the model's,
+/// and this range only has to be sane.
 let zenzaiContextSizeRange: ClosedRange<UInt32> = 512...4096
 
 struct EngineConfig {

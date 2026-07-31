@@ -1,12 +1,12 @@
 {
-  "originHash" : "6b69b0537892565ec6fa16730ec9d36d56c1c1d3ebb4de5c1be84a7aa2fd36aa",
+  "originHash" : "0365a6112e6bc383e0fb1ab3044a7c683e5242957b73869501cadf8d65dfe528",
   "pins" : [
     {
       "identity" : "azookeykanakanjiconverter",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/almandite1-bot/AzooKeyKanaKanjiConverter",
       "state" : {
-        "revision" : "30559610277f969989117c7681541891ad4c628a"
+        "revision" : "39cbdfd5c76204ee3cc114593f6ec5c29c6fd22f"
       }
     },
     {

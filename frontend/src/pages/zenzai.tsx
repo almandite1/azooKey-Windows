@@ -43,8 +43,10 @@ const BackendSelectItem = ({
 // not a separate policy
 const inferenceLimits = [1, 3, 5, 10];
 
-// the engine accepts 512..4096; powers of two inside that range, same idea
-const contextSizes = [512, 1024, 2048, 4096];
+// The engine accepts 512..4096, but it then clamps to what the model was
+// trained on, and the zenz weights that ship with this build stop at 1024.
+// Offering more would be offering a number that silently becomes 1024.
+const contextSizes = [512, 1024];
 
 const backends = [
     { value: "cpu", name: "CPU (非推奨)", reason: "" },
@@ -267,7 +269,7 @@ export const Zenzai = () => {
                             コンテキスト長
                         </p>
                         <p id="zenzai-context-size-description" className="text-xs text-muted-foreground">
-                            一度に扱えるトークン数です。これを超える長さの入力はZenzaiを使わずに変換されます（既定: 1024）
+                            一度に扱えるトークン数です。これを超える長さの入力はZenzaiを使わずに変換されます。モデルの上限を超える値は自動的に切り詰められます（既定: 1024）
                         </p>
                     </div>
                     <Select
