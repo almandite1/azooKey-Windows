@@ -17,6 +17,7 @@ struct SettingsFile: Codable {
         // fields, and matching them by eye beats a CodingKeys table that has
         // to be kept in sync separately
         var inference_limit: Int?
+        var context_size: UInt32?
         var topic: String?
         var style: String?
         var preference: String?
@@ -35,7 +36,7 @@ struct SettingsFile: Codable {
 // genuinely behave alike.
 extension SettingsFile.Zenzai {
     enum CodingKeys: String, CodingKey {
-        case enable, profile, inference_limit, topic, style, preference
+        case enable, profile, inference_limit, context_size, topic, style, preference
     }
 
     init(from decoder: Decoder) throws {
@@ -46,6 +47,7 @@ extension SettingsFile.Zenzai {
         enable = try? container.decodeIfPresent(Bool.self, forKey: .enable)
         profile = try? container.decodeIfPresent(String.self, forKey: .profile)
         inference_limit = try? container.decodeIfPresent(Int.self, forKey: .inference_limit)
+        context_size = try? container.decodeIfPresent(UInt32.self, forKey: .context_size)
         topic = try? container.decodeIfPresent(String.self, forKey: .topic)
         style = try? container.decodeIfPresent(String.self, forKey: .style)
         preference = try? container.decodeIfPresent(String.self, forKey: .preference)
@@ -73,10 +75,20 @@ extension SettingsFile {
 /// the IME, not just the one that triggered it.
 let zenzaiInferenceLimitRange = 1...10
 
+/// Bounds for `context_size`, mirroring `ZENZAI_CONTEXT_SIZE` on the Rust side.
+/// The floor is what the converter hardcoded before the size was a parameter;
+/// the ceiling keeps a hand-edited settings.json from asking llama.cpp for an
+/// allocation that may land in VRAM. Input longer than the cache is not
+/// evaluated by the model at all — the converter falls back to statistical
+/// conversion — so a small value costs quality, not correctness.
+let zenzaiContextSizeRange: ClosedRange<UInt32> = 512...4096
+
 struct EngineConfig {
     var zenzaiEnabled = false
     var zenzaiProfile = ""
     var zenzaiInferenceLimit = zenzaiInferenceLimitRange.lowerBound
+    /// Same default as `ZenzaiConfig::default` on the Rust side.
+    var zenzaiContextSize: UInt32 = 1024
     var zenzaiTopic = ""
     var zenzaiStyle = ""
     var zenzaiPreference = ""
@@ -125,6 +137,15 @@ func decodeSettings(_ json: String) -> SettingsFile? {
         config.zenzaiInferenceLimit = min(
             max(limit, zenzaiInferenceLimitRange.lowerBound),
             zenzaiInferenceLimitRange.upperBound
+        )
+    }
+    // Clamped for the same reason as the limit above, and read by the
+    // converter only while it loads the model — changing it mid-session
+    // leaves the already-loaded model alone until the engine restarts.
+    if let contextSize = zenzai.context_size {
+        config.zenzaiContextSize = min(
+            max(contextSize, zenzaiContextSizeRange.lowerBound),
+            zenzaiContextSizeRange.upperBound
         )
     }
     // The four v3 context strings, paired with where each one lands. A table
@@ -178,7 +199,11 @@ func decodeSettings(_ json: String) -> SettingsFile? {
                     preference: config.zenzaiPreference,
                     leftSideContext: context
                 )
-            )
+            ),
+            // Passed on every conversion, but the converter only reads it
+            // while loading the model, so in practice this is whatever the
+            // setting said when the engine started.
+            contextSize: config.zenzaiContextSize
         ) : .off,
         preloadDictionary: true,
         metadata: .init(versionString: "Azookey for Windows")

@@ -231,10 +231,11 @@ struct EngineConfigTests {
     @Test("the inference limit and the v3 context keys are decoded")
     func advancedZenzaiKeysAreRead() {
         let settings = decodeSettings(
-            #"{"zenzai":{"enable":true,"inference_limit":5,"topic":"ソフトウェア開発","style":"ですます調","preference":"漢字は控えめに"}}"#
+            #"{"zenzai":{"enable":true,"inference_limit":5,"context_size":2048,"topic":"ソフトウェア開発","style":"ですます調","preference":"漢字は控えめに"}}"#
         )
 
         #expect(settings?.zenzai?.inference_limit == 5)
+        #expect(settings?.zenzai?.context_size == 2048)
         #expect(settings?.zenzai?.topic == "ソフトウェア開発")
         #expect(settings?.zenzai?.style == "ですます調")
         #expect(settings?.zenzai?.preference == "漢字は控えめに")
@@ -248,6 +249,7 @@ struct EngineConfigTests {
 
         #expect(settings?.zenzai?.enable == true)
         #expect(settings?.zenzai?.inference_limit == nil)
+        #expect(settings?.zenzai?.context_size == nil)
         #expect(settings?.zenzai?.topic == nil)
         #expect(settings?.zenzai?.style == nil)
         #expect(settings?.zenzai?.preference == nil)
@@ -262,6 +264,7 @@ struct EngineConfigTests {
                 SettingsFile(
                     zenzai: .init(
                         inference_limit: 3,
+                        context_size: 2048,
                         topic: "話題",
                         style: "文体",
                         preference: "好み"
@@ -270,6 +273,7 @@ struct EngineConfigTests {
             )
 
             #expect(config.zenzaiInferenceLimit == 3)
+            #expect(config.zenzaiContextSize == 2048)
             #expect(config.zenzaiTopic == "話題")
             #expect(config.zenzaiStyle == "文体")
             #expect(config.zenzaiPreference == "好み")
@@ -297,6 +301,26 @@ struct EngineConfigTests {
 
             applySettings(SettingsFile(zenzai: .init(inference_limit: 4)))
             #expect(config.zenzaiInferenceLimit == 4, "a value in range is untouched")
+        }
+    }
+
+    /// Same reasoning as the limit above, with a sharper edge: this number is
+    /// handed to llama.cpp as `n_ctx` and `n_batch`, so an unbounded one is an
+    /// allocation that can land in VRAM, and one below the floor is a cache too
+    /// small for anything the model was tested at.
+    @Test("a hand-edited context size is clamped to the supported range")
+    func contextSizeIsClamped() {
+        withRestoredConfig {
+            config = EngineConfig()
+
+            applySettings(SettingsFile(zenzai: .init(context_size: 0)))
+            #expect(config.zenzaiContextSize == 512)
+
+            applySettings(SettingsFile(zenzai: .init(context_size: 1_000_000)))
+            #expect(config.zenzaiContextSize == 4096)
+
+            applySettings(SettingsFile(zenzai: .init(context_size: 2048)))
+            #expect(config.zenzaiContextSize == 2048, "a value in range is untouched")
         }
     }
 
@@ -363,6 +387,7 @@ struct EngineConfigTests {
             #expect(config.zenzaiEnabled == untouched.zenzaiEnabled)
             #expect(config.zenzaiProfile == untouched.zenzaiProfile)
             #expect(config.zenzaiInferenceLimit == untouched.zenzaiInferenceLimit)
+            #expect(config.zenzaiContextSize == untouched.zenzaiContextSize)
             #expect(config.zenzaiTopic == untouched.zenzaiTopic)
             #expect(config.zenzaiStyle == untouched.zenzaiStyle)
             #expect(config.zenzaiPreference == untouched.zenzaiPreference)
@@ -382,8 +407,8 @@ struct EngineConfigTests {
             let applied = loadConfigThroughFFI(
                 #"""
                 {"version":"0.1.0","zenzai":{"enable":true,"profile":"私は猫だ",
-                 "backend":"cpu","inference_limit":3,"topic":"話題","style":"文体",
-                 "preference":"好み"}}
+                 "backend":"cpu","inference_limit":3,"context_size":2048,
+                 "topic":"話題","style":"文体","preference":"好み"}}
                 """#
             )
 
@@ -402,7 +427,8 @@ struct EngineConfigTests {
                             preference: "好み",
                             leftSideContext: "吾輩は"
                         )
-                    )
+                    ),
+                    contextSize: 2048
                 )
             )
         }

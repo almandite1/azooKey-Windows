@@ -30,9 +30,21 @@ let package = Package(
         // neural conversion silently disappears. "Zenzai" (not "ZenzaiCPU")
         // because ZenzaiCPU pins n_gpu_layers to 0, which would rule out the
         // GPU offload issue #56 asks for.
+        //
+        // Our fork is upstream bbef9d2 plus a single commit that offloads
+        // every layer under the Zenzai trait, makes the KV cache size a
+        // parameter, and rejects input too long for it instead of writing
+        // past the batch buffer (issue #56). Upstream never assigned
+        // n_gpu_layers on this path, so llama.cpp's default of 0 left the
+        // whole model on the CPU even with a GPU llama.dll on PATH.
+        //
+        // The fork must keep the upstream name: SwiftPM derives the package
+        // identity from the last URL component, and "azookeykanakanjiconverter"
+        // is what the product reference below and the license key in
+        // scripts/sbom_components.json both look up.
         .package(
-            url: "https://github.com/azookey/AzooKeyKanaKanjiConverter",
-            revision: "bbef9d2d99a2e9e69ac3f7e2e07b08474de59a81",
+            url: "https://github.com/almandite1-bot/AzooKeyKanaKanjiConverter",
+            revision: "30559610277f969989117c7681541891ad4c628a",
             traits: ["Zenzai"]
         )
     ],

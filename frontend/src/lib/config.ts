@@ -10,6 +10,7 @@ export interface ZenzaiConfig {
     profile: string;
     backend: string;
     inference_limit: number;
+    context_size: number;
     topic: string;
     style: string;
     preference: string;
