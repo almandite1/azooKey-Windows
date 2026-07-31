@@ -247,6 +247,15 @@ public static int ConnectState(int sessionId) {
     # cost a full 10-minute run and a round of blaming the wrong component.
     $active = @($desktops | Where-Object { [int]$_.State -eq 0 })
     if ($active.Count -eq 0) {
+        # -1 means the query itself failed, not that the session is idle. Saying
+        # "not connected" there would send the reader after a session that may
+        # be perfectly fine.
+        $unknown = @($desktops | Where-Object { [int]$_.State -eq -1 })
+        if ($unknown.Count -eq $desktops.Count) {
+            Fail ("could not read the connection state of any desktop in $VMName " +
+                "(WTSQuerySessionInformation failed, or the helper type would not compile). " +
+                "Check by hand with qwinsta in the guest before trusting a run.")
+        }
         Fail ("every desktop in $VMName is logged on but not connected, so nothing can be brought " +
             "to the foreground. Reconnect with VMConnect, or from inside the guest run " +
             "'tscon $($desktops[0].SessionId) /dest:console'.")

@@ -13,7 +13,7 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner"
 import { invoke } from '@tauri-apps/api/core';
 import { useConfigKey } from "@/hooks/use-config";
-import type { ConfigKey } from "@/lib/config";
+import type { ConfigKey, SaveOutcome } from "@/lib/config";
 
 // the reason a backend is unavailable used to live in a tooltip, but that put
 // a <button> around the role="option" -- which cost the item its accessible
@@ -38,6 +38,34 @@ const BackendSelectItem = ({
         </SelectItem>
     )
 }
+
+/// The presets, plus the stored value when it is not one of them.
+///
+/// A stored value outside the presets must still be visible. The engine accepts
+/// any of 1..10 and settings.json is hand-editable, so a saved 7 used to render
+/// as an empty combobox -- and picking anything then threw the 7 away without
+/// ever having shown it. Returns the preset array itself when nothing has to be
+/// added, so the common case allocates nothing and the array stays untouched.
+const withStoredValue = (presets: number[], stored: number): number[] =>
+    presets.includes(stored) ? presets : [...presets, stored].sort((a, b) => a - b);
+
+/// Saves, and says so when the change will not be felt until a restart.
+///
+/// Both settings this is used for are read once, while the engine starts, so
+/// silence after changing one looks exactly like a setting that does nothing.
+const commitWithRestartToast = <T,>(
+    commit: (value: T) => Promise<SaveOutcome>,
+    title: string
+) => (value: T) => {
+    void commit(value).then((outcome) => {
+        if (outcome.saved) {
+            toast(title, {
+                description: "変更を適用するには、PCを再起動してください",
+                duration: 10000,
+            });
+        }
+    });
+};
 
 // the engine accepts 1..10; these are the round numbers inside that range,
 // not a separate policy
@@ -132,16 +160,10 @@ export const Zenzai = () => {
     const capabilityOf = (value: string) =>
         value === "cuda" ? capability.cuda : value === "vulkan" ? capability.vulkan : capability.cpu;
 
-    // A stored value outside the presets must still be visible. The engine
-    // accepts any of 1..10 and settings.json is hand-editable, so a saved 7
-    // used to render as an empty combobox -- and picking anything then threw
-    // the 7 away without ever having shown it.
-    const limitOptions = inferenceLimits.includes(inferenceLimit.value)
-        ? inferenceLimits
-        : [...inferenceLimits, inferenceLimit.value].sort((a, b) => a - b);
-    const contextSizeOptions = contextSizes.includes(contextSize.value)
-        ? contextSizes
-        : [...contextSizes, contextSize.value].sort((a, b) => a - b);
+    const limitOptions = withStoredValue(inferenceLimits, inferenceLimit.value);
+    const contextSizeOptions = withStoredValue(contextSizes, contextSize.value);
+    // Same idea, kept separate: these are objects that need a label and an
+    // availability reason built for them, not numbers to be sorted.
     const backendOptions = backends.some((b) => b.value === backend.value)
         ? backends
         : [...backends, { value: backend.value, name: backend.value, reason: "" }];
@@ -207,16 +229,10 @@ export const Zenzai = () => {
                     <Select
                         disabled={disabled}
                         value={backend.value}
-                        onValueChange={(value) => {
-                            void backend.commit(value).then((outcome) => {
-                                if (outcome.saved) {
-                                    toast("バックエンドが変更されました", {
-                                        description: "変更を適用するには、PCを再起動してください",
-                                        duration: 10000,
-                                    });
-                                }
-                            });
-                        }}
+                        onValueChange={commitWithRestartToast(
+                            backend.commit,
+                            "バックエンドが変更されました"
+                        )}
                     >
                         <SelectTrigger id="zenzai-backend" className="w-48" aria-labelledby="zenzai-backend-label zenzai-backend" aria-describedby="zenzai-backend-description">
                             <SelectValue placeholder="バックエンドを選択" />
@@ -275,19 +291,12 @@ export const Zenzai = () => {
                     <Select
                         disabled={disabled}
                         value={String(contextSize.value)}
-                        onValueChange={(value) => {
-                            // like the backend, this is only read while the model
-                            // is being loaded, so saying nothing would look like
-                            // the setting had no effect
-                            void contextSize.commit(Number(value)).then((outcome) => {
-                                if (outcome.saved) {
-                                    toast("コンテキスト長が変更されました", {
-                                        description: "変更を適用するには、PCを再起動してください",
-                                        duration: 10000,
-                                    });
-                                }
-                            });
-                        }}
+                        onValueChange={(value) =>
+                            commitWithRestartToast(
+                                contextSize.commit,
+                                "コンテキスト長が変更されました"
+                            )(Number(value))
+                        }
                     >
                         <SelectTrigger id="zenzai-context-size" className="w-48" aria-labelledby="zenzai-context-size-label zenzai-context-size" aria-describedby="zenzai-context-size-description">
                             <SelectValue placeholder="コンテキスト長を選択" />

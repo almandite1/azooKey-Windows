@@ -125,6 +125,13 @@ pub const ZENZAI_INFERENCE_LIMIT: std::ops::RangeInclusive<u32> = 1..=10;
 /// on this side.
 pub const ZENZAI_CONTEXT_SIZE: std::ops::RangeInclusive<u32> = 512..=4096;
 
+/// The default context size, named because three places have to agree on it and
+/// nothing would notice if they stopped: this crate's `Default`, the Swift
+/// engine's own copy, and `fixtures/default-settings.json`. Not the range's
+/// floor — unlike the inference limit, the useful default sits above it, at the
+/// training context of the model that ships here.
+pub const ZENZAI_CONTEXT_SIZE_DEFAULT: u32 = 1024;
+
 /// Schema version of `settings.json`, independent of the application version
 /// in `workspace.package` — bump it only when the settings schema itself
 /// changes, and add the corresponding migration to `AppConfig::new`.
@@ -256,7 +263,7 @@ impl Default for ZenzaiConfig {
             profile: "".to_string(),
             backend: "cpu".to_string(),
             inference_limit: *ZENZAI_INFERENCE_LIMIT.start(),
-            context_size: 1024,
+            context_size: ZENZAI_CONTEXT_SIZE_DEFAULT,
             topic: "".to_string(),
             style: "".to_string(),
             preference: "".to_string(),
