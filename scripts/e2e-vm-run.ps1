@@ -191,13 +191,34 @@ try {
     # explorer.exe runs once per interactive desktop either way, and its owner
     # is the user whose session a scheduled task will land in.
     $desktops = @(Invoke-Command -Session $session -ScriptBlock {
+            # Connection state comes from the WTS API, not from parsing
+            # qwinsta: its column headers are localised, and this script reads
+            # a BOM-less UTF-8 file as CP932. The API answers the same on
+            # every display language.
+            Add-Type -Namespace AzookeyE2E -Name Wts -MemberDefinition @'
+[DllImport("wtsapi32.dll", SetLastError = true)]
+private static extern bool WTSQuerySessionInformationW(IntPtr server, int sessionId, int infoClass, out IntPtr buffer, out int bytes);
+[DllImport("wtsapi32.dll")]
+private static extern void WTSFreeMemory(IntPtr memory);
+// WTSConnectState is info class 8; the buffer holds a WTS_CONNECTSTATE_CLASS.
+public static int ConnectState(int sessionId) {
+    IntPtr buffer; int bytes;
+    if (!WTSQuerySessionInformationW(IntPtr.Zero, sessionId, 8, out buffer, out bytes)) { return -1; }
+    int state = System.Runtime.InteropServices.Marshal.ReadInt32(buffer);
+    WTSFreeMemory(buffer);
+    return state;
+}
+'@ -ErrorAction SilentlyContinue
+
             $found = @()
             foreach ($p in Get-CimInstance Win32_Process -Filter "Name = 'explorer.exe'") {
                 $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
                 if ($o -and $o.User) {
+                    $state = try { [AzookeyE2E.Wts]::ConnectState([int]$p.SessionId) } catch { -1 }
                     $found += [pscustomobject]@{
                         User      = "$($o.Domain)\$($o.User)"
                         SessionId = $p.SessionId
+                        State     = $state
                     }
                 }
             }
@@ -207,10 +228,32 @@ try {
     if ($desktops.Count -eq 0) {
         Fail "no interactive desktop in $VMName; log on at its console or with VMConnect (enhanced session), then retry"
     }
-    $desktopUser = $desktops[0].User
-    foreach ($d in $desktops) { Write-Host "desktop: $($d.User) (session $($d.SessionId))" }
-    if ($desktops.Count -gt 1) {
-        Write-Host "more than one desktop; using $desktopUser" -ForegroundColor Yellow
+    # WTS_CONNECTSTATE_CLASS. Only 0 (active) can raise a window.
+    $stateNames = @{
+        0 = 'active'; 1 = 'connected'; 2 = 'connect-query'; 3 = 'shadow'; 4 = 'disconnected'
+        5 = 'idle'; 6 = 'listen'; 7 = 'reset'; 8 = 'down'; 9 = 'init'; -1 = 'unknown'
+    }
+    foreach ($d in $desktops) {
+        $name = $stateNames[[int]$d.State]
+        if (-not $name) { $name = "state $($d.State)" }
+        Write-Host "desktop: $($d.User) (session $($d.SessionId), $name)"
+    }
+
+    # Logged on is not the same as usable. A DISCONNECTED session still runs
+    # explorer.exe, so the check above is happy, but no input device is
+    # attached to its desktop and SetForegroundWindow cannot raise anything
+    # there. Every scenario then fails with "never reached the foreground",
+    # which reads exactly like a product bug and is not one -- diagnosing it
+    # cost a full 10-minute run and a round of blaming the wrong component.
+    $active = @($desktops | Where-Object { [int]$_.State -eq 0 })
+    if ($active.Count -eq 0) {
+        Fail ("every desktop in $VMName is logged on but not connected, so nothing can be brought " +
+            "to the foreground. Reconnect with VMConnect, or from inside the guest run " +
+            "'tscon $($desktops[0].SessionId) /dest:console'.")
+    }
+    $desktopUser = $active[0].User
+    if ($active.Count -gt 1) {
+        Write-Host "more than one connected desktop; using $desktopUser" -ForegroundColor Yellow
     }
 
     # BEFORE the payload directory is touched. The previous run's engine holds
