@@ -15,4 +15,13 @@ enum EngineLogLevel: String {
 
 func enginePrint(level: EngineLogLevel, _ message: String) {
     print("[engine \(level.rawValue)] \(message)")
+    // Without this nothing above is ever read. `print` goes through C stdio,
+    // and stdout here is the pipe the launcher pumps, not a terminal — so it
+    // is fully buffered, and the Windows CRT has no line-buffered mode to ask
+    // for (_IOLBF behaves as _IOFBF). Messages sat in a 4 KB buffer until it
+    // filled or the process exited, which is why no [engine ...] line had ever
+    // reached a log file. llama.cpp's output arrives only because it writes to
+    // stderr, and the Rust side's because Rust buffers stdout by line itself.
+    // Flushing per call is free at the rate this is called.
+    fflush(stdout)
 }

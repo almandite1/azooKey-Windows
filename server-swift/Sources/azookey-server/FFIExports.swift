@@ -35,6 +35,14 @@ import ffi
     return reading(state)
 }
 
+/// A sentence's worth of reading, not a syllable.
+///
+/// Length is the whole point: see `warmUpConverter`. Roman input because that
+/// is what the warm-up feeds `ComposingText`, and the kana it produces
+/// (けさはいいてんきなのでこうえんまであるいていきました) is ordinary prose,
+/// so the conversion exercises the dictionary the way real typing does.
+private let warmUpReading = "kesahaiitenkinanodekouenmadearuiteikimashita"
+
 /// One conversion, thrown away, so that whatever the current options need
 /// loading is loaded before a keystroke waits on it.
 ///
@@ -42,10 +50,25 @@ import ffi
 /// on a cold model take seconds, and every FFI call is serialized onto the
 /// server's single thread — so that cost lands on whichever keystroke happens
 /// to be first, with the whole desktop's typing behind it.
+///
+/// The input has to be sentence-length for that to work. It was one character,
+/// which loaded the gguf but only ever ran a single-token batch — and with the
+/// model offloaded to a GPU backend, a Vulkan driver compiles its
+/// matrix-multiply pipelines per batch-size regime, on first submission,
+/// taking seconds. So the first real sentence anyone typed after installing
+/// still stalled, which is the exact failure this function exists to prevent.
+/// Measured once per machine (drivers cache compiled pipelines on disk) and
+/// again after every driver update.
 @MainActor private func warmUpConverter(_ engine: KanaKanjiConverter) {
     var warmup = ComposingText()
-    warmup.insertAtCursorPosition("a", inputStyle: .roman2kana)
-    _ = engine.requestCandidates(warmup, options: getOptions())
+    warmup.insertAtCursorPosition(warmUpReading, inputStyle: .roman2kana)
+    // logged because it is otherwise invisible: this is the one place that
+    // pays the cold-start cost, and the number tells whoever reads the log
+    // whether it stayed here or leaked onto someone's first keystroke
+    let elapsed = ContinuousClock().measure {
+        _ = engine.requestCandidates(warmup, options: getOptions())
+    }
+    enginePrint(level: .info, "converter warm-up took \(elapsed)")
 
     // a missing/corrupt zenz.gguf degrades silently to non-neural
     // conversion inside the converter; surface its status in the log
