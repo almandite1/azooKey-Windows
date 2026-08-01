@@ -1085,6 +1085,52 @@ mod tests {
         IMEState::get().unwrap().ipc_service = None;
     }
 
+    /// The same, for the one form whose text is not the same length as the
+    /// reading it came from. Half-width katakana splits a voiced kana into two
+    /// scalars (が -> ｶﾞ), so a count taken from the CONVERTED text instead of
+    /// the reading is right for every other F-key and wrong for this one.
+    #[test]
+    fn half_katakana_counts_come_from_the_reading_not_the_converted_text() {
+        let _guard = global_state_lock();
+        IMEState::get().unwrap().ipc_service = Some(IPCService::new().unwrap());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = factory_of(&tip);
+
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.set_up_for_test(CompositionState::Composing);
+            composition.preview = "がっこう".to_string();
+            composition.suffix = "".to_string();
+            composition.raw_input = "gakkou".to_string();
+            composition.raw_hiragana = "がっこう".to_string();
+            composition.corresponding_count = 0;
+        }
+
+        factory
+            .handle_action(
+                &[ClientAction::SetTextWithType(SetTextType::HalfKatakana)],
+                CompositionState::Composing,
+            )
+            .unwrap();
+
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(composition.preview, "ｶﾞｯｺｳ", "what is on screen now");
+        assert_eq!(composition.suffix, "");
+        assert_eq!(
+            composition.corresponding_count, 6,
+            "gakkou is six input elements, however long the converted text is"
+        );
+        assert_eq!(
+            composition.surface_count, 4,
+            "the reading is four kana; the five scalars of ｶﾞｯｺｳ are not what              ShrinkText measures"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
     /// Only the batches whose engine call can USE the surrounding text pay
     /// for measuring it (issue #36).
     ///
