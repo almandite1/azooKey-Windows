@@ -320,9 +320,6 @@ pub struct ConversionConfig {
     pub half_width_kana: bool,
     /// Full-width alphanumerics (ＡＢＣ) mixed into the candidate list.
     pub full_width_roman: bool,
-    /// While typing romaji for kana, also read the raw romaji as an English
-    /// word. Catches the case of typing English without leaving Japanese mode.
-    pub english_in_roman_input: bool,
     /// One of [`TYPO_CORRECTION_MODES`].
     pub typo_correction: String,
     /// Decorated letter candidates (𝐁𝐎𝐋𝐃, 𝒜𝓁𝓅𝒽𝒶). The converter only offers
@@ -336,7 +333,6 @@ impl Default for ConversionConfig {
         ConversionConfig {
             half_width_kana: false,
             full_width_roman: false,
-            english_in_roman_input: false,
             typo_correction: TYPO_CORRECTION_MODES[0].to_string(),
             typography: false,
         }
@@ -360,12 +356,6 @@ impl ConversionConfig {
                 "full_width_roman",
                 "conversion.",
                 default.full_width_roman,
-            ),
-            english_in_roman_input: lenient_field(
-                object,
-                "english_in_roman_input",
-                "conversion.",
-                default.english_in_roman_input,
             ),
             typo_correction: lenient_field(
                 object,
@@ -1229,7 +1219,6 @@ mod tests {
 
         assert!(!config.conversion.half_width_kana);
         assert!(!config.conversion.full_width_roman);
-        assert!(!config.conversion.english_in_roman_input);
         assert!(!config.conversion.typography);
         assert_eq!(
             config.conversion.typo_correction, "automatic",

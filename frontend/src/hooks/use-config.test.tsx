@@ -28,7 +28,6 @@ const config = (overrides: Record<string, unknown> = {}) => ({
     conversion: {
         half_width_kana: false,
         full_width_roman: false,
-        english_in_roman_input: false,
         typo_correction: "automatic",
         typography: false,
     },

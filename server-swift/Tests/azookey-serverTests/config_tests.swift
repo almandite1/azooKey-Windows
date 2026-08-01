@@ -316,14 +316,13 @@ struct EngineConfigTests {
             config = EngineConfig()
 
             let settings = decodeSettings(
-                #"{"conversion":{"half_width_kana":true,"full_width_roman":true,"english_in_roman_input":true,"typo_correction":"disabled","typography":true}}"#
+                #"{"conversion":{"half_width_kana":true,"full_width_roman":true,"typo_correction":"disabled","typography":true}}"#
             )
             #expect(settings?.zenzai == nil, "the document really has no zenzai section")
             applySettings(settings)
 
             #expect(config.halfWidthKanaCandidate)
             #expect(config.fullWidthRomanCandidate)
-            #expect(config.englishCandidateInRoman2KanaInput)
             #expect(config.typoCorrection == .disabled)
             #expect(config.typographyCandidates)
         }
@@ -352,21 +351,19 @@ struct EngineConfigTests {
             let untouched = getOptions()
             #expect(!untouched.halfWidthKanaCandidate)
             #expect(!untouched.fullWidthRomanCandidate)
-            #expect(!untouched.englishCandidateInRoman2KanaInput)
             #expect(untouched.typoCorrectionMode == .automatic)
             let defaultProviderCount = KanaKanjiConverter.defaultSpecialCandidateProviders.count
             #expect(untouched.specialCandidateProviders.count == defaultProviderCount)
 
             applySettings(
                 decodeSettings(
-                    #"{"conversion":{"half_width_kana":true,"full_width_roman":true,"english_in_roman_input":true,"typo_correction":"enabled","typography":true}}"#
+                    #"{"conversion":{"half_width_kana":true,"full_width_roman":true,"typo_correction":"enabled","typography":true}}"#
                 )
             )
             let options = getOptions()
 
             #expect(options.halfWidthKanaCandidate)
             #expect(options.fullWidthRomanCandidate)
-            #expect(options.englishCandidateInRoman2KanaInput)
             #expect(options.typoCorrectionMode == .enabled)
             #expect(
                 options.specialCandidateProviders.count == defaultProviderCount + 1,
@@ -461,10 +458,6 @@ struct EngineConfigTests {
             #expect(config.zenzaiContextSize == untouched.zenzaiContextSize)
             #expect(config.halfWidthKanaCandidate == untouched.halfWidthKanaCandidate)
             #expect(config.fullWidthRomanCandidate == untouched.fullWidthRomanCandidate)
-            #expect(
-                config.englishCandidateInRoman2KanaInput
-                    == untouched.englishCandidateInRoman2KanaInput
-            )
             #expect(config.typoCorrection == untouched.typoCorrection)
             #expect(config.typographyCandidates == untouched.typographyCandidates)
             #expect(config.zenzaiTopic == untouched.zenzaiTopic)

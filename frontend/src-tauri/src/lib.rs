@@ -325,7 +325,7 @@ mod tests {
             },
             "conversion": {
                 "half_width_kana": false, "full_width_roman": false,
-                "english_in_roman_input": false, "typo_correction": "automatic",
+                "typo_correction": "automatic",
                 "typography": false
             },
             "plugins": { "enable": false, "entries": [] }
@@ -412,7 +412,6 @@ mod tests {
             "conversion": {
                 "half_width_kana": true,
                 "full_width_roman": false,
-                "english_in_roman_input": false,
                 "typo_correction": "enabled",
                 "typography": false
             },

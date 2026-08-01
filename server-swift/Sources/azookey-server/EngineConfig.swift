@@ -14,7 +14,6 @@ struct SettingsFile: Codable {
     struct Conversion: Codable {
         var half_width_kana: Bool?
         var full_width_roman: Bool?
-        var english_in_roman_input: Bool?
         var typo_correction: String?
         var typography: Bool?
     }
@@ -65,14 +64,13 @@ extension SettingsFile.Zenzai {
 
 extension SettingsFile.Conversion {
     enum CodingKeys: String, CodingKey {
-        case half_width_kana, full_width_roman, english_in_roman_input, typo_correction, typography
+        case half_width_kana, full_width_roman, typo_correction, typography
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         half_width_kana = try? container.decodeIfPresent(Bool.self, forKey: .half_width_kana)
         full_width_roman = try? container.decodeIfPresent(Bool.self, forKey: .full_width_roman)
-        english_in_roman_input = try? container.decodeIfPresent(Bool.self, forKey: .english_in_roman_input)
         typo_correction = try? container.decodeIfPresent(String.self, forKey: .typo_correction)
         typography = try? container.decodeIfPresent(Bool.self, forKey: .typography)
     }
@@ -131,7 +129,6 @@ struct EngineConfig {
     // changing a single conversion.
     var halfWidthKanaCandidate = false
     var fullWidthRomanCandidate = false
-    var englishCandidateInRoman2KanaInput = false
     var typoCorrection: ConvertRequestOptions.TypoCorrectionMode = .automatic
     var typographyCandidates = false
     var zenzaiProfile = ""
@@ -183,9 +180,6 @@ func decodeSettings(_ json: String) -> SettingsFile? {
     if let conversion = settings.conversion {
         if let value = conversion.half_width_kana { config.halfWidthKanaCandidate = value }
         if let value = conversion.full_width_roman { config.fullWidthRomanCandidate = value }
-        if let value = conversion.english_in_roman_input {
-            config.englishCandidateInRoman2KanaInput = value
-        }
         if let value = conversion.typo_correction { config.typoCorrection = typoCorrectionMode(value) }
         if let value = conversion.typography { config.typographyCandidates = value }
     }
@@ -239,7 +233,6 @@ func decodeSettings(_ json: String) -> SettingsFile? {
         requireJapanesePrediction: .autoMix,
         requireEnglishPrediction: .disabled,
         keyboardLanguage: .ja_JP,
-        englishCandidateInRoman2KanaInput: config.englishCandidateInRoman2KanaInput,
         fullWidthRomanCandidate: config.fullWidthRomanCandidate,
         halfWidthKanaCandidate: config.halfWidthKanaCandidate,
         learningType: .nothing,

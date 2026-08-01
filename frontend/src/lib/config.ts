@@ -19,7 +19,6 @@ export interface ZenzaiConfig {
 export interface ConversionConfig {
     half_width_kana: boolean;
     full_width_roman: boolean;
-    english_in_roman_input: boolean;
     /// "automatic" | "enabled" | "disabled"; anything else means automatic
     typo_correction: string;
     typography: boolean;

@@ -84,16 +84,6 @@ struct ConversionFlagCountTests {
         }
     }
 
-    @Test("english candidates keep the counting contract", arguments: inputs)
-    func englishInRomanInput(_ input: String) {
-        withRestoredConfig {
-            execURL = packageRoot.appendingPathComponent("azooKey_emoji_dictionary_storage")
-            config = EngineConfig()
-            config.englishCandidateInRoman2KanaInput = true
-            Self.check(input, "english in roman input")
-        }
-    }
-
     @Test("typography candidates keep the counting contract", arguments: inputs)
     func typography(_ input: String) {
         withRestoredConfig {

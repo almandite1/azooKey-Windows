@@ -1,5 +1,5 @@
 import { Switch } from "@/components/ui/switch";
-import { CaseSensitive, SpellCheck, Sparkles, Type, Languages } from "lucide-react";
+import { CaseSensitive, SpellCheck, Sparkles, Type } from "lucide-react";
 import {
     Select,
     SelectContent,
@@ -84,13 +84,6 @@ export const Conversion = () => {
                     icon={<CaseSensitive aria-hidden="true" />}
                     title="全角英数"
                     description="ＡＢＣ のような全角の英数字を候補に加えます"
-                />
-                <CandidateSwitch
-                    id="conversion-english-in-roman-input"
-                    configKey="conversion.english_in_roman_input"
-                    icon={<Languages aria-hidden="true" />}
-                    title="ローマ字入力中の英単語"
-                    description="日本語モードのまま打った英字を英単語としても解釈します"
                 />
                 <CandidateSwitch
                     id="conversion-typography"
