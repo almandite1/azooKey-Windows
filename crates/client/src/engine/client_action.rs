@@ -15,6 +15,13 @@ pub enum ClientAction {
     /// edits turns a rewrite of the dead range into a second insertion of
     /// the same text (#109).
     CompositionTerminated,
+    /// Focus is leaving the document (`OnSetFocus`). The composition must
+    /// still be ended — an uncommitted reading must not stay alive in the
+    /// app being left — but with the fewest moves that are still an ending:
+    /// no text rewrite, no caret move. Both are extra operations against a
+    /// document the host is tearing down, and in Chromium the full sequence
+    /// failed outright, leaving the composition to die badly (#109).
+    EndCompositionAtFocusLoss,
 
     AppendText(String),
     /// Delete this many kana from the end of the reading, in one RPC.

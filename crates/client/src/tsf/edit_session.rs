@@ -385,6 +385,46 @@ impl TextServiceFactory_Impl {
         result
     }
 
+    /// Ends the composition with the fewest moves that are still an ending.
+    ///
+    /// For a document losing focus. The ordinary `end_composition` re-writes
+    /// the range's text and moves the caret before ending, and mid focus
+    /// change that is three extra operations against a document the host is
+    /// already tearing down — measured in Chromium as the whole session
+    /// failing E_FAIL, which left the composition to be reconciled by the
+    /// host's two halves on their own: the renderer committed the stale
+    /// preview, the browser flushed the new text, and both landed (#109).
+    /// Here: clear the display attribute, end, let go. No text is written
+    /// and the caret stays where the host wants it.
+    #[tracing::instrument]
+    pub fn end_composition_at_focus_loss(&self) -> Result<()> {
+        let result = self.with_live_composition(|text_service, composition| {
+            let context = text_service.context::<ITfContext>()?;
+
+            Ok(Rc::new(move |cookie: u32| unsafe {
+                let range: ITfRange = composition.GetRange()?;
+
+                if let Err(error) = context
+                    .GetProperty(&GUID_PROP_ATTRIBUTE)
+                    .and_then(|prop| prop.Clear(cookie, &range))
+                {
+                    // advisory: a lingering underline is cosmetic, ending the
+                    // composition is what must not be skipped
+                    tracing::warn!("focus-loss attribute clear failed: {error:?}");
+                }
+
+                composition.EndComposition(cookie)?;
+                Ok(())
+            }) as Rc<dyn Fn(u32) -> Result<()>>)
+        });
+
+        // same as end_composition: the client lets go no matter what the
+        // TSF side managed, or the dead handle wedges every later start
+        self.borrow()?.borrow_mut_composition()?.detach_tip();
+
+        result
+    }
+
     /// Lets go of a composition the HOST already ended, and nothing more.
     ///
     /// `end_composition` above is for endings we initiate: it opens an edit

@@ -125,6 +125,9 @@ impl TextServiceFactory_Impl {
                 ClientAction::CompositionTerminated => {
                     self.act_composition_terminated(edit, ipc_service)?
                 }
+                ClientAction::EndCompositionAtFocusLoss => {
+                    self.act_end_composition_at_focus_loss(edit, ipc_service)?
+                }
                 ClientAction::AppendText(text) => {
                     self.act_append_text(edit, ipc_service, mode, text)?
                 }
@@ -220,6 +223,27 @@ impl TextServiceFactory_Impl {
         edit.reset_for_teardown();
         self.close_candidate_ui(ipc_service);
         ipc_service.clear_text()?;
+        Ok(())
+    }
+
+    /// `act_end_composition`, for a document losing focus: same teardown,
+    /// but the ending writes nothing and leaves the caret alone
+    /// (`end_composition_at_focus_loss`). Every teardown step still runs
+    /// even when the edit session fails, for the reasons on
+    /// `act_end_composition`.
+    fn act_end_composition_at_focus_loss(
+        &self,
+        edit: &mut CompositionEdit,
+        ipc_service: &IPCService,
+    ) -> Result<()> {
+        let edit_result = self.end_composition_at_focus_loss();
+
+        edit.reset_for_teardown();
+        self.close_candidate_ui(ipc_service);
+        let clear_result = ipc_service.clear_text();
+
+        edit_result?;
+        clear_result?;
         Ok(())
     }
 
@@ -1118,6 +1142,55 @@ mod tests {
             composition.tip().is_none(),
             "the dead handle must be dropped, or every later start_composition wedges"
         );
+    }
+
+    /// Losing focus ends the composition without writing to the document.
+    ///
+    /// The other half of #109. Chromium fires OnSetFocus milliseconds after
+    /// F8's half-width katakana lands in the composition, and the old
+    /// handler answered with the ordinary EndComposition — whose edit
+    /// session re-writes the range text and moves the caret before ending.
+    /// Against a document mid focus change the whole session failed E_FAIL,
+    /// nobody ended the composition properly, and the host's two halves
+    /// reconciled it themselves: stale preview committed, new text inserted,
+    /// text doubled. Ending must not depend on writes succeeding.
+    #[test]
+    fn losing_focus_ends_the_composition_without_writing() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(Candidates::default());
+
+        let log = Rc::new(RangeLog::default());
+        *log.text.borrow_mut() = "ﾃｷﾄｳﾅﾌﾞﾝｦｳﾂ".encode_utf16().collect();
+        let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
+        let tip = factory_with_context(context.clone());
+        let factory = factory_of(&tip);
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.set_up_for_test(CompositionState::Previewing);
+            composition.preview = "ﾃｷﾄｳﾅﾌﾞﾝｦｳﾂ".to_string();
+            composition.raw_input = "tekitounabunnwoutu".to_string();
+            composition.raw_hiragana = "てきとうなぶんをうつ".to_string();
+        }
+
+        factory
+            .handle_action(
+                &[ClientAction::EndCompositionAtFocusLoss],
+                CompositionState::None,
+            )
+            .unwrap();
+
+        assert!(
+            log.set_texts.borrow().is_empty(),
+            "ending at focus loss must not write text into the departing document"
+        );
+        let calls = recorded_calls(&fake);
+        assert!(calls.contains(&IpcCall::ClearText), "{calls:?}");
+        assert!(calls.contains(&IpcCall::HideWindow), "{calls:?}");
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(*composition.state(), CompositionState::None);
+        assert!(composition.tip().is_none(), "the handle must be dropped");
     }
 
     /// After F6–F10 (SetTextWithType) the written-back composition state must

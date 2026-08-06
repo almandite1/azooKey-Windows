@@ -30,8 +30,16 @@ impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
         // when the previous document is mid-teardown, which is exactly when
         // focus moves — left the composition and its uncommitted reading
         // alive in the previous app.
-        let end_result =
-            self.handle_action(&[ClientAction::EndComposition], CompositionState::None);
+        //
+        // The focus-loss variant, not the ordinary EndComposition: that one
+        // re-writes the range's text and moves the caret first, and against
+        // a document the host is mid-way through leaving, the whole session
+        // failed in Chromium — the composition then died in the host's
+        // hands and the committed text doubled (#109).
+        let end_result = self.handle_action(
+            &[ClientAction::EndCompositionAtFocusLoss],
+            CompositionState::None,
+        );
 
         // advisory: the language bar icon is cosmetic, a failure must not
         // break input (CLAUDE.md error-handling rule)

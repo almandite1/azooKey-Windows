@@ -351,6 +351,7 @@ fn uses_surrounding_text(action: &ClientAction) -> bool {
         | ClientAction::EndComposition
         | ClientAction::CancelComposition
         | ClientAction::CompositionTerminated
+        | ClientAction::EndCompositionAtFocusLoss
         | ClientAction::MoveCursor(_)
         | ClientAction::SetSelection(_)
         | ClientAction::SetIMEMode(_) => false,
