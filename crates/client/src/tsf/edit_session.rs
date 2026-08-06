@@ -214,6 +214,33 @@ fn apply_display_attribute(
     Ok(())
 }
 
+/// Says so when the host moved a range boundary less far than we asked.
+///
+/// `ShiftStart`/`ShiftEnd` report what they actually did, and both callers
+/// used to drop it on the floor. That matters most at `shift_start`, which is
+/// how text gets COMMITTED: the composition start is moved past the text being
+/// confirmed, and a short shift leaves that text inside the composition, where
+/// the next write puts it on screen a second time. Text that reappears as you
+/// keep typing is what that looks like, and there is currently a report of
+/// exactly that after F8 in an Electron host (#109).
+///
+/// Advisory on purpose — a short shift is the host disagreeing with us, not a
+/// failure to carry out the edit, and typing must not stop over it. Release
+/// builds forward warnings to `OutputDebugStringW`, so this is visible in the
+/// field with DebugView, which is the only channel a TIP has.
+fn warn_on_short_shift(api: &str, caller: &str, requested: i32, shifted: i32) {
+    if shifted != requested {
+        tracing::warn!(
+            requested,
+            shifted,
+            api,
+            caller,
+            "the host moved the range boundary a different distance than asked; \
+             committed text can be left inside the composition"
+        );
+    }
+}
+
 /// Places the caret at the end of `range` (collapse + select) — the common
 /// tail of every text-writing edit session.
 fn caret_to_end(context: &ITfContext, cookie: u32, range: &ITfRange) -> windows::core::Result<()> {
@@ -380,6 +407,7 @@ impl TextServiceFactory_Impl {
                 text_range.Collapse(cookie, TF_ANCHOR_START)?;
                 let mut shifted: i32 = 0;
                 text_range.ShiftEnd(cookie, text_len, &mut shifted, std::ptr::null())?;
+                warn_on_short_shift("ShiftEnd", "set_text", text_len, shifted);
                 apply_display_attribute(&context, cookie, &text_range, &display_attribute_atom)?;
 
                 caret_to_end(&context, cookie, &range)?;
@@ -411,6 +439,7 @@ impl TextServiceFactory_Impl {
 
                 range.Collapse(cookie, TF_ANCHOR_START)?;
                 range.ShiftStart(cookie, text_len, &mut shifted, std::ptr::null())?;
+                warn_on_short_shift("ShiftStart", "shift_start", text_len, shifted);
 
                 composition.ShiftStart(cookie, &range)?;
 
