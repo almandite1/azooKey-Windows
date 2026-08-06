@@ -1118,7 +1118,10 @@ mod tests {
         }
 
         factory
-            .handle_action(&[ClientAction::CompositionTerminated], CompositionState::None)
+            .handle_action(
+                &[ClientAction::CompositionTerminated],
+                CompositionState::None,
+            )
             .unwrap();
 
         assert!(
