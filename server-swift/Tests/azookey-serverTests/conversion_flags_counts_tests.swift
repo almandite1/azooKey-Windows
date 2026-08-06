@@ -3,17 +3,22 @@ import Foundation
 import KanaKanjiConverterModule
 @testable import azookey_server
 
-/// The counting contract of `real dictionary`, re-run with each candidate
-/// source the `conversion` settings can switch on.
+/// What the `conversion` settings have to be held to, in both directions.
 ///
-/// That suite pins the contract the client depends on — what the candidate
-/// window shows as the remaining reading is what ShrinkText leaves composing,
-/// and the two together are the reading the user typed — but only for the
-/// candidates the engine produced with everything at its default. A setting
-/// that adds a new KIND of candidate is exactly the kind of change that can
-/// break it, because a candidate whose text is a different length from its
-/// reading has to report the reading's length, not its own.
-@Suite("conversion flag candidate counts")
+/// **That they do something.** A setting is finished when the candidate list
+/// changes, not when the value reaches the converter. `english_in_roman_input`
+/// shipped and was closed on the strength of the second: it reached the
+/// converter, which on Windows handed it to a spell checker that returns nil
+/// on every non-Apple platform, so the list never changed and the switch was
+/// furniture. A test that only checked the values would have passed then too.
+///
+/// **That what they add still counts correctly.** `real dictionary` pins the
+/// contract the client depends on -- what the candidate window shows as the
+/// remaining reading is what ShrinkText leaves composing, and the two together
+/// are the reading the user typed -- but only for the default candidate set. A
+/// candidate whose text is a different length from its reading has to report
+/// the reading's, and half-width kana is exactly that case.
+@Suite("conversion flag candidates")
 @MainActor
 struct ConversionFlagCountTests {
     private static let engine = KanaKanjiConverter(
@@ -91,6 +96,62 @@ struct ConversionFlagCountTests {
             config = EngineConfig()
             config.typographyCandidates = true
             Self.check(input, "typography")
+        }
+    }
+
+    private static func texts(_ input: String) -> [String] {
+        Self.engine.requestCandidates(romaji(input), options: getOptions()).mainResults.map(\.text)
+    }
+
+    private static func enabling(_ flag: String) -> EngineConfig {
+        var config = EngineConfig()
+        switch flag {
+        case "half-width kana": config.halfWidthKanaCandidate = true
+        case "full-width roman": config.fullWidthRomanCandidate = true
+        default: config.typographyCandidates = true
+        }
+        return config
+    }
+
+    /// Each flag, an input that should make it fire, and something it must put
+    /// in the list. The engine only ever composes with `.roman2kana`, so these
+    /// are readings a user could actually type -- note that typography needs a
+    /// composing text that is entirely roman letters or digits, which after
+    /// roman-to-kana means one with no vowels in it.
+    @Test(
+        "each flag adds the candidates it promises",
+        arguments: [
+            ("half-width kana", "hankaku", "\u{FF8A}\u{FF9D}\u{FF76}\u{FF78}"),
+            ("full-width roman", "bcd", "\u{FF42}\u{FF43}\u{FF44}"),
+            ("typography", "bcd", "\u{1D41B}\u{1D41C}\u{1D41D}"),
+        ]
+    )
+    func flagsAddCandidates(_ flag: String, _ input: String, _ expected: String) {
+        withRestoredConfig {
+            execURL = packageRoot.appendingPathComponent("azooKey_emoji_dictionary_storage")
+            config = EngineConfig()
+            #expect(!Self.texts(input).contains(expected), "\(flag): it must need the flag")
+
+            config = Self.enabling(flag)
+            #expect(
+                Self.texts(input).contains(expected),
+                "\(flag): turning it on added nothing usable to \(input) -- the setting is furniture"
+            )
+        }
+    }
+
+    /// The other direction: a flag must not smuggle candidates into a
+    /// composition it has no business touching. Typography is the one with a
+    /// real precondition -- anything with a kana in it is not its business.
+    @Test("typography stays out of ordinary Japanese conversion")
+    func typographyDoesNotFireOnKana() {
+        withRestoredConfig {
+            execURL = packageRoot.appendingPathComponent("azooKey_emoji_dictionary_storage")
+            config = EngineConfig()
+            let off = Self.texts("hankaku")
+            config = EngineConfig()
+            config.typographyCandidates = true
+            #expect(Self.texts("hankaku") == off, "a kana reading is not roman letters")
         }
     }
 }
