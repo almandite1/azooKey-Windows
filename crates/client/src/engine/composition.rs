@@ -344,10 +344,13 @@ fn uses_surrounding_text(action: &ClientAction) -> bool {
         | ClientAction::SetTextWithType(_) => true,
 
         // navigation and lifecycle: no conversion happens, so the context
-        // measured for them would be thrown away (issue #36)
+        // measured for them would be thrown away (issue #36). Doubly so for
+        // CompositionTerminated, which must not open ANY edit session — the
+        // host ended the composition and owns the document again (#109).
         ClientAction::StartComposition
         | ClientAction::EndComposition
         | ClientAction::CancelComposition
+        | ClientAction::CompositionTerminated
         | ClientAction::MoveCursor(_)
         | ClientAction::SetSelection(_)
         | ClientAction::SetIMEMode(_) => false,

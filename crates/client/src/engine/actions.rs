@@ -122,6 +122,9 @@ impl TextServiceFactory_Impl {
                 ClientAction::CancelComposition => {
                     self.act_end_composition(edit, ipc_service, true)?
                 }
+                ClientAction::CompositionTerminated => {
+                    self.act_composition_terminated(edit, ipc_service)?
+                }
                 ClientAction::AppendText(text) => {
                     self.act_append_text(edit, ipc_service, mode, text)?
                 }
@@ -187,6 +190,36 @@ impl TextServiceFactory_Impl {
         // server reading were cleared
         edit_result?;
         clear_result?;
+        Ok(())
+    }
+
+    /// The teardown of `act_end_composition`, minus every document edit.
+    ///
+    /// Runs for `OnCompositionTerminated`: the host has already ended the
+    /// composition and committed its text, and TSF releases the composition
+    /// object when that callback returns. The old path here was the ordinary
+    /// `EndComposition`, whose edit session re-writes the range's text to
+    /// strip the display attribute — correct when WE end the composition,
+    /// but aimed at a composition that no longer exists when the host ended
+    /// it. A host that replays edits (Chromium's TSF implementation) turned
+    /// that rewrite into a fresh insertion, so the just-committed text
+    /// appeared twice; measured live as #109, where every F8 in an Electron
+    /// host duplicated the converted reading. Chromium terminates the
+    /// composition itself right after half-width katakana is written into
+    /// it, which is why F8 and not F7.
+    fn act_composition_terminated(
+        &self,
+        edit: &mut CompositionEdit,
+        ipc_service: &IPCService,
+    ) -> Result<()> {
+        // let go of the dead handle without opening an edit session
+        self.abandon_composition()?;
+
+        // identical teardown to act_end_composition, for the same reasons:
+        // the server's reading must not survive into the next keystroke
+        edit.reset_for_teardown();
+        self.close_candidate_ui(ipc_service);
+        ipc_service.clear_text()?;
         Ok(())
     }
 
@@ -1026,6 +1059,65 @@ mod tests {
         );
 
         IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// A HOST-terminated composition must not be written to — at all.
+    ///
+    /// This is #109 as a test. Chromium terminates the composition itself
+    /// right after F8's half-width katakana is written into it; the handler
+    /// then ran the ordinary EndComposition, whose edit session re-writes the
+    /// range text to strip the display attribute. The host had already
+    /// committed that text and moved on, so the rewrite arrived as a second
+    /// insertion, and every F8 duplicated the converted reading on screen.
+    /// The teardown itself (engine cleared, UI closed, state reset) still has
+    /// to happen — it is only the document that is no longer ours.
+    #[test]
+    fn a_host_terminated_composition_is_never_written_to() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(Candidates::default());
+
+        let log = Rc::new(RangeLog::default());
+        *log.text.borrow_mut() = "ﾊﾝｶｸ".encode_utf16().collect();
+        let context = FakeContext::with_ranges(EditSessionBehavior::RunSync, log.clone());
+        let tip = factory_with_context(context.clone());
+        let factory = factory_of(&tip);
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            // the state right after F8: converted text shown, Previewing
+            composition.set_up_for_test(CompositionState::Previewing);
+            composition.preview = "ﾊﾝｶｸ".to_string();
+            composition.raw_input = "hannkaku".to_string();
+            composition.raw_hiragana = "はんかく".to_string();
+            composition.corresponding_count = 8;
+            composition.surface_count = 4;
+        }
+
+        factory
+            .handle_action(&[ClientAction::CompositionTerminated], CompositionState::None)
+            .unwrap();
+
+        assert!(
+            log.set_texts.borrow().is_empty(),
+            "the host ended this composition; any SetText we issue lands as a \
+             duplicate insertion in a host that replays edits"
+        );
+
+        // the local teardown still has to be complete
+        let calls = recorded_calls(&fake);
+        assert!(calls.contains(&IpcCall::ClearText), "{calls:?}");
+        assert!(calls.contains(&IpcCall::HideWindow), "{calls:?}");
+        let text_service = factory.borrow().unwrap();
+        let composition = text_service.borrow_composition().unwrap();
+        assert_eq!(*composition.state(), CompositionState::None);
+        assert!(
+            composition.raw_input.is_empty() && composition.preview.is_empty(),
+            "the finished composition must stay finished"
+        );
+        assert!(
+            composition.tip().is_none(),
+            "the dead handle must be dropped, or every later start_composition wedges"
+        );
     }
 
     /// After F6–F10 (SetTextWithType) the written-back composition state must

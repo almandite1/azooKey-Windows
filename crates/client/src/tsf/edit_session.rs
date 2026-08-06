@@ -385,6 +385,23 @@ impl TextServiceFactory_Impl {
         result
     }
 
+    /// Lets go of a composition the HOST already ended, and nothing more.
+    ///
+    /// `end_composition` above is for endings we initiate: it opens an edit
+    /// session to re-write the text without the display attribute and to end
+    /// the TSF composition. After `OnCompositionTerminated` both of those are
+    /// aimed at a composition that no longer exists — TSF releases the object
+    /// when the callback returns, the text is already committed host-side,
+    /// and a host that replays edits turns the rewrite into a second copy of
+    /// the committed text (#109). All that is left to do is drop the handle,
+    /// for the same reason as above: keeping it wedges every later
+    /// start_composition.
+    #[tracing::instrument]
+    pub fn abandon_composition(&self) -> Result<()> {
+        self.borrow()?.borrow_mut_composition()?.detach_tip();
+        Ok(())
+    }
+
     #[tracing::instrument]
     pub fn set_text(&self, text: &str, subtext: &str) -> Result<()> {
         self.with_live_composition(|text_service, composition| {

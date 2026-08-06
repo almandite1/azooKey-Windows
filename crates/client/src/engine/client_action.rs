@@ -8,6 +8,13 @@ pub enum ClientAction {
     /// Ends the composition WITHOUT committing: the range is emptied
     /// first, so the discarded text never reaches the document (Escape).
     CancelComposition,
+    /// The HOST ended the composition (`OnCompositionTerminated`: a click
+    /// outside, or a host like Chromium deciding on its own). Same local
+    /// teardown as `EndComposition`, but the document must not be touched —
+    /// the text is already committed host-side, and a host that replays
+    /// edits turns a rewrite of the dead range into a second insertion of
+    /// the same text (#109).
+    CompositionTerminated,
 
     AppendText(String),
     /// Delete this many kana from the end of the reading, in one RPC.

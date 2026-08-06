@@ -38,10 +38,16 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
         _ecwrite: u32,
         _pcomposition: windows_core::Ref<'_, ITfComposition>,
     ) -> Result<()> {
-        // if user clicked outside the composition, the composition will be terminated
+        // The host ended the composition (a click outside, or the host's own
+        // decision — Chromium does this right after half-width katakana is
+        // written into a composition). Its text is already committed on that
+        // side and the object dies when this callback returns, so the
+        // dedicated action tears our state down WITHOUT touching the
+        // document; the ordinary EndComposition re-writes the range, which a
+        // host that replays edits turns into a duplicate insertion (#109).
         tracing::debug!("OnCompositionTerminated");
 
-        let actions = vec![ClientAction::EndComposition];
+        let actions = vec![ClientAction::CompositionTerminated];
         self.handle_action(&actions, CompositionState::None)?;
 
         Ok(())
