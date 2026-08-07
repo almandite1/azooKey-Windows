@@ -22,6 +22,13 @@
 //! applied: applying it would lock out the server itself, and there is no
 //! protection to be had at that point anyway. Learning still works; the
 //! warning in the log is the honest statement of what it costs.
+//!
+//! One carve-out, deliberate: the user can DELETE this directory even though
+//! they cannot read it. Without it the folder would be undeletable from an
+//! ordinary session — the installer does not touch `%APPDATA%\Azookey`, so it
+//! would outlive an uninstall with nothing but an elevated shell able to
+//! remove it. See [`MEMORY_DIR_SDDL`] for what that costs and what it does
+//! not.
 
 use std::path::{Path, PathBuf};
 
@@ -50,17 +57,52 @@ use windows::{
 /// exactly what would otherwise make the history readable. `AI` marks it as
 /// auto-inherit-aware, which is what `SetNamedSecurityInfoW` writes anyway.
 ///
-/// Two ACEs, both `OICI` — OBJECT_INHERIT | CONTAINER_INHERIT — so the files
-/// the converter creates inside are covered as well as the directory itself,
-/// and `FA` (FILE_ALL_ACCESS):
+/// The first two ACEs are the protection. Both `OICI` — OBJECT_INHERIT |
+/// CONTAINER_INHERIT, so the files the converter creates inside are covered
+/// as well as the directory itself — and both `FA` (FILE_ALL_ACCESS):
 /// - `SY`, SYSTEM
 /// - `BA`, the Administrators group, which is what an elevated server's token
 ///   carries
 ///
-/// Nothing else. In particular no `BU` (Users), no `WD` (Everyone), no `AU`
-/// (Authenticated Users), and no per-user SID — the user's own unelevated
-/// processes are precisely who this keeps out.
-const MEMORY_DIR_SDDL: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+/// The last two let `BU` (Users) — the user's own unelevated processes — throw
+/// the directory away without ever reading it. Not one ACE granting `SD`
+/// (DELETE) and no more, which is the obvious shape and does not work:
+/// deleting a folder means enumerating it first, and enumeration is
+/// FILE_LIST_DIRECTORY. Without that bit `Remove-Item -Recurse` and Explorer
+/// both fail before they get to the delete.
+///
+/// So, split by what each right MEANS on each kind of object:
+/// - `(A;CI;0x1101c1;;;BU)` — the directory, and any subdirectory.
+///   `CI` and NOT `OI` is the whole point: bit `0x1` is FILE_LIST_DIRECTORY
+///   on a container and FILE_READ_DATA on a file, so an object-inheritable
+///   copy of this ACE would hand the user's processes the history itself.
+/// - `(A;OIIO;0x110180;;;BU)` — files only (`IO`, inherit-only, keeps it off
+///   the directory). No `0x1`, so no FILE_READ_DATA.
+///
+/// The masks, bit by bit, because every one of them was needed to make an
+/// ordinary `Remove-Item -Recurse -Force` work and none of them reads a byte:
+///
+/// | bit | on the directory | on a file |
+/// |---|---|---|
+/// | `0x00000001` | FILE_LIST_DIRECTORY — enumerate, to find what to delete | not granted |
+/// | `0x00000040` | FILE_DELETE_CHILD — delete the files without rights on them | — |
+/// | `0x00000080` | FILE_READ_ATTRIBUTES | same; the listing already showed these |
+/// | `0x00000100` | FILE_WRITE_ATTRIBUTES | same — `-Force` clears ReadOnly before deleting, and fails here without it |
+/// | `0x00010000` | DELETE — remove the folder once empty | DELETE — Explorer renames into the Recycle Bin, which needs it on the file |
+/// | `0x00100000` | SYNCHRONIZE — every synchronous handle open wants it | same |
+///
+/// What this costs: an unelevated process can now see the NAMES, sizes and
+/// timestamps of the files inside, and can destroy or backdate them. The
+/// names are fixed (`memory.louds` and friends) and the directory's own
+/// timestamp was already visible from `%APPDATA%\Azookey`, which is the
+/// user's. Contents stay unreadable, which is the property that matters —
+/// and destroying the history was never protected anyway, the reset RPC
+/// being on a pipe any local process can open.
+///
+/// Still nothing for `WD` (Everyone), `AU` (Authenticated Users), or any
+/// per-user SID, and no read bit for anyone but SYSTEM and Administrators.
+const MEMORY_DIR_SDDL: &str =
+    "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;CI;0x1101c1;;;BU)(A;OIIO;0x110180;;;BU)";
 
 /// Creates `%APPDATA%\Azookey\memory` if it is not there, locks its DACL
 /// down, and answers with the path.
@@ -197,23 +239,179 @@ fn apply_dacl(directory: &Path) -> windows::core::Result<()> {
 mod tests {
     use super::MEMORY_DIR_SDDL;
 
+    /// FILE_READ_DATA on a file. Also FILE_LIST_DIRECTORY on a directory —
+    /// the same bit, which is why every assertion below has to know whether
+    /// the ACE it is looking at can reach a file.
+    const READ_DATA: u32 = 0x0000_0001;
+    /// FILE_READ_EA, READ_CONTROL, and the two generic reads. Anything here
+    /// is either a read or a step towards one.
+    const OTHER_READS: u32 = 0x0000_0008 | 0x0002_0000 | 0x8000_0000 | 0x1000_0000;
+
+    /// One ACE of [`MEMORY_DIR_SDDL`], split into the fields the assertions
+    /// care about. Hand-rolled rather than parsed by Windows so the tests
+    /// stay pure — see the note in wrappers.rs about FFI in this crate.
+    struct Ace {
+        flags: String,
+        rights: String,
+        sid: String,
+    }
+
+    impl Ace {
+        /// The access mask as a number, whether it was written in hex or as
+        /// one of SDDL's mnemonics.
+        fn mask(&self) -> u32 {
+            if let Some(hex) = self.rights.strip_prefix("0x") {
+                return u32::from_str_radix(hex, 16)
+                    .unwrap_or_else(|e| panic!("unreadable mask {}: {e}", self.rights));
+            }
+            match self.rights.as_str() {
+                "FA" => 0x001F_01FF, // FILE_ALL_ACCESS
+                "SD" => 0x0001_0000, // DELETE
+                other => panic!(
+                    "this test knows hex masks, FA and SD; teach it {other} \
+                     before using it"
+                ),
+            }
+        }
+
+        /// Whether this ACE can land on a FILE: either it is object-inherited
+        /// into one, or -- for the ACE on the directory itself -- it cannot.
+        fn reaches_a_file(&self) -> bool {
+            self.flags.contains("OI")
+        }
+    }
+
+    fn aces() -> Vec<Ace> {
+        let body = MEMORY_DIR_SDDL
+            .strip_prefix("D:PAI")
+            .expect("the DACL header");
+        body.split_terminator(')')
+            .map(|ace| {
+                let ace = ace.trim_start_matches('(');
+                let fields: Vec<&str> = ace.split(';').collect();
+                assert_eq!(fields.len(), 6, "an SDDL ACE has six fields: {ace}");
+                assert_eq!(fields[0], "A", "every ACE here must be an allow: {ace}");
+                Ace {
+                    flags: fields[1].to_string(),
+                    rights: fields[2].to_string(),
+                    sid: fields[5].to_string(),
+                }
+            })
+            .collect()
+    }
+
+    /// The protection itself: the two principals that may read the history,
+    /// and the inheritance that gets the rule onto the files rather than
+    /// leaving it on the folder.
     #[test]
-    fn only_system_and_administrators_are_granted_anything() {
-        assert!(MEMORY_DIR_SDDL.contains(";;;SY)"), "{MEMORY_DIR_SDDL}");
-        assert!(MEMORY_DIR_SDDL.contains(";;;BA)"), "{MEMORY_DIR_SDDL}");
-        assert_eq!(
-            MEMORY_DIR_SDDL.matches("(A;").count(),
-            2,
-            "exactly two allow ACEs, and no more: {MEMORY_DIR_SDDL}"
+    fn system_and_administrators_have_full_control_of_the_files_inside() {
+        for sid in ["SY", "BA"] {
+            let ace = aces()
+                .into_iter()
+                .find(|a| a.sid == sid)
+                .unwrap_or_else(|| panic!("{sid} must be granted access: {MEMORY_DIR_SDDL}"));
+            assert_eq!(ace.rights, "FA", "{sid} needs full control");
+            assert!(
+                ace.flags.contains("OI") && ace.flags.contains("CI"),
+                "{sid}'s ACE must be inherited by the files inside, or \
+                 memory.louds is created with %APPDATA%'s permissions: \
+                 {MEMORY_DIR_SDDL}"
+            );
+        }
+    }
+
+    /// THE test. Every other assertion in this module is a way of getting
+    /// here: no principal outside the pair may end up with a right that
+    /// reads a file, whatever it is granted for deleting one.
+    #[test]
+    fn nobody_else_can_read_a_file_in_it() {
+        for ace in aces() {
+            if ace.sid == "SY" || ace.sid == "BA" {
+                continue;
+            }
+            let mask = ace.mask();
+            assert_eq!(
+                mask & OTHER_READS,
+                0,
+                "{} is granted a read right ({:#x}): {MEMORY_DIR_SDDL}",
+                ace.sid,
+                mask & OTHER_READS
+            );
+            if ace.reaches_a_file() {
+                // On a file this bit is FILE_READ_DATA, which is the history
+                // itself. On the directory it is FILE_LIST_DIRECTORY, which
+                // is only the file names -- and is what makes the folder
+                // deletable at all.
+                assert_eq!(
+                    mask & READ_DATA,
+                    0,
+                    "{}'s ACE is object-inherited, so bit 0x1 is \
+                     FILE_READ_DATA on every file in the directory: \
+                     {MEMORY_DIR_SDDL}",
+                    ace.sid
+                );
+            }
+        }
+    }
+
+    /// The carve-out has to actually work, and "grant DELETE" alone does not.
+    /// Every right asserted here was arrived at by watching an unelevated
+    /// `Remove-Item -Recurse -Force` fail without it.
+    #[test]
+    fn an_unelevated_user_can_delete_the_directory() {
+        const LIST: u32 = 0x0000_0001;
+        const DELETE_CHILD: u32 = 0x0000_0040;
+        const WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+        const DELETE: u32 = 0x0001_0000;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+
+        let users: Vec<Ace> = aces().into_iter().filter(|a| a.sid == "BU").collect();
+        assert!(
+            !users.is_empty(),
+            "Users must be able to remove the folder, or an uninstall leaves \
+             something behind that only an admin can delete: {MEMORY_DIR_SDDL}"
+        );
+
+        let directory = users
+            .iter()
+            .find(|a| !a.reaches_a_file())
+            .expect("an ACE that applies to the directory itself")
+            .mask();
+        assert_ne!(
+            directory & LIST,
+            0,
+            "the folder has to be enumerable to be emptied"
+        );
+        assert_ne!(directory & DELETE, 0, "and then removed");
+        assert_ne!(directory & SYNCHRONIZE, 0, "a synchronous open needs this");
+        assert_ne!(
+            directory & DELETE_CHILD,
+            0,
+            "and its files deleted, which FILE_DELETE_CHILD on the parent \
+             grants without touching the files' own permissions"
+        );
+
+        let file = users
+            .iter()
+            .find(|a| a.reaches_a_file())
+            .expect("an ACE inherited by the files inside")
+            .mask();
+        assert_ne!(file & DELETE, 0, "Explorer renames into the Recycle Bin");
+        assert_ne!(file & SYNCHRONIZE, 0, "a synchronous open needs this");
+        assert_ne!(
+            file & WRITE_ATTRIBUTES,
+            0,
+            "`Remove-Item -Force` clears ReadOnly before deleting, and fails \
+             with ACCESS_DENIED without this"
         );
     }
 
-    /// The principals that would undo the whole thing. `BU` and `AU` cover
-    /// the user's own unelevated processes, which are what this keeps out;
-    /// `WD` covers everyone.
+    /// The principals that would undo the whole thing outright. `BU` is
+    /// handled above, on exactly what it is granted; these have no business
+    /// appearing at all.
     #[test]
-    fn the_users_groups_are_not_granted_anything() {
-        for principal in [";;;BU)", ";;;WD)", ";;;AU)", ";;;IU)"] {
+    fn the_broadest_groups_are_not_granted_anything() {
+        for principal in [";;;WD)", ";;;AU)", ";;;IU)"] {
             assert!(
                 !MEMORY_DIR_SDDL.contains(principal),
                 "{principal} must not appear: {MEMORY_DIR_SDDL}"
@@ -229,19 +427,6 @@ mod tests {
         assert!(
             MEMORY_DIR_SDDL.starts_with("D:PAI"),
             "the DACL must be protected: {MEMORY_DIR_SDDL}"
-        );
-    }
-
-    /// The files inside are the point, not the directory: without `OI` the
-    /// converter's `memory.louds` would be created with inherited
-    /// permissions.
-    #[test]
-    fn both_aces_are_inherited_by_the_files_inside() {
-        assert_eq!(
-            MEMORY_DIR_SDDL.matches("OICI").count(),
-            2,
-            "every ACE must carry OBJECT_INHERIT and CONTAINER_INHERIT: \
-             {MEMORY_DIR_SDDL}"
         );
     }
 }
