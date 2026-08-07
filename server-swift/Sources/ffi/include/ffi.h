@@ -79,10 +79,38 @@ void SetContext(int64_t session, const char *context);
 char *AppendText(int64_t session, const char *input, int32_t *cursorPtr);
 char *RemoveText(int64_t session, int32_t *cursorPtr);
 char *MoveCursor(int64_t session, int32_t offset, int32_t *cursorPtr);
-char *ShrinkText(int64_t session, int32_t surfaceOffset);
-void ClearText(int64_t session);
+/*
+ * `confirmedCandidate` (ShrinkText and ClearText) says which candidate the
+ * user accepted, so the engine can learn from it.
+ *
+ * It indexes the RAW engine list — the `mainResults` order this session was
+ * last handed by GetComposedText — and NOT what the candidate window showed:
+ * the Rust side dedupes that list and lets plugins insert rows into it, so
+ * the two orders differ. Translating one to the other is crates/server's job
+ * (service.rs), and it sends -1 for a row the engine never produced.
+ *
+ * -1 means "learn nothing", which is also what an older client that sends no
+ * index at all comes out as. Anything out of range is ignored rather than
+ * trapped: the pipe carrying these calls can be opened by any local process.
+ *
+ * Learning happens BEFORE the composition is torn down, inside the same
+ * call, because ending a composition drops the converter state the learned
+ * entry is chained onto.
+ */
+char *ShrinkText(int64_t session, int32_t surfaceOffset, int32_t confirmedCandidate);
+void ClearText(int64_t session, int32_t confirmedCandidate);
 struct FFICandidate **GetComposedText(int64_t session, int32_t *lengthPtr);
 void RemoveSession(int64_t session);
+
+/*
+ * Forgets everything learned so far, and reports whether it happened.
+ *
+ * False when there is no memory directory configured or it does not exist —
+ * the engine never creates it (the Rust side does, and locks its DACL down),
+ * so a reset with nowhere to reset is reported rather than silently
+ * succeeding.
+ */
+bool ResetLearning(void);
 
 /* ownership hand-back */
 void FreeString(char *ptr);

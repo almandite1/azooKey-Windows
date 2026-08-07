@@ -61,7 +61,7 @@ struct SessionTests {
         append("mizu", to: a)
         append("kaki", to: b)
 
-        clear_text(session: a)
+        clear_text(session: a, confirmedCandidate: -1)
 
         #expect(reading(a) == "")
         #expect(sessions[a] != nil, "the session survives its composition")
@@ -141,7 +141,7 @@ struct CompositionEditingTests {
     }
 
     private func shrink(_ session: Int64, by surfaces: Int32) -> String {
-        let reading = shrink_text(session: session, surfaceOffset: surfaces)
+        let reading = shrink_text(session: session, surfaceOffset: surfaces, confirmedCandidate: -1)
         defer { free_string(ptr: reading) }
         return reading.map { String(cString: $0) } ?? ""
     }
@@ -270,7 +270,7 @@ struct CompositionEditingTests {
         defer { remove_session(session: session) }
         append("mizu", to: session)
 
-        clear_text(session: session)
+        clear_text(session: session, confirmedCandidate: -1)
         #expect(sessions[session]?.composingText.convertTarget == "")
 
         append("kaki", to: session)

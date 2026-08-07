@@ -16,6 +16,9 @@
     "typo_correction": "automatic",
     "typography": false
   },
+  "learning": {
+    "enable": true
+  },
   "plugins": {
     "enable": false,
     "entries": []

@@ -9,6 +9,7 @@ vi.mock("sonner", () => ({ toast: vi.fn() }));
 import { ConfigProvider } from "@/hooks/use-config";
 import { General } from "@/pages/general";
 import { Conversion } from "@/pages/conversion";
+import { Learning } from "@/pages/learning";
 import { Zenzai } from "@/pages/zenzai";
 import { About } from "@/pages/about";
 
@@ -39,6 +40,7 @@ beforeEach(() => {
                     typo_correction: "automatic",
                     typography: false,
                 },
+                learning: { enable: true },
                 plugins: { enable: false, entries: [] },
             });
         if (command === "check_capability")
@@ -50,6 +52,7 @@ beforeEach(() => {
 const pages: [string, React.ReactNode][] = [
     ["全般", <General key="general" />],
     ["変換", <Conversion key="conversion" />],
+    ["学習", <Learning key="learning" />],
     ["Zenzai", <Zenzai key="zenzai" />],
     ["このソフトについて", <About key="about" />],
 ];

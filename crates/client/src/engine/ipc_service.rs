@@ -390,8 +390,10 @@ pub struct FakeIpc {
 pub enum IpcCall {
     AppendText(String),
     RemoveText(i32),
-    ClearText,
-    ShrinkText(i32),
+    /// The index carried is the candidate the user confirmed, or `None`
+    /// when the composition was discarded rather than confirmed.
+    ClearText(Option<i32>),
+    ShrinkText(i32, Option<i32>),
     SetContext(String),
     ShowWindow,
     HideWindow,
@@ -485,18 +487,28 @@ impl IPCService {
         candidates_or_missing(response.composing_text)
     }
 
+    /// Ends the composition. `candidate_index` names the candidate the user
+    /// confirmed — the row of the list this client was last shown — so the
+    /// engine can learn from it, and is `None` for every way a composition
+    /// ends WITHOUT being confirmed: Escape, focus loss, a host that
+    /// terminated it, a rebuild after an outage.
+    ///
     /// Idempotent: clearing an already-cleared reading lands on the same
     /// state, so it may be retried — and it is the first half of the
-    /// whole-composition rebuild, which is worth the extra attempt.
+    /// whole-composition rebuild, which is worth the extra attempt. That
+    /// stays true with an index attached: the engine drops its record of
+    /// what this session was offered as part of handling the first call, so
+    /// a resend of the same confirmation finds nothing to learn from and
+    /// cannot double-count it.
     #[tracing::instrument(skip(self))]
-    pub fn clear_text(&self) -> anyhow::Result<()> {
-        retry_idempotent(|| self.clear_text_once())
+    pub fn clear_text(&self, candidate_index: Option<i32>) -> anyhow::Result<()> {
+        retry_idempotent(|| self.clear_text_once(candidate_index))
     }
 
-    fn clear_text_once(&self) -> anyhow::Result<()> {
+    fn clear_text_once(&self, candidate_index: Option<i32>) -> anyhow::Result<()> {
         #[cfg(test)]
         if let Some(result) = self.fake_call(|fake| {
-            fake.calls.push(IpcCall::ClearText);
+            fake.calls.push(IpcCall::ClearText(candidate_index));
             fake.engine_outage()
         }) {
             return result;
@@ -505,7 +517,9 @@ impl IPCService {
         let mut client = self.azookey_client.clone();
         self.engine_exec(HOUSEKEEPING_TIMEOUT, async move {
             client
-                .clear_text(tonic::Request::new(shared::proto::ClearTextRequest {}))
+                .clear_text(tonic::Request::new(shared::proto::ClearTextRequest {
+                    candidate_index,
+                }))
                 .await
         })?;
 
@@ -516,11 +530,18 @@ impl IPCService {
     /// `surface_offset` is a count of kana in the reading, not of keystrokes:
     /// a candidate can end inside a romaji cluster and only the kana
     /// boundary can say where.
-    pub fn shrink_text(&self, surface_offset: i32) -> anyhow::Result<Candidates> {
+    ///
+    /// `candidate_index`: see [`IPCService::clear_text`]. A clause commit is
+    /// a confirmation like any other, so it carries one.
+    pub fn shrink_text(
+        &self,
+        surface_offset: i32,
+        candidate_index: Option<i32>,
+    ) -> anyhow::Result<Candidates> {
         #[cfg(test)]
-        if let Some(result) =
-            self.fake_call(|fake| fake.engine_answer(IpcCall::ShrinkText(surface_offset)))
-        {
+        if let Some(result) = self.fake_call(|fake| {
+            fake.engine_answer(IpcCall::ShrinkText(surface_offset, candidate_index))
+        }) {
             return result;
         }
 
@@ -529,6 +550,7 @@ impl IPCService {
             client
                 .shrink_text(tonic::Request::new(shared::proto::ShrinkTextRequest {
                     surface_offset,
+                    candidate_index,
                 }))
                 .await
         })?;
@@ -737,14 +759,14 @@ mod tests {
         // the whole outage lasts one call, so the retry is what succeeds
         fake.lock().unwrap().engine_unavailable_for = 1;
         service
-            .clear_text()
+            .clear_text(None)
             .expect("the retry must carry the call through a one-call outage");
 
         // ...and an outage that outlives both attempts still surfaces
         let (service, fake) = IPCService::new_fake().unwrap();
         fake.lock().unwrap().engine_unavailable_for = IDEMPOTENT_ATTEMPTS;
         let error = service
-            .clear_text()
+            .clear_text(None)
             .expect_err("an outage past the attempt budget must surface");
         assert!(is_server_unavailable(&error), "{error:#}");
         assert_eq!(

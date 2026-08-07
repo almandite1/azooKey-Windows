@@ -70,7 +70,7 @@ fn get_config() -> Result<AppConfig, String> {
 /// WRITE, the same tolerance means something else entirely: a document that
 /// has lost a section gets the defaults filled in and then persisted, which
 /// resets every setting in it.
-const REQUIRED_SECTIONS: [&str; 3] = ["zenzai", "conversion", "plugins"];
+const REQUIRED_SECTIONS: [&str; 4] = ["zenzai", "conversion", "learning", "plugins"];
 
 /// The config to save, or why this document is not one.
 fn config_from_payload(payload: serde_json::Value) -> Result<AppConfig, String> {
@@ -182,6 +182,44 @@ async fn reset_config(state: tauri::State<'_, AppState>) -> Result<SaveOutcome, 
         AppConfig::new();
     }
     Ok(notify_server(&state))
+}
+
+/// Forgets everything the engine has learned from confirmed conversions.
+///
+/// Deliberately NOT a [`SaveOutcome`]: nothing is written to disk here, so
+/// there is no "saved, but the IME could not be told" to report. Either the
+/// history was reset or it was not, and a running IME is a precondition
+/// rather than a nicety — an error is the honest answer when there is
+/// nothing running to reset.
+#[tauri::command]
+async fn reset_learning(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut ipc_guard = state.ipc.lock().unwrap_or_else(PoisonError::into_inner);
+
+    if ipc_guard.is_none() {
+        match ipc::IPCService::new() {
+            Ok(service) => *ipc_guard = Some(service),
+            Err(e) => {
+                return Err(format!(
+                    "the IME could not be reached ({e}); nothing was reset. Start the \
+                     IME and try again."
+                ));
+            }
+        }
+    }
+
+    let Some(ipc) = ipc_guard.as_mut() else {
+        return Err("the IME could not be reached; nothing was reset".to_string());
+    };
+
+    ipc.reset_learning().map_err(|failure| {
+        let message = failure.message().to_string();
+        // same rule as notify_server: only a dead connection costs the
+        // channel, because rebuilding the runtime is the expensive part
+        if failure.connection_lost() {
+            *ipc_guard = None;
+        }
+        message
+    })
 }
 
 /// Tells the running IME to re-read the file. Never fatal: the file is
@@ -302,6 +340,7 @@ pub fn run() {
             get_config,
             patch_config,
             reset_config,
+            reset_learning,
             check_capability
         ])
         .run(tauri::generate_context!())
@@ -328,6 +367,7 @@ mod tests {
                 "typo_correction": "automatic",
                 "typography": false
             },
+            "learning": { "enable": true },
             "plugins": { "enable": false, "entries": [] }
         })
     }
@@ -415,11 +455,13 @@ mod tests {
                 "typo_correction": "enabled",
                 "typography": false
             },
+            "learning": { "enable": false },
             "plugins": { "enable": true, "entries": [] }
         }))
         .expect("a complete payload is savable");
 
         assert!(config.zenzai.enable);
+        assert!(!config.learning.enable);
         assert_eq!(config.zenzai.backend, "cuda");
         assert_eq!(config.zenzai.inference_limit, 3);
         assert_eq!(config.zenzai.context_size, 2048);
@@ -521,7 +563,11 @@ mod tests {
         let document = serde_json::to_value(AppConfig::default()).expect("serialize the defaults");
         let object = document.as_object().expect("the config is an object");
 
-        for (interface, section) in [("ZenzaiConfig", "zenzai"), ("PluginsConfig", "plugins")] {
+        for (interface, section) in [
+            ("ZenzaiConfig", "zenzai"),
+            ("LearningConfig", "learning"),
+            ("PluginsConfig", "plugins"),
+        ] {
             let mut declared = fields_of(interface);
             let mut actual: Vec<String> = object[section]
                 .as_object()

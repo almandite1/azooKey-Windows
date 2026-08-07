@@ -98,4 +98,35 @@ impl IPCService {
             }
         })
     }
+
+    /// Tells the server to forget everything it has learned.
+    ///
+    /// Same timeout and same failure classification as `update_config`, for
+    /// the same reasons — but this one saves nothing first, so a failure is
+    /// the whole outcome rather than a footnote to one: nothing has been
+    /// reset, and the user has to be told that plainly.
+    pub fn reset_learning(&mut self) -> Result<(), NotifyFailure> {
+        let mut client = self.azookey_client.clone();
+        self.runtime.block_on(async move {
+            let request = tonic::Request::new(shared::proto::ResetLearningRequest {});
+            match time::timeout(RPC_TIMEOUT, client.reset_learning(request)).await {
+                Err(_) => Err(NotifyFailure::Rejected(
+                    "the IME did not answer in time; nothing was reset".to_string(),
+                )),
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(status)) => {
+                    let message = status.message().to_string();
+                    if shared::pipe::is_transport_failure(&status) {
+                        Err(NotifyFailure::ConnectionLost(format!(
+                            "cannot reach the IME ({message}); nothing was reset"
+                        )))
+                    } else {
+                        Err(NotifyFailure::Rejected(format!(
+                            "the IME could not reset the learning history: {message}"
+                        )))
+                    }
+                }
+            }
+        })
+    }
 }

@@ -24,6 +24,10 @@ export interface ConversionConfig {
     typography: boolean;
 }
 
+export interface LearningConfig {
+    enable: boolean;
+}
+
 export interface PluginsConfig {
     enable: boolean;
     entries: { id: string; enabled: boolean }[];
@@ -33,6 +37,7 @@ export interface AppConfig {
     version: string;
     zenzai: ZenzaiConfig;
     conversion: ConversionConfig;
+    learning: LearningConfig;
     plugins: PluginsConfig;
 }
 
@@ -42,6 +47,7 @@ export interface AppConfig {
 export type ConfigKey =
     | `zenzai.${keyof ZenzaiConfig}`
     | `conversion.${keyof ConversionConfig}`
+    | "learning.enable"
     | "plugins.enable";
 
 /// What a save achieved. The two halves are separate because they fail
@@ -82,3 +88,12 @@ export const resetConfig = async (): Promise<SaveOutcome> => {
         return { saved: false, notified: false, error: String(error) };
     }
 };
+
+/// Forgets everything the engine has learned from confirmed conversions.
+///
+/// Deliberately not a `SaveOutcome`, and deliberately allowed to throw:
+/// nothing is written to disk, so there is no half-success to describe.
+/// Either the history was reset or it was not — including the case where the
+/// IME is not running, which the caller has to show rather than swallow.
+export const resetLearning = async (): Promise<void> =>
+    await invoke<void>("reset_learning");

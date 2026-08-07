@@ -10,12 +10,22 @@ import Foundation
 struct SettingsFile: Codable {
     var zenzai: Zenzai?
     var conversion: Conversion?
+    var learning: Learning?
 
     struct Conversion: Codable {
         var half_width_kana: Bool?
         var full_width_roman: Bool?
         var typo_correction: String?
         var typography: Bool?
+    }
+
+    struct Learning: Codable {
+        var enable: Bool?
+        // Not a key in settings.json. The Rust side computes it and injects
+        // it into the document it hands over (AppConfig::to_engine_json), so
+        // the absolute path is spelled on one side of the boundary only and
+        // never roams with the user's settings file.
+        var memory_directory: String?
     }
 
     struct Zenzai: Codable {
@@ -76,9 +86,21 @@ extension SettingsFile.Conversion {
     }
 }
 
+extension SettingsFile.Learning {
+    enum CodingKeys: String, CodingKey {
+        case enable, memory_directory
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enable = try? container.decodeIfPresent(Bool.self, forKey: .enable)
+        memory_directory = try? container.decodeIfPresent(String.self, forKey: .memory_directory)
+    }
+}
+
 extension SettingsFile {
     enum CodingKeys: String, CodingKey {
-        case zenzai, conversion
+        case zenzai, conversion, learning
     }
 
     init(from decoder: Decoder) throws {
@@ -87,6 +109,7 @@ extension SettingsFile {
         // document — same as the Rust reader
         zenzai = try? container.decodeIfPresent(Zenzai.self, forKey: .zenzai)
         conversion = try? container.decodeIfPresent(Conversion.self, forKey: .conversion)
+        learning = try? container.decodeIfPresent(Learning.self, forKey: .learning)
     }
 }
 
@@ -131,6 +154,17 @@ struct EngineConfig {
     var fullWidthRomanCandidate = false
     var typoCorrection: ConvertRequestOptions.TypoCorrectionMode = .automatic
     var typographyCandidates = false
+    /// Unlike the four above, this does NOT reproduce the engine's previous
+    /// behaviour — it is `true` to match `LearningConfig::default` on the
+    /// Rust side, which the shared fixture holds both ends to. Learning is
+    /// still inert until `memoryDirectory` is set, so a build that never
+    /// receives a LoadConfig learns nothing.
+    var learningEnabled = true
+    /// Where the converter keeps what it has learned, or nil when there is
+    /// nowhere to keep it: before the first LoadConfig, without `APPDATA`,
+    /// or when the directory the Rust side named does not exist. Never
+    /// composed here — see `SettingsFile.Learning.memory_directory`.
+    var memoryDirectory: URL?
     var zenzaiProfile = ""
     var zenzaiInferenceLimit = zenzaiInferenceLimitRange.lowerBound
     /// Same default as `ZenzaiConfig::default` on the Rust side.
@@ -184,6 +218,34 @@ func decodeSettings(_ json: String) -> SettingsFile? {
         if let value = conversion.typography { config.typographyCandidates = value }
     }
 
+    // Before the zenzai guard for the same reason the conversion block is:
+    // the settings app sends a document carrying one section, and a
+    // `learning`-only document must not be dropped by a missing `zenzai`.
+    if let learning = settings.learning {
+        if let value = learning.enable { config.learningEnabled = value }
+        if let path = learning.memory_directory {
+            // Existence is a precondition, not something to fix here. The
+            // engine must never create this directory: the Rust server
+            // creates it AND locks its DACL down to SYSTEM + Administrators
+            // (crates/server/src/memory_dir.rs), and a mkdir from this side
+            // would race that and win with default, unprotected permissions
+            // — the user's input history readable by any process they run.
+            // No directory means no learning, which is the safe answer.
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                config.memoryDirectory = URL(filePath: path)
+            } else {
+                enginePrint(
+                    level: .error,
+                    "the learning directory \(path) does not exist; learning stays off "
+                        + "until the server creates it"
+                )
+                config.memoryDirectory = nil
+            }
+        }
+    }
+
     guard let zenzai = settings.zenzai else { return }
     if let enable = zenzai.enable {
         config.zenzaiEnabled = enable
@@ -235,8 +297,21 @@ func decodeSettings(_ json: String) -> SettingsFile? {
         keyboardLanguage: .ja_JP,
         fullWidthRomanCandidate: config.fullWidthRomanCandidate,
         halfWidthKanaCandidate: config.halfWidthKanaCandidate,
-        learningType: .nothing,
-        memoryDirectoryURL: placeholderDataDirectory,
+        // Both halves have to be true. The setting is the user's answer; the
+        // directory is whether there is anywhere to write — without it the
+        // converter would build a memory store rooted at the placeholder
+        // path, which is a relative directory in whatever the server's
+        // working directory happens to be.
+        //
+        // Switching this at runtime needs no further wiring: every conversion
+        // goes through `updateIfRequired(options:)`, which rebuilds the
+        // converter's LearningConfig from these options.
+        learningType: (config.learningEnabled && config.memoryDirectory != nil)
+            ? .inputAndOutput : .nothing,
+        memoryDirectoryURL: config.memoryDirectory ?? placeholderDataDirectory,
+        // Still the placeholder: this one is where a user dictionary would
+        // live, which is a separate feature and not written while it is
+        // unimplemented.
         sharedContainerURL: placeholderDataDirectory,
         textReplacer: .init {
             return execURL.appendingPathComponent("EmojiDictionary").appendingPathComponent(emojiDictionaryFileName)
