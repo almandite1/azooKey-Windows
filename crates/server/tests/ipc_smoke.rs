@@ -462,6 +462,61 @@ async fn committing_a_clause_leaves_the_rest_of_the_reading() {
     clear(&mut client).await;
 }
 
+/// The newest mtime under the learning directory, or `None` if there is
+/// nothing there. The engine rewrites every file on each commit, so this
+/// moves whenever a confirmation reaches the disk — and stays put when one
+/// does not.
+fn learning_written_at() -> Option<std::time::SystemTime> {
+    let directory = shared::learning_memory_dir()?;
+    std::fs::read_dir(directory)
+        .ok()?
+        .filter_map(|entry| entry.ok()?.metadata().ok()?.modified().ok())
+        .max()
+}
+
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment; it LEARNS \
+            from one conversion (clear it with the settings app's reset button)"]
+async fn a_confirmation_reaches_the_disk() {
+    // The half the RPC-level test below cannot see. `updateLearningData` is
+    // RAM only, so a confirmation that never commits still improves the
+    // ranking for as long as the process lives -- and looks exactly like a
+    // working feature until the machine is rebooted. The only proof is the
+    // store on disk changing, so that is what this asserts.
+    //
+    // Non-destructive: it adds one learned conversion and resets nothing.
+    let before = learning_written_at().expect(
+        "no learning directory yet; the server creates it at startup -- is \
+         this server the build under test?",
+    );
+
+    let mut client = connect().await;
+    clear(&mut client).await;
+
+    let composing = type_keys(&mut client, "mizu").await;
+    assert_eq!(composing.hiragana, "みず");
+    assert!(
+        !composing.suggestions.is_empty(),
+        "nothing to confirm: the engine returned no candidates"
+    );
+
+    client
+        .clear_text(shared::proto::ClearTextRequest {
+            candidate_index: Some(0),
+        })
+        .await
+        .expect("a confirming clear_text must be accepted");
+
+    let after = learning_written_at().expect("the learning directory must still be there");
+    assert!(
+        after > before,
+        "a confirmed conversion did not reach the disk: the store's newest \
+         mtime is still {before:?}. The RPC was accepted, so the index was \
+         either translated to -1 by the server or dropped by the engine -- \
+         learning would work until the next restart and then be gone."
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a running azookey-server with its DLL environment; it LEARNS \
             from a conversion and then resets the learning history"]
