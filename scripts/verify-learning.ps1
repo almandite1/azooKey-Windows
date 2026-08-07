@@ -33,6 +33,25 @@ $ErrorActionPreference = 'Continue'
 
 $script:Failures = 0
 
+# Whether this failure was an access denial, decided WITHOUT looking at the
+# message. `$_.Exception.Message` comes back in the machine's own language, so
+# a regex over it reports a perfectly good ACCESS_DENIED as a failure on a
+# Japanese Windows -- which is exactly what this script is for.
+#
+# PowerShell wraps a static-method throw in a MethodInvocationException, hence
+# walking InnerException. The HRESULT is the belt to the type's braces:
+# 0x80070005 is E_ACCESSDENIED, which is what ERROR_ACCESS_DENIED becomes.
+function Test-AccessDenied {
+    param($Exception)
+    $ex = $Exception
+    while ($null -ne $ex) {
+        if ($ex -is [System.UnauthorizedAccessException]) { return $true }
+        if ($ex.HResult -eq -2147024891) { return $true }
+        $ex = $ex.InnerException
+    }
+    return $false
+}
+
 function Report {
     param([string]$Verdict, [string]$What, [string]$Detail = '')
     if ($Verdict -eq 'FAIL') { $script:Failures++ }
@@ -310,6 +329,7 @@ if (-not $probeExists) {
 } else {
     $bytes = $null
     $readError = $null
+    $exception = $null
     try {
         $stream = [System.IO.File]::Open($probe, 'Open', 'Read', 'Read')
         $buffer = New-Object byte[] 16
@@ -317,7 +337,8 @@ if (-not $probeExists) {
         $stream.Close()
         $bytes = $buffer
     } catch {
-        $readError = $_.Exception.Message
+        $exception = $_.Exception
+        $readError = $exception.Message
     }
 
     if ($Elevated) {
@@ -329,8 +350,11 @@ if (-not $probeExists) {
         }
     } else {
         if ($null -eq $bytes) {
-            # Distinguish the denial we want from any other failure.
-            if ($readError -match 'denied|Denied|UnauthorizedAccess') {
+            # Distinguish the denial we want from any other failure -- by TYPE
+            # and HRESULT, never by the message. PowerShell prints that in the
+            # machine's own language, so matching "denied" reports a perfectly
+            # good denial as a failure on a Japanese Windows.
+            if (Test-AccessDenied $exception) {
                 Report 'PASS' 'an ordinary shell is DENIED the learned file' $probe
             } else {
                 Report 'FAIL' 'the read failed, but not with an access denial' `
