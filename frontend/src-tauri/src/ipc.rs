@@ -33,7 +33,15 @@ impl IPCService {
     /// the command. The channel is lazy, so nothing connects until the first
     /// request — which is why this can be built before the IME is running.
     pub fn new() -> Result<Self> {
-        let server_channel = shared::pipe::lazy_pipe_channel(shared::pipe::server_pipe())?;
+        Self::connect(shared::pipe::server_pipe())
+    }
+
+    /// The same, against a named pipe of the caller's choosing. Only the
+    /// tests use it, and they use it to name a pipe that does not exist: a
+    /// test that reached the real server would reset a real learning history
+    /// on whichever machine happened to have the IME running.
+    pub(crate) fn connect(pipe_name: String) -> Result<Self> {
+        let server_channel = shared::pipe::lazy_pipe_channel(pipe_name)?;
         Ok(Self {
             azookey_client: AzookeyServiceClient::new(server_channel),
         })

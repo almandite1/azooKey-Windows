@@ -42,4 +42,35 @@ pub(crate) fn setup_logger() {
         .with_max_level(tracing::Level::INFO)
         .with_writer(Mutex::new(file))
         .try_init();
+    log_panics();
+}
+
+/// Sends panics to the log file instead of to the void.
+///
+/// A panic in this process is invisible three times over, and the three
+/// compound: the default hook writes to stderr, which a GUI-subsystem binary
+/// does not have; a panic inside a `#[tauri::command]` kills the spawned task
+/// rather than returning, so the `invoke` promise on the other side never
+/// settles; and a promise that never settles renders as nothing at all —
+/// no error, no toast, just a control that stays disabled.
+///
+/// That is not hypothetical. Every server call the settings app made
+/// panicked for nine days on a runtime-in-runtime, and the only symptom
+/// anybody could see was a button that did nothing (see `ipc.rs`). One line
+/// in a log would have named it immediately.
+///
+/// The previous hook still runs afterwards, so a debug build keeps printing
+/// to the console it does have.
+fn log_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // force_capture, not capture: RUST_BACKTRACE is not set for a user's
+        // double-click, and a panic with no location is most of the value
+        // gone.
+        tracing::error!(
+            "PANIC: {info}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        previous(info);
+    }));
 }

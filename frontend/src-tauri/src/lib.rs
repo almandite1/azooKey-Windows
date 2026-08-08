@@ -193,7 +193,15 @@ async fn reset_config(state: tauri::State<'_, AppState>) -> Result<SaveOutcome, 
 /// nothing running to reset.
 #[tauri::command]
 async fn reset_learning(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let ipc = ipc_client(&state).map_err(|e| {
+    reset_learning_on(&state).await
+}
+
+/// The body of the command above, over a plain `&AppState` — which is what
+/// makes it testable at all. `tauri::State` needs an App to exist, so a
+/// command that keeps its logic in its own signature can only be exercised by
+/// clicking. See the tests at the bottom of this file.
+async fn reset_learning_on(state: &AppState) -> Result<(), String> {
+    let ipc = ipc_client(state).map_err(|e| {
         format!(
             "the IME could not be reached ({e}); nothing was reset. Start the \
              IME and try again."
@@ -204,7 +212,7 @@ async fn reset_learning(state: tauri::State<'_, AppState>) -> Result<(), String>
         // same rule as notify_server: only a dead connection costs the
         // channel, because reconnecting is not free
         if failure.connection_lost() {
-            drop_ipc_client(&state);
+            drop_ipc_client(state);
         }
         failure.message().to_string()
     })
@@ -351,9 +359,71 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, Capability, all_present, capability_in, config_from_payload, search_directories,
+        AppConfig, AppState, Capability, all_present, capability_in, config_from_payload, ipc,
+        notify_server, reset_learning_on, search_directories,
     };
     use std::path::{Path, PathBuf};
+
+    /// An app state whose client points at a pipe nothing is listening on.
+    ///
+    /// Every server call then fails the same way on any machine, which is the
+    /// only way these can be ordinary `cargo test` tests: aimed at the real
+    /// pipe, `reset_learning_on` would wipe the learning history of whoever
+    /// happened to have the IME running.
+    ///
+    /// MUST be called from inside the runtime, like everything else here: the
+    /// lazy channel wants a reactor to exist when it is BUILT, not only when
+    /// it is used. In the app that is free — `IPCService::new()` runs inside
+    /// the command that is about to await it.
+    fn state_with_no_server() -> AppState {
+        let state = AppState::new();
+        let absent = ipc::IPCService::connect(r"\\.\pipe\azookey_server_absent_for_tests".into())
+            .expect("a lazy channel connects to nothing until it is used");
+        *state
+            .ipc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(absent);
+        state
+    }
+
+    /// THE test this file was missing.
+    ///
+    /// Not "does the config reach the server" — that needs one — but "is the
+    /// call even legal from where Tauri makes it". A `#[tauri::command]`
+    /// declared `async fn` runs on Tauri's Tokio runtime, and for nine days
+    /// every server call this app made drove its RPC with a second runtime's
+    /// `block_on` from inside that one. Tokio panics at that; the panic kills
+    /// the task instead of returning, so the `invoke` promise never settled
+    /// and the UI showed nothing at all.
+    ///
+    /// So the runtime here is not scaffolding, it is the subject: the call
+    /// must be awaited on it rather than blocked on. Against the old code
+    /// this panics.
+    #[test]
+    fn notify_server_may_be_awaited_on_a_runtime() {
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime to stand in for Tauri's");
+        let outcome = runtime.block_on(async { notify_server(&state_with_no_server()).await });
+
+        assert!(outcome.saved, "the file was written before we got here");
+        assert!(!outcome.notified, "nothing is listening on that pipe");
+        assert!(
+            outcome.error.is_some(),
+            "an unreachable IME has to be reportable, not silent"
+        );
+    }
+
+    /// The same property for the reset, which is a different command with the
+    /// same shape — and the one whose silence started the hunt.
+    #[test]
+    fn reset_learning_may_be_awaited_on_a_runtime() {
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime to stand in for Tauri's");
+        let outcome = runtime.block_on(async { reset_learning_on(&state_with_no_server()).await });
+
+        assert!(
+            outcome.is_err(),
+            "nothing is listening on that pipe, so nothing was reset"
+        );
+    }
 
     fn document() -> serde_json::Value {
         serde_json::json!({
