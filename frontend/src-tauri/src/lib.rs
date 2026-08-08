@@ -165,7 +165,7 @@ async fn patch_config(
         let _saving = state.save.lock().unwrap_or_else(PoisonError::into_inner);
         patch_on_disk(&key_path, value)?;
     }
-    Ok(notify_server(&state))
+    Ok(notify_server(&state).await)
 }
 
 /// Moves an unreadable settings.json aside and starts again from the
@@ -181,7 +181,7 @@ async fn reset_config(state: tauri::State<'_, AppState>) -> Result<SaveOutcome, 
         // this is the call whose recovery path backs the old file up first
         AppConfig::new();
     }
-    Ok(notify_server(&state))
+    Ok(notify_server(&state).await)
 }
 
 /// Forgets everything the engine has learned from confirmed conversions.
@@ -193,66 +193,67 @@ async fn reset_config(state: tauri::State<'_, AppState>) -> Result<SaveOutcome, 
 /// nothing running to reset.
 #[tauri::command]
 async fn reset_learning(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let ipc = ipc_client(&state).map_err(|e| {
+        format!(
+            "the IME could not be reached ({e}); nothing was reset. Start the \
+             IME and try again."
+        )
+    })?;
+
+    ipc.reset_learning().await.map_err(|failure| {
+        // same rule as notify_server: only a dead connection costs the
+        // channel, because reconnecting is not free
+        if failure.connection_lost() {
+            drop_ipc_client(&state);
+        }
+        failure.message().to_string()
+    })
+}
+
+/// A client for the running IME, connected on first use and kept afterwards.
+///
+/// Returns a CLONE, and that is the point: `IPCService` is a lazy tonic
+/// channel, cheap to clone, and cloning is what lets the lock go before the
+/// call is awaited. A `std::sync::MutexGuard` held across an `.await` makes
+/// the command's future `!Send`, which Tauri will not take — and holding it
+/// would serialise every settings save behind whichever one is in flight.
+fn ipc_client(state: &AppState) -> Result<ipc::IPCService, String> {
     let mut ipc_guard = state.ipc.lock().unwrap_or_else(PoisonError::into_inner);
 
     if ipc_guard.is_none() {
-        match ipc::IPCService::new() {
-            Ok(service) => *ipc_guard = Some(service),
-            Err(e) => {
-                return Err(format!(
-                    "the IME could not be reached ({e}); nothing was reset. Start the \
-                     IME and try again."
-                ));
-            }
-        }
+        *ipc_guard = Some(ipc::IPCService::new().map_err(|e| e.to_string())?);
     }
+    ipc_guard
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "no connection to the IME".to_string())
+}
 
-    let Some(ipc) = ipc_guard.as_mut() else {
-        return Err("the IME could not be reached; nothing was reset".to_string());
-    };
-
-    ipc.reset_learning().map_err(|failure| {
-        let message = failure.message().to_string();
-        // same rule as notify_server: only a dead connection costs the
-        // channel, because rebuilding the runtime is the expensive part
-        if failure.connection_lost() {
-            *ipc_guard = None;
-        }
-        message
-    })
+/// Drops the stored client so the next call builds a fresh one. Only for a
+/// connection that is gone: see the callers.
+fn drop_ipc_client(state: &AppState) {
+    *state.ipc.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 /// Tells the running IME to re-read the file. Never fatal: the file is
 /// already saved by the time this runs, so the worst case is a change that
 /// takes effect at the next start, and saying so is the whole job here.
-fn notify_server(state: &AppState) -> SaveOutcome {
-    let mut ipc_guard = state.ipc.lock().unwrap_or_else(PoisonError::into_inner);
-
-    if ipc_guard.is_none() {
-        match ipc::IPCService::new() {
-            Ok(service) => *ipc_guard = Some(service),
-            Err(e) => {
-                return SaveOutcome {
-                    saved: true,
-                    notified: false,
-                    error: Some(format!(
-                        "saved, but the IME could not be reached ({e}); it will pick the \
-                         settings up when it next starts"
-                    )),
-                };
-            }
+async fn notify_server(state: &AppState) -> SaveOutcome {
+    let ipc = match ipc_client(state) {
+        Ok(ipc) => ipc,
+        Err(e) => {
+            return SaveOutcome {
+                saved: true,
+                notified: false,
+                error: Some(format!(
+                    "saved, but the IME could not be reached ({e}); it will pick the \
+                     settings up when it next starts"
+                )),
+            };
         }
-    }
-
-    let Some(ipc) = ipc_guard.as_mut() else {
-        return SaveOutcome {
-            saved: true,
-            notified: false,
-            error: Some("saved, but the IME could not be reached".to_string()),
-        };
     };
 
-    match ipc.update_config() {
+    match ipc.update_config().await {
         Ok(()) => SaveOutcome {
             saved: true,
             notified: true,
@@ -261,10 +262,10 @@ fn notify_server(state: &AppState) -> SaveOutcome {
         Err(failure) => {
             let message = failure.message().to_string();
             // only a dead connection costs the channel; a timeout is the
-            // single-threaded engine being busy, and rebuilding the runtime
-            // for that is what made the next keystroke expensive
+            // single-threaded engine being busy, and reconnecting for that is
+            // what made the next keystroke expensive
             if failure.connection_lost() {
-                *ipc_guard = None;
+                drop_ipc_client(state);
             }
             SaveOutcome {
                 saved: true,
