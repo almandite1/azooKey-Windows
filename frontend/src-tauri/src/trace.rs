@@ -74,3 +74,71 @@ fn log_panics() {
         previous(info);
     }));
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    /// Somewhere for the subscriber to write that the test can read back.
+    #[derive(Clone)]
+    struct Captured(Arc<StdMutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The hook is six lines, which is exactly the sort of thing that gets
+    /// shipped unverified — and the whole reason it exists is that an
+    /// unverified six lines cost nine days. If it silently failed to emit,
+    /// the log would look the same as a process that never panicked, which is
+    /// the state it was written to distinguish from.
+    #[test]
+    fn a_panic_reaches_the_subscriber() {
+        let captured = Captured(Arc::new(StdMutex::new(Vec::new())));
+
+        super::log_panics();
+        {
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            // scoped to this thread, and the hook runs on the thread that
+            // panicked — so a global subscriber, which the test binary may
+            // already have, is neither needed nor disturbed
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let _ = std::panic::catch_unwind(|| panic!("a panic on purpose"));
+        }
+        // back to the default hook, so a later #[should_panic] elsewhere in
+        // this binary is not writing into a dropped subscriber
+        let _ = std::panic::take_hook();
+
+        let log = String::from_utf8_lossy(
+            &captured
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned();
+
+        assert!(log.contains("PANIC:"), "nothing was logged: {log}");
+        assert!(
+            log.contains("a panic on purpose"),
+            "the message has to survive, or the log names no cause: {log}"
+        );
+        assert!(
+            log.contains("trace.rs"),
+            "and the backtrace, or it names no place: {log}"
+        );
+    }
+}
