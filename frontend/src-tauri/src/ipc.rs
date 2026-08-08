@@ -130,3 +130,63 @@ impl IPCService {
         })
     }
 }
+
+/// Live checks against a RUNNING azookey-server, excluded from `cargo test`
+/// by `#[ignore]` for the same reason as `crates/server/tests/ipc_smoke.rs`.
+///
+///     cargo test -p azookey --lib -- --ignored --test-threads=1 --nocapture
+///
+/// They exist because the settings app's two server calls are otherwise only
+/// exercised by clicking, and "the button does nothing" is indistinguishable
+/// from a hang at this layer without them.
+#[cfg(test)]
+mod tests {
+    use super::IPCService;
+
+    /// The reset is one RPC with a 3s ceiling, so a call that takes longer
+    /// than that has hung somewhere the timeout does not cover.
+    #[test]
+    #[ignore = "requires a running azookey-server; RESETS the learning history"]
+    fn reset_learning_answers_within_its_timeout() {
+        let start = std::time::Instant::now();
+        let mut service = IPCService::new().expect("connect to the server");
+        let connected = start.elapsed();
+
+        let call = std::time::Instant::now();
+        let outcome = service.reset_learning();
+        let elapsed = call.elapsed();
+
+        println!("connect {connected:?}, reset_learning {elapsed:?}");
+        assert!(
+            elapsed < super::RPC_TIMEOUT * 2,
+            "reset_learning took {elapsed:?}, past its own ceiling"
+        );
+        assert!(
+            outcome.is_ok(),
+            "reset_learning failed: {}",
+            outcome
+                .err()
+                .map(|e| e.message().to_string())
+                .unwrap_or_default()
+        );
+    }
+
+    /// The call the settings app already made before this feature existed —
+    /// the control for the one above.
+    #[test]
+    #[ignore = "requires a running azookey-server"]
+    fn update_config_answers_within_its_timeout() {
+        let mut service = IPCService::new().expect("connect to the server");
+
+        let call = std::time::Instant::now();
+        let outcome = service.update_config();
+        let elapsed = call.elapsed();
+
+        println!("update_config {elapsed:?}");
+        assert!(
+            elapsed < super::RPC_TIMEOUT * 2,
+            "update_config took {elapsed:?}"
+        );
+        assert!(outcome.is_ok(), "update_config failed");
+    }
+}
