@@ -1,25 +1,72 @@
 //! The gRPC service implementation: request/response plumbing only.
 //! Engine access goes through the safe wrappers in wrappers.rs.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use tonic::{Request, Response, Status};
 
 use shared::proto::azookey_service_server::AzookeyService;
 use shared::proto::{
     AppendTextRequest, AppendTextResponse, ClearTextRequest, ClearTextResponse, ComposingText,
     MoveCursorRequest, MoveCursorResponse, RemoveTextRequest, RemoveTextResponse,
-    ShrinkTextRequest, ShrinkTextResponse,
+    ShrinkTextRequest, ShrinkTextResponse, Suggestion,
 };
 
 use crate::candidate_pipeline::{self, StageInput};
+use crate::memory_dir::ensure_secured_memory_dir;
 use crate::plugin_client::PluginClient;
 use crate::session::session_of;
 use crate::wrappers::{
     RawComposingText, add_text, clear_text, get_composed_text, load_config, move_cursor,
-    remove_text, set_context, shrink_text,
+    remove_text, reset_learning, set_context, shrink_text,
 };
 
 pub struct MyAzookeyService {
     plugins: PluginClient,
+    /// For each session, how the candidate list the window is showing maps
+    /// back onto the engine's own.
+    ///
+    /// The client can only name a row it can see, and the engine can only
+    /// learn from a candidate it produced — and the two lists are not the
+    /// same list: the pipeline drops duplicates and lets plugins insert
+    /// rows. This is the translation, rebuilt on every conversion.
+    ///
+    /// A `Mutex` because the trait's methods take `&self`. It is never held
+    /// across an await, and the runtime is single-threaded anyway, so it is
+    /// bookkeeping rather than concurrency.
+    ///
+    /// ACCEPTED: an entry outlives its session when a client dies
+    /// mid-composition. `clear_text` drops it on every ordinary end —
+    /// confirm, Escape, focus loss, a host-terminated composition — so what
+    /// is left is one small vector per connection that never got to finish,
+    /// and a session id is never reused. Wiring it to the idle eviction in
+    /// session.rs would mean threading this map through a free function
+    /// every handler calls, which costs more than the leak.
+    displayed_engine_indices: Mutex<HashMap<i64, Vec<Option<i32>>>>,
+}
+
+/// Where each displayed candidate sits in the engine's own list.
+///
+/// Matched on text, which is exact rather than approximate here: the
+/// pipeline's dedup keeps the FIRST candidate carrying a given text, so
+/// `position` finds precisely the row that survived; and a plugin may not
+/// add a text the engine already produced, so a plugin row never matches
+/// one — it maps to `None`, and learns nothing.
+///
+/// O(displayed × engine) and deliberately so: both lists are a candidate
+/// window's worth, and an index built per keystroke would cost more than the
+/// scan it saves.
+fn engine_indices(engine: &[Suggestion], displayed: &[Suggestion]) -> Vec<Option<i32>> {
+    displayed
+        .iter()
+        .map(|shown| {
+            engine
+                .iter()
+                .position(|candidate| candidate.text == shown.text)
+                .and_then(|index| i32::try_from(index).ok())
+        })
+        .collect()
 }
 
 /// Ceiling on one `RemoveText` batch.
@@ -36,6 +83,46 @@ impl MyAzookeyService {
     pub fn new() -> Self {
         MyAzookeyService {
             plugins: PluginClient::new(),
+            displayed_engine_indices: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Turns the index the client confirmed — a row in the list its window
+    /// was showing — into an index the engine can learn from, or -1.
+    ///
+    /// -1 for every way this can fail to name an engine candidate: no
+    /// mapping for the session (nothing was ever converted), a row that came
+    /// from a plugin, or an index outside the list. Out of range is warned
+    /// about and then treated like the rest: this arrives over a pipe any
+    /// local process can open, so it is untrusted input, not an assertion.
+    fn engine_index(&self, session: i64, displayed: Option<i32>) -> i32 {
+        let Some(displayed) = displayed else {
+            return -1;
+        };
+        let Ok(map) = self.displayed_engine_indices.lock() else {
+            return -1;
+        };
+        let Some(indices) = map.get(&session) else {
+            return -1;
+        };
+        let row = usize::try_from(displayed)
+            .ok()
+            .and_then(|index| indices.get(index).copied());
+        match row {
+            // a row we sent, and the engine's own index for it
+            Some(Some(engine)) => engine,
+            // a row we sent that the engine did not produce: a plugin's.
+            // Ordinary, so no warning.
+            Some(None) => -1,
+            None => {
+                tracing::warn!(
+                    displayed,
+                    shown = indices.len(),
+                    "the confirmed candidate is not a row of the list we last \
+                     sent; learning nothing from it"
+                );
+                -1
+            }
         }
     }
 
@@ -58,7 +145,15 @@ impl MyAzookeyService {
         // engine produced: this list, before the pipeline removes
         // anything from it.
         let input = StageInput::new(&hiragana, &offered, &candidates);
+        // Kept because the pipeline consumes the list and this is the one
+        // place both orders exist at once: the client will eventually
+        // confirm a row of `suggestions`, and the engine can only learn from
+        // a row of what it produced.
+        let engine = candidates.clone();
         let suggestions = candidate_pipeline::run(&input, candidates);
+        if let Ok(mut map) = self.displayed_engine_indices.lock() {
+            map.insert(session, engine_indices(&engine, &suggestions));
+        }
         ComposingText {
             hiragana,
             suggestions,
@@ -130,7 +225,18 @@ impl AzookeyService for MyAzookeyService {
         request: Request<ClearTextRequest>,
     ) -> Result<Response<ClearTextResponse>, Status> {
         let session = session_of(&request);
-        clear_text(session);
+        let confirmed = request.into_inner().candidate_index;
+        // Absent means the composition was thrown away rather than
+        // confirmed — Escape, focus loss, a host that terminated it — or a
+        // TIP from before the field existed. All of those learn nothing.
+        let engine_index = self.engine_index(session, confirmed);
+        clear_text(session, engine_index);
+        // The composition is over, so the mapping has nothing left to
+        // translate. Dropped here rather than aged out: this is the one
+        // moment we know for certain it is spent.
+        if let Ok(mut map) = self.displayed_engine_indices.lock() {
+            map.remove(&session);
+        }
         Ok(Response::new(ClearTextResponse {}))
     }
 
@@ -139,7 +245,11 @@ impl AzookeyService for MyAzookeyService {
         request: Request<ShrinkTextRequest>,
     ) -> Result<Response<ShrinkTextResponse>, Status> {
         let session = session_of(&request);
-        let surface_offset = request.into_inner().surface_offset;
+        let request = request.into_inner();
+        let surface_offset = request.surface_offset;
+        // Translated NOW, before `composed` below replaces the mapping with
+        // the one for the remainder of the reading.
+        let engine_index = self.engine_index(session, request.candidate_index);
 
         // Committing a candidate that spends no kana is something the client
         // never has reason to ask for — the candidate it just confirmed always
@@ -165,7 +275,7 @@ impl AzookeyService for MyAzookeyService {
 
         Ok(Response::new(ShrinkTextResponse {
             composing_text: Some(
-                self.composed(session, shrink_text(session, surface_offset))
+                self.composed(session, shrink_text(session, surface_offset, engine_index))
                     .await,
             ),
         }))
@@ -186,6 +296,11 @@ impl AzookeyService for MyAzookeyService {
         &self,
         _: Request<shared::proto::UpdateConfigRequest>,
     ) -> Result<Response<shared::proto::UpdateConfigResponse>, Status> {
+        // Before the read, because the document about to be built names the
+        // learning directory and the engine adopts it only if it EXISTS. It
+        // also heals a directory the user deleted by hand, and re-applies
+        // the ACL if something replaced it.
+        ensure_secured_memory_dir();
         // ONE read, here, handed to both halves. The engine used to open
         // settings.json for itself, so this RPC read the file twice and a save
         // landing between the two reads applied half of each version.
@@ -207,11 +322,88 @@ impl AzookeyService for MyAzookeyService {
         self.plugins.reload_config();
         Ok(Response::new(shared::proto::UpdateConfigResponse {}))
     }
+
+    async fn reset_learning(
+        &self,
+        _: Request<shared::proto::ResetLearningRequest>,
+    ) -> Result<Response<shared::proto::ResetLearningResponse>, Status> {
+        // The engine refuses to reset what it cannot see, and it never
+        // creates the directory itself — so make sure there is one, with our
+        // permissions on it, before asking.
+        ensure_secured_memory_dir();
+        if !reset_learning() {
+            return Err(Status::failed_precondition(
+                "the conversion engine has no learning history to reset",
+            ));
+        }
+        Ok(Response::new(shared::proto::ResetLearningResponse {}))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::last_line_context;
+    //! Pure-function tests: nothing here may reference an FFI symbol (see
+    //! the warning in wrappers.rs — one import would make every test in the
+    //! crate need the Swift runtime).
+
+    use super::{engine_indices, last_line_context};
+    use shared::proto::Suggestion;
+
+    fn suggestions(texts: &[&str]) -> Vec<Suggestion> {
+        texts
+            .iter()
+            .map(|text| Suggestion {
+                text: (*text).to_string(),
+                subtext: String::new(),
+                corresponding_count: 1,
+                surface_count: 1,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_untouched_list_maps_onto_itself() {
+        let engine = suggestions(&["今日", "きょう", "強"]);
+
+        assert_eq!(
+            engine_indices(&engine, &engine),
+            vec![Some(0), Some(1), Some(2)]
+        );
+    }
+
+    /// Dedup keeps the FIRST candidate carrying a text, so matching by text
+    /// finds exactly the row that survived — not merely one that looks like
+    /// it.
+    #[test]
+    fn a_deduplicated_list_points_at_the_surviving_row() {
+        let engine = suggestions(&["今日", "強", "今日", "京"]);
+        let displayed = suggestions(&["今日", "強", "京"]);
+
+        assert_eq!(
+            engine_indices(&engine, &displayed),
+            vec![Some(0), Some(1), Some(3)]
+        );
+    }
+
+    /// A plugin may not offer a text the engine already produced, so its row
+    /// never matches one — and there is nothing for the engine to learn from
+    /// a candidate it did not make.
+    #[test]
+    fn a_plugin_row_maps_to_nothing() {
+        let engine = suggestions(&["今日", "強", "京"]);
+        let displayed = suggestions(&["今日", "強", "2026年8月7日", "京"]);
+
+        assert_eq!(
+            engine_indices(&engine, &displayed),
+            vec![Some(0), Some(1), None, Some(2)]
+        );
+    }
+
+    #[test]
+    fn an_empty_list_maps_to_nothing_at_all() {
+        assert!(engine_indices(&suggestions(&["今日"]), &[]).is_empty());
+        assert_eq!(engine_indices(&[], &suggestions(&["今日"])), vec![None]);
+    }
 
     /// `UpdateConfig` has to reload BOTH halves of the settings file, and
     /// nothing was checking that it still did.
@@ -254,6 +446,13 @@ mod tests {
             body.contains("try_read"),
             "the document must be read ONCE here and passed on, rather than \
              read again on the far side of the FFI boundary: got {body}"
+        );
+        assert!(
+            body.contains("ensure_secured_memory_dir()"),
+            "the learning directory must exist, with our permissions on it, \
+             before the document naming it reaches the engine — the engine \
+             adopts the path only if the directory is already there, and it \
+             must never create it itself: got {body}"
         );
     }
 

@@ -198,10 +198,36 @@ impl CompositionEdit {
         }
     }
 
+    /// Which candidate this composition would be confirming, for the engine
+    /// to learn from — or `None` when what is about to be committed is not a
+    /// candidate the user picked off the list.
+    ///
+    /// The check is against the screen rather than against a flag: a
+    /// selection index only names a confirmed candidate while the preview is
+    /// still that candidate's text. That is what makes it correct without any
+    /// new state to keep in step, and it excludes exactly the cases that
+    /// should be excluded, without any of them being enumerated here:
+    ///
+    /// - F6–F10 rewrite the preview in place (katakana, half-width, …).
+    ///   The selection index still points at whatever was highlighted, and
+    ///   the text no longer matches it — so nothing is learned, which is
+    ///   right: the user did not pick that reading's kanji, they asked for a
+    ///   transformation of the reading.
+    /// - Backspace can empty the list. An index into nothing matches
+    ///   nothing.
+    ///
+    /// The counterpart to [`CompositionEdit::adopt_candidate`], which is
+    /// where the preview and the index are put INTO agreement.
+    pub(super) fn confirmed_candidate_index(&self) -> Option<i32> {
+        let index = usize::try_from(self.selection_index).ok()?;
+        (self.candidates.texts.get(index) == Some(&self.preview)).then_some(self.selection_index)
+    }
+
     /// Mirrors candidate entry `index` into the preview fields of this
     /// working copy. This is the single point where a selected candidate
-    /// becomes the visible preview — the future hook for conversion-history
-    /// learning to observe what the user actually picked.
+    /// becomes the visible preview, and so the thing
+    /// [`CompositionEdit::confirmed_candidate_index`] checks against when a
+    /// commit asks what the user actually picked.
     pub(super) fn adopt_candidate(&mut self, candidates: &Candidates, index: i32) {
         let (text, sub_text, count, surface) = candidates.entry(index as usize);
         self.corresponding_count = count;
@@ -387,6 +413,69 @@ mod tests {
         assert_eq!(raw_input_after_commit("ki", "u", 3), "");
         // count of zero drops nothing
         assert_eq!(raw_input_after_commit("ki", "u", 0), "kiu");
+    }
+
+    /// A working copy in the shape `confirmed_candidate_index` is asked
+    /// about: a list, a selection, and whatever the preview currently says.
+    fn previewing(texts: &[&str], selection_index: i32, preview: &str) -> CompositionEdit {
+        CompositionEdit {
+            preview: preview.to_string(),
+            suffix: String::new(),
+            raw_input: String::new(),
+            raw_hiragana: String::new(),
+            corresponding_count: 0,
+            surface_count: 0,
+            candidates: Candidates {
+                texts: texts.iter().map(|t| (*t).to_string()).collect(),
+                ..Candidates::default()
+            },
+            selection_index,
+            state: CompositionState::Previewing,
+        }
+    }
+
+    /// What the engine learns from is decided by comparing the highlighted
+    /// candidate with what is actually on screen, so this is the whole
+    /// contract in four cases.
+    #[test]
+    fn a_confirmed_candidate_is_the_one_the_preview_still_shows() {
+        assert_eq!(
+            previewing(&["水", "見ず", "みず"], 1, "見ず").confirmed_candidate_index(),
+            Some(1),
+            "the highlighted candidate is what the user picked"
+        );
+    }
+
+    /// F6–F10 rewrite the preview without touching the selection. The user
+    /// asked for a transformation of the reading, not for the kanji the
+    /// index still points at — and learning that pairing would be wrong.
+    #[test]
+    fn a_rewritten_preview_confirms_no_candidate() {
+        assert_eq!(
+            previewing(&["水", "見ず"], 0, "ミズ").confirmed_candidate_index(),
+            None
+        );
+    }
+
+    /// Backspace can leave the list empty while an index survives.
+    #[test]
+    fn an_index_into_an_empty_list_confirms_nothing() {
+        assert_eq!(previewing(&[], 0, "").confirmed_candidate_index(), None);
+        assert_eq!(
+            previewing(&["水"], 5, "水").confirmed_candidate_index(),
+            None
+        );
+    }
+
+    /// Not reachable today, and cheap to hold: `usize::try_from` is what
+    /// stands between a negative index and an `as usize` that would wrap
+    /// into a very large one.
+    #[test]
+    fn a_negative_index_confirms_nothing() {
+        assert_eq!(
+            previewing(&["水"], -1, "水").confirmed_candidate_index(),
+            None
+        );
     }
 
     /// The invariant the rebuild depends on: replaying a whole reading in one

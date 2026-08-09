@@ -372,6 +372,105 @@ struct EngineConfigTests {
         }
     }
 
+    /// Makes a directory that exists for the duration of `body`, so the
+    /// "does it exist" branch below is exercised against a real one rather
+    /// than a path that happens to be there on the machine running the test.
+    private func withTemporaryDirectory(_ body: (URL) -> Void) {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("azookey-learning-config-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: url) }
+        body(url)
+    }
+
+    /// Same reason as the conversion section: toggling the learning switch
+    /// sends a document with `learning` and nothing else, and a section read
+    /// after the zenzai guard would be dropped whole.
+    @Test("the learning section applies on its own")
+    func learningSectionAppliesWithoutZenzai() {
+        withRestoredConfig {
+            config = EngineConfig()
+
+            let settings = decodeSettings(#"{"learning":{"enable":false}}"#)
+            #expect(settings?.zenzai == nil, "the document really has no zenzai section")
+            applySettings(settings)
+
+            #expect(!config.learningEnabled)
+        }
+    }
+
+    /// A section carrying only the other key must not reset this one — the
+    /// same per-key rule as everywhere else in this decoder.
+    @Test("a learning section without enable keeps the current value")
+    func learningKeepsAbsentKeys() {
+        withRestoredConfig {
+            config = EngineConfig()
+            config.learningEnabled = false
+
+            applySettings(decodeSettings(#"{"learning":{}}"#))
+
+            #expect(!config.learningEnabled)
+        }
+    }
+
+    /// The directory is a precondition the Rust server establishes, not
+    /// something the engine may create: the server also locks the DACL down
+    /// to SYSTEM and Administrators, and a mkdir from this side would produce
+    /// an unprotected directory holding the user's input history.
+    @Test("a memory directory is adopted only when it already exists")
+    func memoryDirectoryMustExist() {
+        withRestoredConfig {
+            withTemporaryDirectory { existing in
+                config = EngineConfig()
+
+                applySettings(
+                    SettingsFile(learning: .init(memory_directory: existing.path))
+                )
+                #expect(config.memoryDirectory?.path == existing.path)
+
+                let absent = existing.appendingPathComponent("not-created-by-the-engine")
+                applySettings(
+                    SettingsFile(learning: .init(memory_directory: absent.path))
+                )
+                #expect(config.memoryDirectory == nil, "no directory means no learning")
+                #expect(
+                    !FileManager.default.fileExists(atPath: absent.path),
+                    "and the engine must not have created it"
+                )
+            }
+        }
+    }
+
+    /// Both halves have to be true before the converter is asked to learn.
+    /// The directory half matters most: without it the converter would build
+    /// a memory store under the relative placeholder path.
+    @Test("learning reaches the options only with a directory and the setting on")
+    func learningReachesTheOptions() {
+        withRestoredConfig {
+            withTemporaryDirectory { directory in
+                config = EngineConfig()
+
+                #expect(
+                    getOptions().learningType == .nothing,
+                    "a fresh config has no directory yet, whatever the setting says"
+                )
+
+                config.memoryDirectory = directory
+                var options = getOptions()
+                #expect(options.learningType == .inputAndOutput)
+                #expect(options.memoryDirectoryURL == directory)
+
+                config.learningEnabled = false
+                options = getOptions()
+                #expect(options.learningType == .nothing)
+                #expect(
+                    options.sharedContainerURL == placeholderDataDirectory,
+                    "the user dictionary's directory is a separate feature"
+                )
+            }
+        }
+    }
+
     /// Same reasoning as the limit above, with a sharper edge: this number is
     /// handed to llama.cpp as `n_ctx` and `n_batch`, so an unbounded one is an
     /// allocation that can land in VRAM, and one below the floor is a cache too
@@ -460,6 +559,7 @@ struct EngineConfigTests {
             #expect(config.fullWidthRomanCandidate == untouched.fullWidthRomanCandidate)
             #expect(config.typoCorrection == untouched.typoCorrection)
             #expect(config.typographyCandidates == untouched.typographyCandidates)
+            #expect(config.learningEnabled == untouched.learningEnabled)
             #expect(config.zenzaiTopic == untouched.zenzaiTopic)
             #expect(config.zenzaiStyle == untouched.zenzaiStyle)
             #expect(config.zenzaiPreference == untouched.zenzaiPreference)

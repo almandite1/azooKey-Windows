@@ -79,7 +79,7 @@ struct DefensiveTests {
         let session: Int64 = 0x7000_0003
         defer { remove_session(session: session) }
 
-        let reading = shrink_text(session: session, surfaceOffset: 5)
+        let reading = shrink_text(session: session, surfaceOffset: 5, confirmedCandidate: -1)
         #expect(reading != nil)
         #expect(String(cString: reading!) == "")
         free_string(ptr: reading)

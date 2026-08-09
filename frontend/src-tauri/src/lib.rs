@@ -70,7 +70,7 @@ fn get_config() -> Result<AppConfig, String> {
 /// WRITE, the same tolerance means something else entirely: a document that
 /// has lost a section gets the defaults filled in and then persisted, which
 /// resets every setting in it.
-const REQUIRED_SECTIONS: [&str; 3] = ["zenzai", "conversion", "plugins"];
+const REQUIRED_SECTIONS: [&str; 4] = ["zenzai", "conversion", "learning", "plugins"];
 
 /// The config to save, or why this document is not one.
 fn config_from_payload(payload: serde_json::Value) -> Result<AppConfig, String> {
@@ -165,7 +165,7 @@ async fn patch_config(
         let _saving = state.save.lock().unwrap_or_else(PoisonError::into_inner);
         patch_on_disk(&key_path, value)?;
     }
-    Ok(notify_server(&state))
+    Ok(notify_server(&state).await)
 }
 
 /// Moves an unreadable settings.json aside and starts again from the
@@ -181,40 +181,87 @@ async fn reset_config(state: tauri::State<'_, AppState>) -> Result<SaveOutcome, 
         // this is the call whose recovery path backs the old file up first
         AppConfig::new();
     }
-    Ok(notify_server(&state))
+    Ok(notify_server(&state).await)
+}
+
+/// Forgets everything the engine has learned from confirmed conversions.
+///
+/// Deliberately NOT a [`SaveOutcome`]: nothing is written to disk here, so
+/// there is no "saved, but the IME could not be told" to report. Either the
+/// history was reset or it was not, and a running IME is a precondition
+/// rather than a nicety — an error is the honest answer when there is
+/// nothing running to reset.
+#[tauri::command]
+async fn reset_learning(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    reset_learning_on(&state).await
+}
+
+/// The body of the command above, over a plain `&AppState` — which is what
+/// makes it testable at all. `tauri::State` needs an App to exist, so a
+/// command that keeps its logic in its own signature can only be exercised by
+/// clicking. See the tests at the bottom of this file.
+async fn reset_learning_on(state: &AppState) -> Result<(), String> {
+    let ipc = ipc_client(state).map_err(|e| {
+        format!(
+            "the IME could not be reached ({e}); nothing was reset. Start the \
+             IME and try again."
+        )
+    })?;
+
+    ipc.reset_learning().await.map_err(|failure| {
+        // same rule as notify_server: only a dead connection costs the
+        // channel, because reconnecting is not free
+        if failure.connection_lost() {
+            drop_ipc_client(state);
+        }
+        failure.message().to_string()
+    })
+}
+
+/// A client for the running IME, connected on first use and kept afterwards.
+///
+/// Returns a CLONE, and that is the point: `IPCService` is a lazy tonic
+/// channel, cheap to clone, and cloning is what lets the lock go before the
+/// call is awaited. A `std::sync::MutexGuard` held across an `.await` makes
+/// the command's future `!Send`, which Tauri will not take — and holding it
+/// would serialise every settings save behind whichever one is in flight.
+fn ipc_client(state: &AppState) -> Result<ipc::IPCService, String> {
+    let mut ipc_guard = state.ipc.lock().unwrap_or_else(PoisonError::into_inner);
+
+    if ipc_guard.is_none() {
+        *ipc_guard = Some(ipc::IPCService::new().map_err(|e| e.to_string())?);
+    }
+    ipc_guard
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "no connection to the IME".to_string())
+}
+
+/// Drops the stored client so the next call builds a fresh one. Only for a
+/// connection that is gone: see the callers.
+fn drop_ipc_client(state: &AppState) {
+    *state.ipc.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 /// Tells the running IME to re-read the file. Never fatal: the file is
 /// already saved by the time this runs, so the worst case is a change that
 /// takes effect at the next start, and saying so is the whole job here.
-fn notify_server(state: &AppState) -> SaveOutcome {
-    let mut ipc_guard = state.ipc.lock().unwrap_or_else(PoisonError::into_inner);
-
-    if ipc_guard.is_none() {
-        match ipc::IPCService::new() {
-            Ok(service) => *ipc_guard = Some(service),
-            Err(e) => {
-                return SaveOutcome {
-                    saved: true,
-                    notified: false,
-                    error: Some(format!(
-                        "saved, but the IME could not be reached ({e}); it will pick the \
-                         settings up when it next starts"
-                    )),
-                };
-            }
+async fn notify_server(state: &AppState) -> SaveOutcome {
+    let ipc = match ipc_client(state) {
+        Ok(ipc) => ipc,
+        Err(e) => {
+            return SaveOutcome {
+                saved: true,
+                notified: false,
+                error: Some(format!(
+                    "saved, but the IME could not be reached ({e}); it will pick the \
+                     settings up when it next starts"
+                )),
+            };
         }
-    }
-
-    let Some(ipc) = ipc_guard.as_mut() else {
-        return SaveOutcome {
-            saved: true,
-            notified: false,
-            error: Some("saved, but the IME could not be reached".to_string()),
-        };
     };
 
-    match ipc.update_config() {
+    match ipc.update_config().await {
         Ok(()) => SaveOutcome {
             saved: true,
             notified: true,
@@ -223,10 +270,10 @@ fn notify_server(state: &AppState) -> SaveOutcome {
         Err(failure) => {
             let message = failure.message().to_string();
             // only a dead connection costs the channel; a timeout is the
-            // single-threaded engine being busy, and rebuilding the runtime
-            // for that is what made the next keystroke expensive
+            // single-threaded engine being busy, and reconnecting for that is
+            // what made the next keystroke expensive
             if failure.connection_lost() {
-                *ipc_guard = None;
+                drop_ipc_client(state);
             }
             SaveOutcome {
                 saved: true,
@@ -302,6 +349,7 @@ pub fn run() {
             get_config,
             patch_config,
             reset_config,
+            reset_learning,
             check_capability
         ])
         .run(tauri::generate_context!())
@@ -311,9 +359,71 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, Capability, all_present, capability_in, config_from_payload, search_directories,
+        AppConfig, AppState, Capability, all_present, capability_in, config_from_payload, ipc,
+        notify_server, reset_learning_on, search_directories,
     };
     use std::path::{Path, PathBuf};
+
+    /// An app state whose client points at a pipe nothing is listening on.
+    ///
+    /// Every server call then fails the same way on any machine, which is the
+    /// only way these can be ordinary `cargo test` tests: aimed at the real
+    /// pipe, `reset_learning_on` would wipe the learning history of whoever
+    /// happened to have the IME running.
+    ///
+    /// MUST be called from inside the runtime, like everything else here: the
+    /// lazy channel wants a reactor to exist when it is BUILT, not only when
+    /// it is used. In the app that is free — `IPCService::new()` runs inside
+    /// the command that is about to await it.
+    fn state_with_no_server() -> AppState {
+        let state = AppState::new();
+        let absent = ipc::IPCService::connect(r"\\.\pipe\azookey_server_absent_for_tests".into())
+            .expect("a lazy channel connects to nothing until it is used");
+        *state
+            .ipc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(absent);
+        state
+    }
+
+    /// THE test this file was missing.
+    ///
+    /// Not "does the config reach the server" — that needs one — but "is the
+    /// call even legal from where Tauri makes it". A `#[tauri::command]`
+    /// declared `async fn` runs on Tauri's Tokio runtime, and for nine days
+    /// every server call this app made drove its RPC with a second runtime's
+    /// `block_on` from inside that one. Tokio panics at that; the panic kills
+    /// the task instead of returning, so the `invoke` promise never settled
+    /// and the UI showed nothing at all.
+    ///
+    /// So the runtime here is not scaffolding, it is the subject: the call
+    /// must be awaited on it rather than blocked on. Against the old code
+    /// this panics.
+    #[test]
+    fn notify_server_may_be_awaited_on_a_runtime() {
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime to stand in for Tauri's");
+        let outcome = runtime.block_on(async { notify_server(&state_with_no_server()).await });
+
+        assert!(outcome.saved, "the file was written before we got here");
+        assert!(!outcome.notified, "nothing is listening on that pipe");
+        assert!(
+            outcome.error.is_some(),
+            "an unreachable IME has to be reportable, not silent"
+        );
+    }
+
+    /// The same property for the reset, which is a different command with the
+    /// same shape — and the one whose silence started the hunt.
+    #[test]
+    fn reset_learning_may_be_awaited_on_a_runtime() {
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime to stand in for Tauri's");
+        let outcome = runtime.block_on(async { reset_learning_on(&state_with_no_server()).await });
+
+        assert!(
+            outcome.is_err(),
+            "nothing is listening on that pipe, so nothing was reset"
+        );
+    }
 
     fn document() -> serde_json::Value {
         serde_json::json!({
@@ -328,6 +438,7 @@ mod tests {
                 "typo_correction": "automatic",
                 "typography": false
             },
+            "learning": { "enable": true },
             "plugins": { "enable": false, "entries": [] }
         })
     }
@@ -415,11 +526,13 @@ mod tests {
                 "typo_correction": "enabled",
                 "typography": false
             },
+            "learning": { "enable": false },
             "plugins": { "enable": true, "entries": [] }
         }))
         .expect("a complete payload is savable");
 
         assert!(config.zenzai.enable);
+        assert!(!config.learning.enable);
         assert_eq!(config.zenzai.backend, "cuda");
         assert_eq!(config.zenzai.inference_limit, 3);
         assert_eq!(config.zenzai.context_size, 2048);
@@ -521,7 +634,11 @@ mod tests {
         let document = serde_json::to_value(AppConfig::default()).expect("serialize the defaults");
         let object = document.as_object().expect("the config is an object");
 
-        for (interface, section) in [("ZenzaiConfig", "zenzai"), ("PluginsConfig", "plugins")] {
+        for (interface, section) in [
+            ("ZenzaiConfig", "zenzai"),
+            ("LearningConfig", "learning"),
+            ("PluginsConfig", "plugins"),
+        ] {
             let mut declared = fields_of(interface);
             let mut actual: Vec<String> = object[section]
                 .as_object()

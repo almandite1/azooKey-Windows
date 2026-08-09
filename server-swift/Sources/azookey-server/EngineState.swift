@@ -18,6 +18,15 @@ import Foundation
 struct SessionState {
     var composingText = ComposingText()
     var context = ""
+    /// What the last GetComposedText for this session produced, in the
+    /// converter's own order.
+    ///
+    /// Learning needs a real `Candidate` — the dictionary entries behind the
+    /// text, not the text — and by the time the client tells us which one it
+    /// accepted, the list has long since been flattened into C strings and
+    /// freed. So the objects are kept here, indexed exactly as the client's
+    /// `confirmedCandidate` indexes them (see ffi.h).
+    var lastCandidates: [Candidate] = []
 }
 
 @MainActor var sessions: [Int64: SessionState] = [:]
@@ -34,8 +43,12 @@ struct SessionState {
 @MainActor var config = EngineConfig()
 
 // Fixed engine parameters, hoisted so they are visible in one place.
-// The ./test placeholder predates this refactor: with learningType
-// .nothing the memory/shared-container dirs are never written — they
-// become real, configurable paths when the learning feature lands.
+//
+// `placeholderDataDirectory` is a relative path that must never actually be
+// written to. The memory directory is now a real, configured one
+// (`config.memoryDirectory`) and falls back to this only when learning is
+// off, where the converter does not touch it. The shared container is still
+// genuinely a placeholder: it is the user dictionary's home, and there is no
+// user dictionary yet.
 let emojiDictionaryFileName = "emoji_all_E16.0.txt"
 let placeholderDataDirectory = URL(filePath: "./test")

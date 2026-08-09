@@ -158,7 +158,7 @@ mod tests {
         assert!(result.is_ok(), "a cosmetic failure must not break input");
         let calls = ipc_calls(&fake);
         assert!(
-            calls.contains(&IpcCall::HideWindow) && calls.contains(&IpcCall::ClearText),
+            calls.contains(&IpcCall::HideWindow) && calls.contains(&IpcCall::ClearText(None)),
             "the composition must have been torn down anyway: {calls:?}"
         );
 

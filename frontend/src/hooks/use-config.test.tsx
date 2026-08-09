@@ -10,6 +10,7 @@ vi.mock("sonner", () => ({ toast: (...args: unknown[]) => toast(...args) }));
 import { ConfigProvider } from "@/hooks/use-config";
 import { General } from "@/pages/general";
 import { Conversion } from "@/pages/conversion";
+import { Learning } from "@/pages/learning";
 import { Zenzai } from "@/pages/zenzai";
 
 const config = (overrides: Record<string, unknown> = {}) => ({
@@ -31,6 +32,7 @@ const config = (overrides: Record<string, unknown> = {}) => ({
         typo_correction: "automatic",
         typography: false,
     },
+    learning: { enable: true },
     plugins: { enable: false, entries: [] },
 });
 
@@ -244,6 +246,78 @@ describe("the conversion settings", () => {
                 "aggressive"
             )
         );
+    });
+});
+
+describe("the learning settings", () => {
+    /// Same risk as the conversion switches: a key path the Rust side rejects
+    /// looks exactly like a switch that does nothing.
+    it("writes the key it names", async () => {
+        const patches = withBackend(config());
+        await renderPage(<Learning />);
+
+        await userEvent.click(screen.getByRole("switch", { name: /入力履歴からの学習/ }));
+
+        await waitFor(() =>
+            expect(patches).toContainEqual({ key: "learning.enable", value: false })
+        );
+    });
+
+    it("shows the stored state of the switch", async () => {
+        const document = config();
+        withBackend({ ...document, learning: { enable: false } });
+        await renderPage(<Learning />);
+
+        await waitFor(() =>
+            expect(screen.getByRole("switch", { name: /入力履歴からの学習/ })).not.toBeChecked()
+        );
+    });
+
+    /// Destructive, so it must not fire on the first click — and it must fire
+    /// exactly once when it does.
+    it("resets only after the confirmation is accepted", async () => {
+        withBackend(config());
+        await renderPage(<Learning />);
+
+        await userEvent.click(screen.getByRole("button", { name: /学習履歴をリセット/ }));
+        expect(invoke).not.toHaveBeenCalledWith("reset_learning");
+
+        await userEvent.click(screen.getByRole("button", { name: "削除する" }));
+
+        await waitFor(() => expect(invoke).toHaveBeenCalledWith("reset_learning"));
+        expect(
+            invoke.mock.calls.filter(([command]) => command === "reset_learning")
+        ).toHaveLength(1);
+        expect(await screen.findByRole("status")).toHaveTextContent("削除しました");
+    });
+
+    it("cancels without resetting anything", async () => {
+        withBackend(config());
+        await renderPage(<Learning />);
+
+        await userEvent.click(screen.getByRole("button", { name: /学習履歴をリセット/ }));
+        await userEvent.click(screen.getByRole("button", { name: "キャンセル" }));
+
+        expect(invoke).not.toHaveBeenCalledWith("reset_learning");
+        expect(screen.getByRole("button", { name: /学習履歴をリセット/ })).toBeInTheDocument();
+    });
+
+    /// The IME not running is the commonest failure, and it is the command's
+    /// own message that says so — showing it verbatim is the point.
+    it("shows why a reset did not happen", async () => {
+        withBackend(config());
+        invoke.mockImplementation((command: string) => {
+            if (command === "get_config") return Promise.resolve(config());
+            if (command === "reset_learning")
+                return Promise.reject("the IME could not be reached; nothing was reset");
+            return Promise.resolve(undefined);
+        });
+        await renderPage(<Learning />);
+
+        await userEvent.click(screen.getByRole("button", { name: /学習履歴をリセット/ }));
+        await userEvent.click(screen.getByRole("button", { name: "削除する" }));
+
+        expect(await screen.findByRole("status")).toHaveTextContent("nothing was reset");
     });
 });
 

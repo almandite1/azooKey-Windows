@@ -299,9 +299,13 @@ mod extraction {
         // opens settings.json itself, so this RPC reads it once (#105)
         assert_eq!(surface.get("LoadConfig"), Some(&1));
         assert_eq!(surface.get("Initialize"), Some(&1));
-        assert_eq!(surface.get("ShrinkText"), Some(&2));
+        // the third is `confirmedCandidate`, the index the user accepted
+        assert_eq!(surface.get("ShrinkText"), Some(&3));
         assert_eq!(surface.get("AppendText"), Some(&3));
         assert_eq!(surface.get("MoveCursor"), Some(&3));
+        // `(void)` — the spelling for none, and the only declaration here
+        // that uses it
+        assert_eq!(surface.get("ResetLearning"), Some(&0));
     }
 
     /// Multi-line signatures are the shape both the Rust mirror and the Swift
@@ -321,7 +325,7 @@ mod extraction {
     #[test]
     fn swift_attributes_between_the_cdecl_and_the_func_are_skipped() {
         let surface = swift_cdecl_surface(SWIFT_EXPORTS);
-        assert_eq!(surface.get("ClearText"), Some(&1));
+        assert_eq!(surface.get("ClearText"), Some(&2));
         assert_eq!(surface.get("FreeComposedText"), Some(&2));
     }
 

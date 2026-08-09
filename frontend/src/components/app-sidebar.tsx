@@ -1,4 +1,4 @@
-import { Bot, Settings, Megaphone, Languages } from "lucide-react"
+import { Bot, Settings, Megaphone, Languages, History } from "lucide-react"
 import { Link, useLocation } from "react-router"
 
 import {
@@ -29,6 +29,11 @@ const contents = [
         title: "変換",
         url: "/conversion",
         icon: Languages,
+    },
+    {
+        title: "学習",
+        url: "/learning",
+        icon: History,
     },
     {
         title: "Zenzai",

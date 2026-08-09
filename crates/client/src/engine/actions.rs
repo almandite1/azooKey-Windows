@@ -177,6 +177,14 @@ impl TextServiceFactory_Impl {
         ipc_service: &IPCService,
         cancel: bool,
     ) -> Result<()> {
+        // The one place a whole composition is CONFIRMED, so the one place
+        // there is anything to learn from. Read before `reset_for_teardown`
+        // below empties the working copy, and only when this is not a cancel
+        // — Escape commits nothing, so there is nothing the user chose.
+        let confirmed = (!cancel)
+            .then(|| edit.confirmed_candidate_index())
+            .flatten();
+
         let mut edit_result = Ok(());
         if cancel {
             edit_result = self.set_text("", "");
@@ -187,7 +195,7 @@ impl TextServiceFactory_Impl {
 
         edit.reset_for_teardown();
         self.close_candidate_ui(ipc_service);
-        let clear_result = ipc_service.clear_text();
+        let clear_result = ipc_service.clear_text(confirmed);
 
         // surface the first failure only after both the client state and the
         // server reading were cleared
@@ -222,7 +230,9 @@ impl TextServiceFactory_Impl {
         // the server's reading must not survive into the next keystroke
         edit.reset_for_teardown();
         self.close_candidate_ui(ipc_service);
-        ipc_service.clear_text()?;
+        // No index: the host ended this composition, not the user. Whatever
+        // it committed is not a choice anyone made off the candidate list.
+        ipc_service.clear_text(None)?;
         Ok(())
     }
 
@@ -240,7 +250,9 @@ impl TextServiceFactory_Impl {
 
         edit.reset_for_teardown();
         self.close_candidate_ui(ipc_service);
-        let clear_result = ipc_service.clear_text();
+        // No index: losing focus abandons the composition rather than
+        // confirming it, and nothing is written to the document.
+        let clear_result = ipc_service.clear_text(None);
 
         edit_result?;
         clear_result?;
@@ -351,7 +363,10 @@ impl TextServiceFactory_Impl {
         let apply_result = self.apply_input_mode(mode.clone(), true);
 
         edit.reset_for_teardown();
-        let clear_result = ipc_service.clear_text();
+        // No index: switching input mode discards whatever was composing.
+        // The mode-toggle batch that DOES commit its preview to the document
+        // pairs this with an EndComposition, which learns on its own behalf.
+        let clear_result = ipc_service.clear_text(None);
 
         // surface the first failure only after both the client state and the
         // server reading were cleared
@@ -418,10 +433,14 @@ impl TextServiceFactory_Impl {
         let spent = edit.corresponding_count;
         let after_commit = raw_input_after_commit(&edit.raw_input, "", spent);
         let after_append = raw_input_after_commit(&edit.raw_input, text, spent);
+        // Up front for the same reason, and for one more: `adopt_fresh`
+        // below replaces both the selection and the list this is read from.
+        // A clause commit is a confirmation, so the engine learns from it.
+        let confirmed = edit.confirmed_candidate_index();
 
         // kana, not keystrokes: only the reading can express a candidate
         // that ends inside a romaji cluster
-        ipc_service.shrink_text(edit.surface_count)?;
+        ipc_service.shrink_text(edit.surface_count, confirmed)?;
         edit.raw_input = after_commit;
 
         let candidates = ipc_service.append_text(keystrokes(mode, text))?;
@@ -659,6 +678,10 @@ mod tests {
             composition.raw_input = "mizu".to_string();
             composition.corresponding_count = 4;
             composition.surface_count = 2; // みず — two kana, four keystrokes
+            // the list the preview came off, so the commit below is a
+            // candidate the user picked rather than a rewritten reading
+            composition.candidates = scripted(&["水", "見ず"], "みず", &[4, 4], &[2, 2]);
+            composition.selection_index = 0;
         }
 
         factory
@@ -686,8 +709,11 @@ mod tests {
         let calls = recorded_calls(&fake);
         let shrink = calls
             .iter()
-            .position(|c| *c == IpcCall::ShrinkText(2))
-            .expect("shrink_text must be sent the committed KANA count, not the keystrokes");
+            .position(|c| *c == IpcCall::ShrinkText(2, Some(0)))
+            .expect(
+                "shrink_text must be sent the committed KANA count, not the keystrokes, \
+                 and the index of the candidate the user confirmed",
+            );
         let append = calls
             .iter()
             .position(|c| *c == IpcCall::AppendText("n".to_string()))
@@ -806,8 +832,9 @@ mod tests {
             "the stale list must be blanked: {calls:?}"
         );
         assert!(
-            calls.contains(&IpcCall::ClearText),
-            "the server reading must be cleared: {calls:?}"
+            calls.contains(&IpcCall::ClearText(Some(0))),
+            "the server reading must be cleared, and told which candidate was \
+             confirmed: {calls:?}"
         );
 
         // ...and the written-back composition must not keep the list either.
@@ -955,8 +982,86 @@ mod tests {
         drop(text_service);
 
         assert!(
-            recorded_calls(&fake).contains(&IpcCall::ClearText),
+            recorded_calls(&fake).contains(&IpcCall::ClearText(None)),
             "the server's reading must be dropped too, or it comes back on the next key"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// Escape throws the composition away. It reaches the same arm as Enter,
+    /// with `cancel` set — and the engine must be told the difference, or a
+    /// user who rejected a conversion would have taught the IME to prefer
+    /// it.
+    #[test]
+    fn cancelling_a_composition_learns_nothing_from_it() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(Candidates::default());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = factory_of(&tip);
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.set_up_for_test(CompositionState::Previewing);
+            // exactly the shape that WOULD be learned from on Enter
+            composition.preview = "水".to_string();
+            composition.candidates = scripted(&["水", "見ず"], "みず", &[4, 4], &[2, 2]);
+            composition.selection_index = 0;
+        }
+
+        factory
+            .handle_action(&[ClientAction::CancelComposition], CompositionState::None)
+            .unwrap();
+
+        let calls = recorded_calls(&fake);
+        assert!(
+            calls.contains(&IpcCall::ClearText(None)),
+            "a cancelled composition confirms nothing: {calls:?}"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// F6–F10 rewrite the preview and leave the selection where it was, so
+    /// the index no longer names what is on screen. Committing that must not
+    /// teach the engine that the reading's top kanji was chosen — the user
+    /// asked for katakana.
+    ///
+    /// The composition is set up exactly as in
+    /// `end_composition_tears_down_the_candidate_ui`, which confirms index 0
+    /// — so the difference here is the F7, and nothing else.
+    #[test]
+    fn a_reading_rewritten_by_a_function_key_learns_nothing() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(Candidates::default());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = factory_of(&tip);
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.set_up_for_test(CompositionState::Previewing);
+            composition.raw_hiragana = "みず".to_string();
+            composition.preview = "水".to_string();
+            composition.candidates = scripted(&["水", "見ず"], "みず", &[4, 4], &[2, 2]);
+            composition.selection_index = 0;
+        }
+
+        factory
+            .handle_action(
+                &[
+                    ClientAction::SetTextWithType(SetTextType::Katakana),
+                    ClientAction::EndComposition,
+                ],
+                CompositionState::None,
+            )
+            .unwrap();
+
+        let calls = recorded_calls(&fake);
+        assert!(
+            calls.contains(&IpcCall::ClearText(None)),
+            "the preview is ミズ, not the candidate the index points at: {calls:?}"
         );
 
         IMEState::get().unwrap().ipc_service = None;
@@ -1014,7 +1119,7 @@ mod tests {
             "the mode indicator must be told: {calls:?}"
         );
         assert!(
-            calls.contains(&IpcCall::ClearText),
+            calls.contains(&IpcCall::ClearText(None)),
             "the server's reading goes with the mode switch: {calls:?}"
         );
 
@@ -1132,7 +1237,11 @@ mod tests {
 
         // the local teardown still has to be complete
         let calls = recorded_calls(&fake);
-        assert!(calls.contains(&IpcCall::ClearText), "{calls:?}");
+        assert!(
+            calls.contains(&IpcCall::ClearText(None)),
+            "a composition the HOST ended is not a candidate the user picked, \
+             so nothing may be learned from it: {calls:?}"
+        );
         assert!(calls.contains(&IpcCall::HideWindow), "{calls:?}");
         let text_service = factory.borrow().unwrap();
         let composition = text_service.borrow_composition().unwrap();
@@ -1188,7 +1297,10 @@ mod tests {
             "ending at focus loss must not write text into the departing document"
         );
         let calls = recorded_calls(&fake);
-        assert!(calls.contains(&IpcCall::ClearText), "{calls:?}");
+        assert!(
+            calls.contains(&IpcCall::ClearText(None)),
+            "focus loss abandons the composition; nothing was confirmed: {calls:?}"
+        );
         assert!(calls.contains(&IpcCall::HideWindow), "{calls:?}");
         let text_service = factory.borrow().unwrap();
         let composition = text_service.borrow_composition().unwrap();

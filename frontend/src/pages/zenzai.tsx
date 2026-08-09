@@ -11,7 +11,7 @@ import {
 } from "@/components/ui/select"
 import { useEffect, useState } from "react";
 import { toast } from "sonner"
-import { invoke } from '@tauri-apps/api/core';
+import { invokeCommand } from "@/lib/config";
 import { useConfigKey } from "@/hooks/use-config";
 import type { ConfigKey, SaveOutcome } from "@/lib/config";
 
@@ -145,7 +145,7 @@ export const Zenzai = () => {
     });
 
     useEffect(() => {
-        invoke<{ cpu: boolean; cuda: boolean; vulkan: boolean }>("check_capability")
+        invokeCommand<{ cpu: boolean; cuda: boolean; vulkan: boolean }>("check_capability")
             .then(setCapability)
             // without this the rejection was unhandled and the list silently
             // stayed CPU-only, which looks identical to "your machine has no GPU"

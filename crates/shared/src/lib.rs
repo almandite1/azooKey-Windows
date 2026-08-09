@@ -63,6 +63,32 @@ pub fn config_root_in(base: Option<std::ffi::OsString>) -> Option<PathBuf> {
     Some(Path::new(&base).join("Azookey"))
 }
 
+/// `%APPDATA%\Azookey\memory` — where the engine keeps what it has learned
+/// from confirmed conversions.
+///
+/// User data rather than runtime state, so it lives beside `settings.json`
+/// and not under [`local_data_root`]: it is the same kind of thing as the
+/// user dictionary, and a user who moves machines would want it to follow.
+///
+/// `None` for the same reason [`config_root`] is: without `APPDATA` there is
+/// no per-user directory to name, and the caller decides what that means (the
+/// engine's answer is to leave learning off rather than write somewhere
+/// arbitrary).
+///
+/// Spelling the path is deliberately one side's job. The Swift engine is
+/// handed the result as a string in the settings document and never composes
+/// it — the same rule the FFI header states about paths crossing the
+/// boundary.
+pub fn learning_memory_dir() -> Option<PathBuf> {
+    learning_memory_dir_in(std::env::var_os("APPDATA"))
+}
+
+/// Takes the environment value explicitly so tests never read or race on a
+/// real environment variable (same reason as [`config_root_in`]).
+pub fn learning_memory_dir_in(base: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    config_root_in(base).map(|root| root.join("memory"))
+}
+
 /// `%LOCALAPPDATA%\Azookey` — where per-user RUNTIME state belongs: logs,
 /// crash dumps, the WebView2 profile. Deliberately not [`config_root`]:
 /// that one is `%APPDATA%` (roaming), which is for settings a user would
@@ -368,6 +394,48 @@ impl ConversionConfig {
     }
 }
 
+/// Whether the engine learns from what the user confirms.
+///
+/// Unlike [`ConversionConfig`], whose every default reproduces the behaviour
+/// the engine had before the setting existed, this one defaults to ON and so
+/// CHANGES what an upgraded install does. That is a deliberate product
+/// decision, not an oversight: an IME that does not remember the conversions
+/// you keep picking is the thing users notice. The settings page says in so
+/// many words that the history is written to disk, which is where the
+/// transparency for that decision lives.
+///
+/// The directory the history is written to is NOT a field here. It is a
+/// computed key, `learning.memory_directory`, that
+/// [`AppConfig::to_engine_json`] injects into the document handed to the
+/// engine and that [`AppConfig::write`] never puts in `settings.json`:
+/// settings.json roams between machines, and a machine-specific absolute path
+/// has no business travelling with it. Only the Rust side ever spells the
+/// path — see [`learning_memory_dir`].
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct LearningConfig {
+    /// Whether confirmed conversions are remembered and fed back into the
+    /// candidate ranking.
+    pub enable: bool,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        LearningConfig { enable: true }
+    }
+}
+
+impl LearningConfig {
+    /// Decoded one key at a time, so a single unusable value costs only
+    /// itself — see [`lenient_field`].
+    fn from_json(object: Option<&serde_json::Map<String, serde_json::Value>>) -> Self {
+        let default = LearningConfig::default();
+        LearningConfig {
+            enable: lenient_field(object, "enable", "learning.", default.enable),
+        }
+    }
+}
+
 /// One add-on the user has installed. Deliberately the smallest thing that
 /// can identify a plugin and say whether it runs: anything a plugin
 /// declares about itself (name, version, capabilities) belongs to its own
@@ -444,6 +512,7 @@ pub struct AppConfig {
     pub version: String,
     pub zenzai: ZenzaiConfig,
     pub conversion: ConversionConfig,
+    pub learning: LearningConfig,
     pub plugins: PluginsConfig,
 }
 
@@ -453,6 +522,7 @@ impl Default for AppConfig {
             version: CONFIG_VERSION.to_string(),
             zenzai: ZenzaiConfig::default(),
             conversion: ConversionConfig::default(),
+            learning: LearningConfig::default(),
             plugins: PluginsConfig::default(),
         }
     }
@@ -505,8 +575,34 @@ impl AppConfig {
     /// boundary — and a save landing between the two reads applied half of one
     /// version and half of the other. Now there is a single read, and the
     /// engine is given exactly the document this build would have written.
+    ///
+    /// Plus one key that is never written: `learning.memory_directory`. The
+    /// engine has to be told where to keep what it learns, the answer is
+    /// machine-specific, and `settings.json` roams — so the path is computed
+    /// here, on every LoadConfig and every UpdateConfig, and injected into
+    /// the copy the engine sees. Without `APPDATA` nothing is injected and
+    /// the engine leaves learning off, which is the honest outcome: there is
+    /// no directory to learn into.
     pub fn to_engine_json(&self) -> Result<String, String> {
-        serde_json::to_string(&self.normalized())
+        self.to_engine_json_with(learning_memory_dir())
+    }
+
+    /// The same, with the directory named explicitly so tests do not read
+    /// `%APPDATA%` (see [`config_root_in`]).
+    fn to_engine_json_with(&self, memory_dir: Option<PathBuf>) -> Result<String, String> {
+        let mut value = serde_json::to_value(self.normalized())
+            .map_err(|e| format!("failed to serialize settings for the engine: {e}"))?;
+        if let Some(dir) = memory_dir
+            && let Some(section) = value
+                .get_mut("learning")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            section.insert(
+                "memory_directory".to_string(),
+                serde_json::Value::String(dir.to_string_lossy().into_owned()),
+            );
+        }
+        serde_json::to_string(&value)
             .map_err(|e| format!("failed to serialize settings for the engine: {e}"))
     }
 
@@ -662,6 +758,7 @@ impl AppConfig {
             version: lenient_field(object, "version", "", CONFIG_VERSION.to_string()),
             zenzai: ZenzaiConfig::from_json(lenient_section(object, "zenzai")),
             conversion: ConversionConfig::from_json(lenient_section(object, "conversion")),
+            learning: LearningConfig::from_json(lenient_section(object, "learning")),
             plugins: PluginsConfig::from_json(lenient_section(object, "plugins")),
         }
     }
@@ -1225,6 +1322,102 @@ mod tests {
             "the converter's own default, so the engine keeps deciding"
         );
         assert!(config.zenzai.enable, "the sections it does have still load");
+    }
+
+    /// The one default that is NOT the engine's previous behaviour. Every
+    /// conversion flag reproduces what the engine did before it was settable;
+    /// learning deliberately does not, so an install upgraded from a build
+    /// without the section starts remembering. That is the product decision,
+    /// and this is where it is pinned so it cannot drift by accident.
+    #[test]
+    fn learning_is_on_for_a_settings_file_that_predates_the_section() {
+        let root = TempConfigRoot::new();
+        root.write_settings(
+            r#"{"version":"0.1.0","zenzai":{"enable":true},"plugins":{"enable":true}}"#,
+        );
+
+        let config = AppConfig::new_in(root.path());
+
+        assert!(
+            config.learning.enable,
+            "an older file must upgrade into learning being on"
+        );
+        assert!(config.zenzai.enable, "the sections it does have still load");
+    }
+
+    #[test]
+    fn an_unusable_learning_enable_falls_back_without_touching_the_file() {
+        let root = TempConfigRoot::new();
+        root.write_settings(
+            r#"{"version":"0.1.0","learning":{"enable":"yes please"},"zenzai":{"profile":"p"}}"#,
+        );
+
+        let config = AppConfig::read_in(root.path());
+
+        assert!(
+            config.learning.enable,
+            "the field falls back to its default"
+        );
+        assert_eq!(
+            config.zenzai.profile, "p",
+            "and costs nothing but itself, as everywhere else"
+        );
+    }
+
+    /// The path is machine-specific and `settings.json` roams, so it exists
+    /// on exactly one side of the boundary: present in what the engine is
+    /// handed, absent from what is written to disk.
+    #[test]
+    fn the_memory_directory_reaches_the_engine_but_never_the_file() {
+        let root = TempConfigRoot::new();
+        let config = AppConfig::default();
+
+        let engine_json = config
+            .to_engine_json_with(Some(PathBuf::from(
+                r"C:\Users\someone\AppData\Roaming\Azookey\memory",
+            )))
+            .expect("serialize for the engine");
+        let engine: serde_json::Value = serde_json::from_str(&engine_json).expect("engine JSON");
+        assert_eq!(
+            engine["learning"]["memory_directory"],
+            serde_json::json!(r"C:\Users\someone\AppData\Roaming\Azookey\memory")
+        );
+        assert_eq!(engine["learning"]["enable"], serde_json::json!(true));
+
+        config.write_to(root.path()).expect("write");
+        let stored: serde_json::Value =
+            serde_json::from_str(&root.read_settings()).expect("stored JSON");
+        assert_eq!(
+            stored["learning"]["memory_directory"],
+            serde_json::Value::Null,
+            "a machine-specific path must not travel in a roaming file"
+        );
+        assert_eq!(stored["learning"]["enable"], serde_json::json!(true));
+    }
+
+    /// No `APPDATA`, no directory to name — and the engine's own guard turns
+    /// that into learning staying off rather than a path being invented.
+    #[test]
+    fn without_a_config_root_the_engine_is_told_no_directory() {
+        let engine_json = AppConfig::default()
+            .to_engine_json_with(learning_memory_dir_in(None))
+            .expect("serialize for the engine");
+        let engine: serde_json::Value = serde_json::from_str(&engine_json).expect("engine JSON");
+
+        assert_eq!(
+            engine["learning"]["memory_directory"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn the_memory_directory_hangs_off_the_config_root() {
+        assert_eq!(
+            learning_memory_dir_in(Some(r"C:\Users\someone\AppData\Roaming".into()))
+                .expect("a set base yields a directory"),
+            Path::new(r"C:\Users\someone\AppData\Roaming\Azookey\memory")
+        );
+        assert_eq!(learning_memory_dir_in(Some("".into())), None);
     }
 
     /// Same reasoning as the inference limit, with a sharper edge: this number

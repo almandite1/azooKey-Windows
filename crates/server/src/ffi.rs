@@ -44,14 +44,25 @@ unsafe extern "C" {
     ) -> *mut c_char;
     pub(crate) fn RemoveText(session: i64, cursorPtr: *mut c_int) -> *mut c_char;
     pub(crate) fn MoveCursor(session: i64, offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
-    pub(crate) fn ShrinkText(session: i64, surfaceOffset: c_int) -> *mut c_char;
-    pub(crate) fn ClearText(session: i64);
+    /// `confirmedCandidate` indexes the RAW engine list this session was last
+    /// handed (see ffi.h), not the displayed one — service.rs translates.
+    /// -1 learns nothing, which is also what a client that sends no index
+    /// becomes.
+    pub(crate) fn ShrinkText(
+        session: i64,
+        surfaceOffset: c_int,
+        confirmedCandidate: c_int,
+    ) -> *mut c_char;
+    pub(crate) fn ClearText(session: i64, confirmedCandidate: c_int);
     pub(crate) fn GetComposedText(session: i64, lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     pub(crate) fn RemoveSession(session: i64);
     /// Takes the settings document as text and reports whether it was
     /// applied — see the header for why it is not the engine that reads the
     /// file. `false` means the engine kept the configuration it had.
     pub(crate) fn LoadConfig(json: *const c_char) -> bool;
+    /// Forgets everything learned so far. `false` when there is no memory
+    /// directory to reset — the engine never creates one.
+    pub(crate) fn ResetLearning() -> bool;
     pub(crate) fn FreeString(ptr: *mut c_char);
     pub(crate) fn FreeComposedText(listPtr: *mut *mut FFICandidate, length: c_int);
 }

@@ -167,18 +167,101 @@ private let warmUpReading = "kesahaiitenkinanodekouenmadearuiteikimashita"
     }
 }
 
+/// Whether the converter is both allowed to learn and has somewhere to keep
+/// what it learns. Both halves, everywhere — a commit with no directory
+/// writes into the relative placeholder path.
+@MainActor private var learningIsLive: Bool {
+    config.learningEnabled && config.memoryDirectory != nil
+}
+
+/// Feeds one accepted candidate back into the converter's memory.
+///
+/// MUST be called before `endComposition()` in the same export.
+/// `stopComposition` drops the converter's `lastData`, which is what chains
+/// this entry to the previous one — learning after it still records the
+/// candidate but loses the bigram, so the ordering here is the contract, not
+/// a style preference.
+///
+/// RAM only: `updateLearningData` does not touch the disk. Persisting is
+/// `commitUpdateLearningData`, which the confirming ClearText and
+/// RemoveSession do.
+///
+/// `index` is whatever arrived over the FFI, so every guard below is against
+/// untrusted input rather than against a bug: negative means "learn nothing"
+/// and out of range is ignored.
+///
+/// ACCEPTED: the `lastData` chain the bigram hangs off is the CONVERTER's,
+/// and one converter serves every application. Two apps confirming in
+/// alternation can therefore chain across each other — the same
+/// process-wide-state caveat as `endComposition` below, and the same real
+/// fix: the per-session converter state coming upstream (feat/session_api).
+/// The candidate itself is always learned correctly; only the pairing with
+/// what came before it can be another window's.
+@MainActor private func learn(session: Int64, candidateIndex index: Int32) {
+    guard index >= 0, learningIsLive, let converter else { return }
+    let candidate = withSession(session) { state -> Candidate? in
+        let i = Int(index)
+        return state.lastCandidates.indices.contains(i) ? state.lastCandidates[i] : nil
+    }
+    guard let candidate else { return }
+    converter.updateLearningData(candidate)
+}
+
 @_cdecl("ClearText")
-@MainActor public func clear_text(session: Int64) {
+@MainActor public func clear_text(session: Int64, confirmedCandidate: Int32) {
+    // Order matters at every step here.
+    //
+    // 1. Learn first: `endComposition` below drops the converter state this
+    //    hangs off (see `learn`).
+    learn(session: session, candidateIndex: confirmedCandidate)
+    // 2. Persist, but only for a confirmation. This is the end of a sentence
+    //    — Enter — so it is the natural place to pay a disk write, and it
+    //    bounds what a crash or a watchdog restart can lose to the sentence
+    //    in progress. Not per keystroke: that would write on every key.
+    if confirmedCandidate >= 0, learningIsLive {
+        converter?.commitUpdateLearningData()
+    }
     withSession(session) { state in
         state.composingText = ComposingText()
+        // 3. Emptied so a RETRY of this same call learns nothing. The client
+        //    retries ClearText as idempotent (it is, for composing state),
+        //    and without this a resent confirmation would be counted twice.
+        state.lastCandidates = []
     }
+    // 4. Last, for the reason in step 1.
     endComposition()
 }
 
 @_cdecl("RemoveSession")
 @MainActor public func remove_session(session: Int64) {
+    // An idle session being retired is the other moment worth a disk write:
+    // whatever it learned since its last confirmation would otherwise sit in
+    // RAM until the process exits, which a crash does not wait for.
+    if learningIsLive {
+        converter?.commitUpdateLearningData()
+    }
     sessions.removeValue(forKey: session)
     endComposition()
+}
+
+/// Forgets everything the converter has learned.
+///
+/// Deliberately does NOT create the directory when it is missing: creating
+/// it belongs to the Rust server, which also locks its DACL down (see
+/// `memory_dir.rs`), and a directory created here would hold the user's
+/// input history with default permissions. The server's handler runs that
+/// step before calling this, so by the time we get here the directory either
+/// exists or could not be made — and `false` says which.
+@_cdecl("ResetLearning")
+@MainActor public func reset_learning() -> Bool {
+    guard let directory = config.memoryDirectory,
+          FileManager.default.fileExists(atPath: directory.path),
+          let converter
+    else {
+        return false
+    }
+    converter.resetMemory()
+    return true
 }
 
 /// Drops the converter's own per-composition caches (lattice, zenzai
@@ -237,6 +320,12 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         return to_list_pointer([])
     }
     let converted = converter.requestCandidates(target, options: options)
+    // Kept whole, before anything below turns it into C strings and throws
+    // the objects away: learning needs the `Candidate`, and the index the
+    // client eventually confirms is an index into exactly this (see ffi.h).
+    withSession(session) { state in
+        state.lastCandidates = converted.mainResults
+    }
     // one table for the whole request: it depends only on the reading
     let readings = shrinkReadings(of: target)
     var result: [FFICandidate] = []
@@ -271,9 +360,15 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 @_cdecl("ShrinkText")
 @MainActor public func shrink_text(
     session: Int64,
-    surfaceOffset: Int32
+    surfaceOffset: Int32,
+    confirmedCandidate: Int32
 ) -> UnsafeMutablePointer<CChar>? {
-    withSession(session) { state in
+    // Before `spend` below, for the same reason ClearText learns first: the
+    // candidate is about to stop being what this composition is about. No
+    // commit here — a clause confirmation is mid-sentence, and the write
+    // happens when the sentence ends.
+    learn(session: session, candidateIndex: confirmedCandidate)
+    return withSession(session) { state in
         var afterComposingText = state.composingText
         // A surface (kana) count, not the keystroke count this used to take:
         // a candidate can end inside a romaji cluster (かんし|ゃ), and only

@@ -66,6 +66,15 @@ message ShrinkTextRequest {
   reserved 1;
   reserved "offset";
   int32 surface_offset = 2;
+  // Which candidate the user accepted, as an index into the list the
+  // candidate window was showing. Present means a confirmation the engine
+  // should learn from; absent means a discard, or a TIP from before this
+  // field existed — either way, nothing is learned.
+  //
+  // `optional` rather than a plain int32 because index 0 is the commonest
+  // value there is (the top candidate), and proto3's zero-default cannot
+  // tell it apart from "not sent".
+  optional int32 candidate_index = 3;
 }
 
 message ShrinkTextResponse {
@@ -78,10 +87,24 @@ message MoveCursorResponse {
 }
 
 // Request message for ClearText.
-message ClearTextRequest {}
+message ClearTextRequest {
+  // The same field as in ShrinkTextRequest, and it is what separates the two
+  // things this one RPC does: ending a composition by confirming it (present)
+  // and ending it by throwing it away — Escape, focus loss, a host-terminated
+  // composition (absent). Field 1 was free; this message was empty.
+  optional int32 candidate_index = 1;
+}
 
 // Response message for ClearText.
 message ClearTextResponse {}
+
+// Forgets everything the engine has learned from confirmed conversions.
+//
+// Its own RPC rather than a flag on UpdateConfig: UpdateConfig is sent on
+// every save the settings app makes, and a destructive action must not ride
+// along on a message that frequent.
+message ResetLearningRequest {}
+message ResetLearningResponse {}
 
 message SetContextRequest {
   string context = 1;
@@ -102,4 +125,5 @@ service AzookeyService {
   rpc ClearText (ClearTextRequest) returns (ClearTextResponse);
   rpc SetContext (SetContextRequest) returns (SetContextResponse);
   rpc UpdateConfig (UpdateConfigRequest) returns (UpdateConfigResponse);
+  rpc ResetLearning (ResetLearningRequest) returns (ResetLearningResponse);
 }

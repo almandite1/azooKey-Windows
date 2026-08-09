@@ -62,7 +62,9 @@ impl TextServiceFactory_Impl {
 
         let replay = keystrokes(mode, &snapshot.raw_input);
 
-        if let Err(error) = ipc_service.clear_text() {
+        // No index: this clears the server so the reading can be replayed
+        // onto it. Nothing was confirmed — the composition is still open.
+        if let Err(error) = ipc_service.clear_text(None) {
             tracing::warn!("could not clear the server before rebuilding: {error:#}");
             return false;
         }
@@ -173,7 +175,7 @@ mod tests {
         let calls = recorded_calls(&fake);
         let clear = calls
             .iter()
-            .position(|c| *c == IpcCall::ClearText)
+            .position(|c| *c == IpcCall::ClearText(None))
             .expect("the rebuild must clear the server's half-applied reading first");
         let replay = calls
             .iter()
@@ -305,7 +307,7 @@ mod tests {
             .position(|c| *c == IpcCall::HideWindow)
             .expect("the teardown must have run");
         assert!(
-            !calls[hide..].contains(&IpcCall::ClearText),
+            !calls[hide..].contains(&IpcCall::ClearText(None)),
             "the teardown must spend no further RPC on a pipe the rebuild \
              already found dead: {calls:?}"
         );

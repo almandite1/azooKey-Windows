@@ -25,7 +25,12 @@ async fn connect() -> Client {
     // here with a clear message instead of on the first real assertion
     tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        client.clear_text(shared::proto::ClearTextRequest {}),
+        client.clear_text(shared::proto::ClearTextRequest {
+            // no index: these calls end a composition without confirming
+            // one, which is what the client sends on Escape — and what the
+            // engine must learn nothing from
+            candidate_index: None,
+        }),
     )
     .await
     .expect("timed out connecting; is the server running? (see file header)")
@@ -42,7 +47,12 @@ async fn connect() -> Client {
 
 async fn clear(client: &mut Client) {
     client
-        .clear_text(shared::proto::ClearTextRequest {})
+        .clear_text(shared::proto::ClearTextRequest {
+            // no index: these calls end a composition without confirming
+            // one, which is what the client sends on Escape — and what the
+            // engine must learn nothing from
+            candidate_index: None,
+        })
         .await
         .expect("clear_text failed");
 }
@@ -87,14 +97,20 @@ async fn remove_many(client: &mut Client, count: i32) -> ComposingText {
 
 async fn shrink(client: &mut Client, surface_offset: i32) {
     client
-        .shrink_text(shared::proto::ShrinkTextRequest { surface_offset })
+        .shrink_text(shared::proto::ShrinkTextRequest {
+            surface_offset,
+            candidate_index: None,
+        })
         .await
         .expect("shrink_text failed (server crash?)");
 }
 
 async fn shrink_for(client: &mut Client, surface_offset: i32) -> ComposingText {
     client
-        .shrink_text(shared::proto::ShrinkTextRequest { surface_offset })
+        .shrink_text(shared::proto::ShrinkTextRequest {
+            surface_offset,
+            candidate_index: None,
+        })
         .await
         .expect("shrink_text failed")
         .into_inner()
@@ -444,6 +460,105 @@ async fn committing_a_clause_leaves_the_rest_of_the_reading() {
     );
 
     clear(&mut client).await;
+}
+
+/// The newest mtime under the learning directory, or `None` if there is
+/// nothing there. The engine rewrites every file on each commit, so this
+/// moves whenever a confirmation reaches the disk — and stays put when one
+/// does not.
+fn learning_written_at() -> Option<std::time::SystemTime> {
+    let directory = shared::learning_memory_dir()?;
+    std::fs::read_dir(directory)
+        .ok()?
+        .filter_map(|entry| entry.ok()?.metadata().ok()?.modified().ok())
+        .max()
+}
+
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment; it LEARNS \
+            from one conversion (clear it with the settings app's reset button)"]
+async fn a_confirmation_reaches_the_disk() {
+    // The half the RPC-level test below cannot see. `updateLearningData` is
+    // RAM only, so a confirmation that never commits still improves the
+    // ranking for as long as the process lives -- and looks exactly like a
+    // working feature until the machine is rebooted. The only proof is the
+    // store on disk changing, so that is what this asserts.
+    //
+    // Non-destructive: it adds one learned conversion and resets nothing.
+    let before = learning_written_at().expect(
+        "no learning directory yet; the server creates it at startup -- is \
+         this server the build under test?",
+    );
+
+    let mut client = connect().await;
+    clear(&mut client).await;
+
+    let composing = type_keys(&mut client, "mizu").await;
+    assert_eq!(composing.hiragana, "みず");
+    assert!(
+        !composing.suggestions.is_empty(),
+        "nothing to confirm: the engine returned no candidates"
+    );
+
+    client
+        .clear_text(shared::proto::ClearTextRequest {
+            candidate_index: Some(0),
+        })
+        .await
+        .expect("a confirming clear_text must be accepted");
+
+    let after = learning_written_at().expect("the learning directory must still be there");
+    assert!(
+        after > before,
+        "a confirmed conversion did not reach the disk: the store's newest \
+         mtime is still {before:?}. The RPC was accepted, so the index was \
+         either translated to -1 by the server or dropped by the engine -- \
+         learning would work until the next restart and then be gone."
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a running azookey-server with its DLL environment; it LEARNS \
+            from a conversion and then resets the learning history"]
+async fn a_confirmed_candidate_is_learned_and_the_history_can_be_reset() {
+    // The learning path end to end, which only a live engine can show: a
+    // displayed index is translated to the engine's own, the engine learns
+    // from the candidate behind it, and the whole history can be dropped
+    // again.
+    //
+    // Deliberately destructive of the learning history and nothing else —
+    // hence the second half. Run it on a development machine, not on one
+    // whose learned conversions you want to keep.
+    let mut client = connect().await;
+    clear(&mut client).await;
+
+    let composing = type_keys(&mut client, "mizu").await;
+    assert_eq!(composing.hiragana, "みず");
+    // whatever the engine ranks second, so the confirmation is a real
+    // choice rather than the ranking it already had
+    let chosen = i32::try_from(composing.suggestions.len().min(2) - 1).expect("a small index");
+
+    client
+        .clear_text(shared::proto::ClearTextRequest {
+            candidate_index: Some(chosen),
+        })
+        .await
+        .expect("a confirming clear_text must be accepted");
+
+    client
+        .reset_learning(shared::proto::ResetLearningRequest {})
+        .await
+        .expect("reset_learning failed; is there a memory directory?");
+
+    // An index no list ever had must be refused by the translation rather
+    // than reaching the engine — the pipe is open to any local process.
+    let _ = type_keys(&mut client, "mizu").await;
+    client
+        .clear_text(shared::proto::ClearTextRequest {
+            candidate_index: Some(9999),
+        })
+        .await
+        .expect("an out-of-range index must be ignored, not fatal");
 }
 
 #[tokio::test]

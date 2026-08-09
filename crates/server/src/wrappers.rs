@@ -8,7 +8,7 @@ use shared::proto::Suggestion;
 
 use crate::ffi::{
     AppendText, ClearText, FFICandidate, FreeComposedText, FreeString, GetComposedText, Initialize,
-    LoadConfig, MoveCursor, RemoveSession, RemoveText, SetContext, ShrinkText,
+    LoadConfig, MoveCursor, RemoveSession, RemoveText, ResetLearning, SetContext, ShrinkText,
 };
 
 pub(crate) struct RawComposingText {
@@ -110,8 +110,12 @@ pub(crate) fn remove_text(session: i64) -> RawComposingText {
     composing_call(|cursor| unsafe { RemoveText(session, cursor) })
 }
 
-pub(crate) fn clear_text(session: i64) {
-    unsafe { ClearText(session) };
+/// `confirmed_candidate` is an index into the engine's own last candidate
+/// list, or -1 for "learn nothing" — a discarded composition, or a client
+/// too old to send one. Translating a displayed index into an engine one is
+/// service.rs's job; by here it is already the engine's.
+pub(crate) fn clear_text(session: i64, confirmed_candidate: i32) {
+    unsafe { ClearText(session, confirmed_candidate) };
 }
 
 // The offset is the full int32 from the wire: it is a count of kana in the
@@ -121,8 +125,17 @@ pub(crate) fn clear_text(session: i64) {
 //
 // The one export with no cursor out-parameter (see ffi.h), hence the
 // cursor-less variant: it reports `None` rather than a plausible-looking 0.
-pub(crate) fn shrink_text(session: i64, surface_offset: i32) -> RawComposingText {
-    composing_call_without_cursor(|| unsafe { ShrinkText(session, surface_offset) })
+//
+// `confirmed_candidate`: see `clear_text`. A clause confirmation learns but
+// does not persist — the write happens when the sentence ends.
+pub(crate) fn shrink_text(
+    session: i64,
+    surface_offset: i32,
+    confirmed_candidate: i32,
+) -> RawComposingText {
+    composing_call_without_cursor(|| unsafe {
+        ShrinkText(session, surface_offset, confirmed_candidate)
+    })
 }
 
 pub(crate) fn set_context(session: i64, context: &str) {
@@ -140,6 +153,14 @@ pub(crate) fn set_context(session: i64, context: &str) {
 pub(crate) fn load_config(json: &str) -> bool {
     let json = to_cstring(json);
     unsafe { LoadConfig(json.as_ptr()) }
+}
+
+/// Forgets everything the engine has learned, and reports whether it
+/// happened. `false` means there was no memory directory to reset — the
+/// engine never creates one (see `memory_dir.rs`), so the caller says so
+/// rather than reporting a reset that did not occur.
+pub(crate) fn reset_learning() -> bool {
+    unsafe { ResetLearning() }
 }
 
 /// Drops the engine's composing state for a session whose connection went

@@ -1,5 +1,6 @@
 mod candidate_pipeline;
 mod ffi;
+mod memory_dir;
 mod plugin_client;
 mod service;
 mod session;
@@ -31,6 +32,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a session that starts with Zenzai on has to know that before the warm-up
     // rather than on the first keystroke after it. The engine no longer opens
     // settings.json at all — this process is its only reader.
+    //
+    // Before that read, though: the settings document carries the learning
+    // directory, and the engine only adopts it if it already EXISTS (it must
+    // never create it — see memory_dir.rs for why the permissions have to be
+    // ours). Initialize's warm-up conversion is the first thing to build a
+    // learning store, so the directory has to be there and locked down by
+    // now.
+    memory_dir::ensure_secured_memory_dir();
     match shared::AppConfig::new().to_engine_json() {
         Ok(json) => {
             if !wrappers::load_config(&json) {
