@@ -29,9 +29,15 @@ struct LearningTests {
     private func withRestoredConfig(_ body: () -> Void) {
         let saved = config
         let savedConverter = converter
+        let savedUnsaved = hasUnsavedLearning
+        // Reset, not just restored: the suite shares one converter, so
+        // whether a PREVIOUS test left something unwritten would otherwise
+        // decide whether this one's commit writes.
+        hasUnsavedLearning = false
         defer {
             config = saved
             converter = savedConverter
+            hasUnsavedLearning = savedUnsaved
         }
         body()
     }
@@ -195,6 +201,144 @@ struct LearningTests {
                 #expect(
                     memoryFiles(in: directory).isEmpty,
                     "nothing may be written with learning off, got \(memoryFiles(in: directory))"
+                )
+            }
+        }
+    }
+
+    // MARK: - nothing learned, nothing written (#110)
+    //
+    // The engine's commit has no empty case: it rewrites every file in the
+    // memory directory whether or not anything was learned. So "did this
+    // operation write?" is a question about the store's timestamps, and it is
+    // the question a user asks when they want to know whether a conversion
+    // they cancelled was remembered. Each test below deletes or withholds the
+    // files rather than comparing timestamps, so a spurious write shows up as
+    // a file that came back — no dependence on filesystem clock resolution.
+
+    /// Cancelling is the -1 path, and it must leave the store alone.
+    @Test("a cancelled composition writes nothing")
+    func cancellingWritesNothing() {
+        withRestoredConfig {
+            withTemporaryDirectory { directory in
+                converter = Self.engine
+                config = EngineConfig()
+                config.memoryDirectory = directory
+                execURL = packageRoot.appendingPathComponent("azooKey_emoji_dictionary_storage")
+
+                let session: Int64 = 0x7102_0007
+                defer { remove_session(session: session) }
+
+                #expect(convert("mizu", in: session) > 0)
+                clear_text(session: session, confirmedCandidate: -1)
+
+                #expect(
+                    memoryFiles(in: directory).isEmpty,
+                    "a cancel confirms nothing, got \(memoryFiles(in: directory))"
+                )
+            }
+        }
+    }
+
+    /// Retiring an idle session is not a moment the user chose: eviction runs
+    /// off whatever request happens to arrive half an hour later, from any
+    /// application (`session_of` in the Rust server). A session that learned
+    /// nothing must therefore leave no trace — this is what made a cancel in
+    /// one window rewrite the whole store from another window's keystroke.
+    @Test("retiring a session that learned nothing writes nothing")
+    func retiringAnUnlearnedSessionWritesNothing() {
+        withRestoredConfig {
+            withTemporaryDirectory { directory in
+                converter = Self.engine
+                config = EngineConfig()
+                config.memoryDirectory = directory
+                execURL = packageRoot.appendingPathComponent("azooKey_emoji_dictionary_storage")
+
+                let session: Int64 = 0x7102_0008
+                #expect(convert("mizu", in: session) > 0)
+                clear_text(session: session, confirmedCandidate: -1)
+
+                remove_session(session: session)
+
+                #expect(
+                    memoryFiles(in: directory).isEmpty,
+                    "nothing was learned, so nothing may be written, got \(memoryFiles(in: directory))"
+                )
+            }
+        }
+    }
+
+    /// The other half of the same rule, so the fix cannot be "never commit on
+    /// eviction": a clause commit learns WITHOUT writing (mid-sentence, see
+    /// ShrinkText), which leaves the retirement of that session as the only
+    /// thing that can get it to disk.
+    @Test("retiring a session commits what it did learn")
+    func retiringASessionCommitsRealLearning() {
+        withRestoredConfig {
+            withTemporaryDirectory { directory in
+                converter = Self.engine
+                config = EngineConfig()
+                config.memoryDirectory = directory
+                execURL = packageRoot.appendingPathComponent("azooKey_emoji_dictionary_storage")
+
+                let session: Int64 = 0x7102_0009
+                #expect(convert("kisha", in: session) > 0, "the dictionary answered nothing")
+
+                let reading = shrink_text(
+                    session: session,
+                    surfaceOffset: 1,
+                    confirmedCandidate: 0
+                )
+                free_string(ptr: reading)
+                #expect(
+                    memoryFiles(in: directory).isEmpty,
+                    "a clause commit is mid-sentence: learned, not yet written"
+                )
+
+                remove_session(session: session)
+
+                #expect(
+                    !memoryFiles(in: directory).isEmpty,
+                    "what the session learned must survive its retirement, got \(memoryFiles(in: directory))"
+                )
+            }
+        }
+    }
+
+    /// The client resends `ClearText` when a reply is lost, carrying the same
+    /// index. `clearTextEmptiesTheCandidateList` pins that the retry learns
+    /// nothing; this pins that it does not pay for a write either.
+    @Test("a retried confirmation does not write a second time")
+    func retriedConfirmationDoesNotWriteAgain() {
+        withRestoredConfig {
+            withTemporaryDirectory { directory in
+                converter = Self.engine
+                config = EngineConfig()
+                config.memoryDirectory = directory
+                execURL = packageRoot.appendingPathComponent("azooKey_emoji_dictionary_storage")
+
+                let session: Int64 = 0x7102_000A
+                defer { remove_session(session: session) }
+
+                #expect(convert("kisha", in: session) > 0)
+                clear_text(session: session, confirmedCandidate: 0)
+                let written = memoryFiles(in: directory)
+                #expect(!written.isEmpty, "the first confirmation must write")
+
+                // Taken away so the retry's write, if it happens, is visible
+                // as their return rather than as a timestamp that may not
+                // have moved.
+                for name in written {
+                    try? FileManager.default.removeItem(
+                        at: directory.appendingPathComponent(name)
+                    )
+                }
+
+                clear_text(session: session, confirmedCandidate: 0)
+
+                #expect(
+                    memoryFiles(in: directory).isEmpty,
+                    "the retry learned nothing, so it must write nothing, got \(memoryFiles(in: directory))"
                 )
             }
         }
