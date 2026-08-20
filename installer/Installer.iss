@@ -65,8 +65,8 @@ UninstallDisplayIcon={app}\Azookey.exe
 Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 
 [Files]
-Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit
-Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit
+Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit; AfterInstall: GrantAppContainerRead
+Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit; AfterInstall: GrantAppContainerRead
 ; exclude the installer's own output (OutputDir is also ../build): a stale
 ; azookey-setup.exe would otherwise be bundled into — or clash with — the new one.
 ; also exclude azookey_windows*.dll: the TIP is already placed and registered
@@ -110,32 +110,6 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\Azookey.exe"
 Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\azookey-server.exe"; ValueType: expandsz; ValueName: "DumpFolder"; ValueData: "%LOCALAPPDATA%\Azookey\dumps"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\azookey-server.exe"; ValueType: dword; ValueName: "DumpType"; ValueData: "1"
 Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\azookey-server.exe"; ValueType: dword; ValueName: "DumpCount"; ValueData: "5"
-
-[Run]
-; Let AppContainer hosts (Start menu search, Store apps) read the TIP. Without
-; this ACE they cannot load it, and the symptom is not an error: picking
-; azooKey in such a host silently does nothing and the tray falls back to
-; another IME.
-;
-; The path MUST be quoted. {app} defaults to "C:\Program Files\Azookey", and
-; unquoted, icacls saw "C:\Program" and failed every install with exit code 87
-; (ERROR_INVALID_PARAMETER). That went unnoticed because Program Files already
-; hands this same right down by inheritance, so the default install looked
-; right while the explicit grant had never once been applied - a directory the
-; user picks that does not inherit it would have had no grant at all.
-;
-; Not postinstall: that turns the grant into a finish-page checkbox the user
-; can clear, and it is not optional. Not runascurrentuser either: that
-; de-elevates the child, and only Setup's own elevated token may rewrite an
-; ACL under Program Files.
-Filename: "icacls"; \
-  Parameters: """{app}\azookey.dll"" /grant ""*S-1-15-2-1:(RX)"""; \
-  StatusMsg: "Granting read access to sandboxed applications..."; \
-  Flags: runhidden
-Filename: "icacls"; \
-  Parameters: """{app}\azookey32.dll"" /grant ""*S-1-15-2-1:(RX)"""; \
-  StatusMsg: "Granting read access to sandboxed applications..."; \
-  Flags: runhidden
 
 [InstallDelete]
 ; The settings app used to be called frontend.exe: Tauri names the main
@@ -696,6 +670,55 @@ begin
   // write, and Azookey.exe has just been stopped so nothing holds them
   RemoveLegacyNsisSettingsApp();
   Result := '';
+end;
+
+// Let AppContainer hosts (Start menu search, Store apps) read the TIP. Without
+// this ACE they cannot load it, and the symptom is not an error: picking
+// azooKey in such a host silently does nothing and the tray falls back to
+// another IME.
+//
+// Called from AfterInstall on the two TIP entries rather than from [Run],
+// because of WHEN [Run] happens: Setup registers every regserver file as the
+// last step of the installation, and [Run] entries come after that. So the
+// grant used to be the last thing the install did to azookey.dll -- and
+// rewriting a file's security descriptor invalidates Defender's scan verdict
+// for it, leaving the rescan to be paid by whoever loads the TIP next. That is
+// the first application the user typed in, on its UI thread, which is what
+// #108 looks like from the outside: the first sentence after installing
+// stalls for seconds and every sentence after it is fine. AfterInstall runs as
+// soon as the file has been copied, so the registration load comes last again
+// and the scan is paid inside Setup's own progress bar.
+//
+// Runs under Setup's own elevated token, the only one that may rewrite an ACL
+// under Program Files -- the [Run] entry could not use runascurrentuser for
+// that same reason, and there is no such flag here to get wrong. It is also
+// unconditional: with the postinstall flag it would have become a finish-page
+// checkbox the user could clear, and it is not optional.
+procedure GrantAppContainerRead;
+var
+  FileName: String;
+  ExitCode: Integer;
+begin
+  // CurrentFilename, not a second literal copy of the path: DestName already
+  // decides where the file lands, and a literal here would go on granting to
+  // a path nothing is at, silently, if the two ever disagreed.
+  FileName := ExpandConstant(CurrentFilename);
+  // The path MUST be quoted. {app} defaults to "C:\Program Files\Azookey", and
+  // unquoted, icacls saw "C:\Program" and failed every install with exit code
+  // 87 (ERROR_INVALID_PARAMETER). That went unnoticed because Program Files
+  // already hands this same right down by inheritance, so the default install
+  // looked right while the explicit grant had never once been applied - a
+  // directory the user picks that does not inherit it would have had no grant
+  // at all.
+  if not Exec('icacls', '"' + FileName + '" /grant "*S-1-15-2-1:(RX)"', '',
+              SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
+    // Not fatal: inheritance covers the default install, and failing the whole
+    // install over this would be worse than the sandboxed-host case it
+    // protects. But no longer silent -- the [Run] entry discarded both the
+    // launch result and the exit code, which is how a grant that had never
+    // once applied went unnoticed for as long as it did.
+    Log('AppContainer grant failed for ' + FileName + ' (exit code ' +
+        IntToStr(ExitCode) + ')');
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
