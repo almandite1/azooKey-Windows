@@ -488,6 +488,10 @@ impl TextServiceFactory_Impl {
 
         edit.preview = text;
         edit.suffix.clear();
+        // What is on screen is now a transformation of the reading, not the
+        // entry the index points at — even when the two spell the same thing
+        // (#110). Committing it must confirm nothing.
+        edit.discard_candidate_selection();
         // the conversion covers everything typed so far, so a following
         // ShrinkText must drop it all — each count in its own unit
         edit.corresponding_count = edit.raw_input.chars().count() as i32;
@@ -1062,6 +1066,50 @@ mod tests {
         assert!(
             calls.contains(&IpcCall::ClearText(None)),
             "the preview is ミズ, not the candidate the index points at: {calls:?}"
+        );
+
+        IMEState::get().unwrap().ipc_service = None;
+    }
+
+    /// The same, for the reading where the katakana IS the top candidate
+    /// (#110). Comparing the preview against the highlighted entry cannot
+    /// tell the two apart — both spell パソコン — so the F7 arm has to say
+    /// that nothing is selected any more. Before it did, this Enter taught
+    /// the engine a candidate the user never picked, and paid a disk write
+    /// for it.
+    #[test]
+    fn a_function_key_result_matching_the_top_candidate_still_learns_nothing() {
+        let _guard = global_state_lock();
+        let fake = install_fake_ipc(Candidates::default());
+
+        let (tip, _context) = factory_with_fake_context(EditSessionBehavior::RunSync);
+        let factory = factory_of(&tip);
+        {
+            let text_service = factory.borrow().unwrap();
+            let mut composition = text_service.borrow_mut_composition().unwrap();
+            composition.set_up_for_test(CompositionState::Previewing);
+            composition.raw_hiragana = "ぱそこん".to_string();
+            composition.preview = "パソコン".to_string();
+            composition.candidates =
+                scripted(&["パソコン", "パソ混"], "ぱそこん", &[8, 8], &[4, 4]);
+            composition.selection_index = 0;
+        }
+
+        factory
+            .handle_action(
+                &[
+                    ClientAction::SetTextWithType(SetTextType::Katakana),
+                    ClientAction::EndComposition,
+                ],
+                CompositionState::None,
+            )
+            .unwrap();
+
+        let calls = recorded_calls(&fake);
+        assert!(
+            calls.contains(&IpcCall::ClearText(None)),
+            "F7 asked for katakana; that it spells the top candidate is a \
+             coincidence, not a choice: {calls:?}"
         );
 
         IMEState::get().unwrap().ipc_service = None;

@@ -9,6 +9,20 @@ import Foundation
 // instead of trapping and taking the server down.
 @MainActor var converter: KanaKanjiConverter?
 
+// Whether anything has been learned since the store was last written.
+//
+// The converter accumulates what it learns in RAM and only writes when told
+// to (`updateLearningData` then `commitUpdateLearningData`), but it will not
+// say whether there is anything to write — and committing an empty trie is
+// not free or invisible: it rewrites every file in the memory directory from
+// itself. So the answer is tracked here, on the two exports that learn and
+// the two that commit (FFIExports.swift).
+//
+// Engine-wide, not per-session, because the learning it describes is: one
+// converter serves every application, so a session retiring correctly
+// persists what another one learned.
+@MainActor var hasUnsavedLearning = false
+
 // Per-client composing state, keyed by the session id the Rust server
 // assigns to each pipe connection. Every application hosting the IME has
 // its own session; sharing one global ComposingText made simultaneous

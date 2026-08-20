@@ -205,6 +205,26 @@ private let warmUpReading = "kesahaiitenkinanodekouenmadearuiteikimashita"
     }
     guard let candidate else { return }
     converter.updateLearningData(candidate)
+    hasUnsavedLearning = true
+}
+
+/// Writes what has been learned to the memory directory — and only then.
+///
+/// The engine's commit has no notion of "nothing to do": it hands the
+/// temporary trie to `LongTermLearningMemory.merge`, which always reaches
+/// `update(trie:directoryURL:)` and rewrites every file in the directory,
+/// empty trie or not. So an unconditional commit leaves the memory store's
+/// timestamps saying the user's input was recorded when nothing was.
+///
+/// That is not a cosmetic difference. This directory is the user's input
+/// history, kept behind a locked-down DACL for that reason, and "was that
+/// cancelled conversion learned?" is answered by looking at it. A cancel
+/// arriving while an unrelated idle session happened to be retired used to
+/// rewrite all of it (#110).
+@MainActor private func commitLearning() {
+    guard hasUnsavedLearning, learningIsLive else { return }
+    converter?.commitUpdateLearningData()
+    hasUnsavedLearning = false
 }
 
 @_cdecl("ClearText")
@@ -218,8 +238,14 @@ private let warmUpReading = "kesahaiitenkinanodekouenmadearuiteikimashita"
     //    — Enter — so it is the natural place to pay a disk write, and it
     //    bounds what a crash or a watchdog restart can lose to the sentence
     //    in progress. Not per keystroke: that would write on every key.
-    if confirmedCandidate >= 0, learningIsLive {
-        converter?.commitUpdateLearningData()
+    //
+    //    `commitLearning` adds the other half of the condition, and it is
+    //    what makes the client's idempotent RETRY of this call free: the
+    //    retry carries the same index, but step 3 below has already emptied
+    //    the list so its `learn` finds nothing, and with nothing learned
+    //    there is nothing to write a second time.
+    if confirmedCandidate >= 0 {
+        commitLearning()
     }
     withSession(session) { state in
         state.composingText = ComposingText()
@@ -237,9 +263,12 @@ private let warmUpReading = "kesahaiitenkinanodekouenmadearuiteikimashita"
     // An idle session being retired is the other moment worth a disk write:
     // whatever it learned since its last confirmation would otherwise sit in
     // RAM until the process exits, which a crash does not wait for.
-    if learningIsLive {
-        converter?.commitUpdateLearningData()
-    }
+    //
+    // This is not a moment the user chose. Eviction runs off any request
+    // from any application (`session_of` in the Rust server), so the write
+    // has to be conditional on there being something to write — see
+    // `commitLearning`.
+    commitLearning()
     sessions.removeValue(forKey: session)
     endComposition()
 }
@@ -261,6 +290,10 @@ private let warmUpReading = "kesahaiitenkinanodekouenmadearuiteikimashita"
         return false
     }
     converter.resetMemory()
+    // `resetMemory` empties the temporary trie along with the store, so
+    // there is nothing left for a later commit to write — and saying so
+    // stops that commit rewriting the freshly emptied directory.
+    hasUnsavedLearning = false
     return true
 }
 

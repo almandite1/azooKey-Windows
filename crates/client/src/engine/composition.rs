@@ -205,22 +205,39 @@ impl CompositionEdit {
     /// The check is against the screen rather than against a flag: a
     /// selection index only names a confirmed candidate while the preview is
     /// still that candidate's text. That is what makes it correct without any
-    /// new state to keep in step, and it excludes exactly the cases that
-    /// should be excluded, without any of them being enumerated here:
+    /// new state to keep in step, and it excludes cases like backspace
+    /// emptying the list — an index into nothing matches nothing — without
+    /// enumerating them here.
     ///
-    /// - F6–F10 rewrite the preview in place (katakana, half-width, …).
-    ///   The selection index still points at whatever was highlighted, and
-    ///   the text no longer matches it — so nothing is learned, which is
-    ///   right: the user did not pick that reading's kanji, they asked for a
-    ///   transformation of the reading.
-    /// - Backspace can empty the list. An index into nothing matches
-    ///   nothing.
+    /// What it does NOT catch on its own is a preview that was rewritten into
+    /// the same text by something other than a choice off the list. F6–F10
+    /// transform the reading, and a transformation can spell what the
+    /// highlighted entry spells (ぱそこん → F7 → パソコン, which is also the
+    /// top candidate), so the texts match while the user picked nothing. That
+    /// is why those arms clear the selection themselves, through
+    /// [`CompositionEdit::discard_candidate_selection`] (#110).
     ///
     /// The counterpart to [`CompositionEdit::adopt_candidate`], which is
     /// where the preview and the index are put INTO agreement.
     pub(super) fn confirmed_candidate_index(&self) -> Option<i32> {
         let index = usize::try_from(self.selection_index).ok()?;
         (self.candidates.texts.get(index) == Some(&self.preview)).then_some(self.selection_index)
+    }
+
+    /// Says the preview is no longer any candidate's, so committing it
+    /// confirms nothing and the engine learns nothing.
+    ///
+    /// The undo of [`CompositionEdit::adopt_candidate`], for the arms that
+    /// replace the preview with something derived from the READING instead
+    /// of from the list.
+    ///
+    /// A negative index rather than an emptied list: the list is still what
+    /// the candidate window is showing and what an arrow key moves through.
+    /// Nothing downstream sees the negative — `act_set_selection` clamps into
+    /// range before it publishes or adopts, and the UILess accessors clamp
+    /// with `max(0)`.
+    pub(super) fn discard_candidate_selection(&mut self) {
+        self.selection_index = -1;
     }
 
     /// Mirrors candidate entry `index` into the preview fields of this
