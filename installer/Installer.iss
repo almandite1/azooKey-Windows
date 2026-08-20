@@ -111,6 +111,36 @@ Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDum
 Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\azookey-server.exe"; ValueType: dword; ValueName: "DumpType"; ValueData: "1"
 Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\azookey-server.exe"; ValueType: dword; ValueName: "DumpCount"; ValueData: "5"
 
+[Run]
+; Reload both TIPs as the last thing the install does to them, so that whatever
+; one-time cost Windows charges for a binary it has not seen before -- a
+; Defender scan, a cloud reputation lookup -- is paid here, inside a progress
+; bar, instead of by the first application the user types in (#108).
+;
+; Registering again is the means, not the end. DllRegisterServer rewrites the
+; same HKCR keys and the same TSF profile it wrote minutes ago and is
+; idempotent; what this is here for is that regsvr32 has to LOAD the DLL to
+; call it.
+;
+; Belt and braces behind the AfterInstall grant: with the ACL written before
+; registration, the registration load is already the last touch, and this only
+; matters if something later in the install disturbs the files again. Drop it
+; if a measurement ever shows the grant alone is enough.
+;
+; The bitness flags are not decoration. Setup itself is 32-bit, so {sys} is
+; rewritten per entry -- the 64bit entry reaches the real System32 through
+; Sysnative, the 32bit entry reaches SysWOW64 -- and each DLL has to be handed
+; to the regsvr32 that matches it. Same flags, same reason, as the [Files]
+; entries that register them in the first place.
+Filename: "{sys}\regsvr32.exe"; \
+  Parameters: "/s ""{app}\azookey.dll"""; \
+  StatusMsg: "Warming up the input method..."; \
+  Flags: runhidden 64bit
+Filename: "{sys}\regsvr32.exe"; \
+  Parameters: "/s ""{app}\azookey32.dll"""; \
+  StatusMsg: "Warming up the input method..."; \
+  Flags: runhidden 32bit
+
 [InstallDelete]
 ; The settings app used to be called frontend.exe: Tauri names the main
 ; binary after the crate unless `mainBinaryName` says otherwise, and it did
