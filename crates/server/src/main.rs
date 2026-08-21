@@ -7,6 +7,8 @@ mod session;
 mod trace;
 mod wrappers;
 
+use std::time::Instant;
+
 use azookey_server::TonicNamedPipeServer;
 use tonic::transport::Server;
 use tonic_reflection::server::Builder as ReflectionBuilder;
@@ -22,6 +24,15 @@ use service::MyAzookeyService;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     trace::setup_logger();
     tracing::info!("AzookeyServer started");
+    // Everything between here and "listening" is dead time: the pipe does not
+    // exist until serve_with_incoming below, so a keystroke arriving in this
+    // window has nothing to talk to. It is also where issue #108 spends its
+    // seconds, and the only number anyone had for it was the engine's own
+    // "converter warm-up took" -- which covers the last fraction of it. On one
+    // machine the warm-up ran 0.8s inside a window that ran 8.05s, so the
+    // measurement everyone was reading described a twelfth of the problem.
+    // Time each phase so a log says which one grew.
+    let startup = Instant::now();
     // get executable directory
     let current_exe = std::env::current_exe()?;
     let parent_dir = current_exe
@@ -48,7 +59,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => tracing::warn!("could not pass the stored settings to the engine: {e}"),
     }
+    let settings_done = startup.elapsed();
+
+    // Announced before the call rather than only timed after it: when the
+    // engine hangs in here the watchdog kills the process, the line below
+    // never runs, and the log would otherwise not say which phase it died in.
+    tracing::info!("startup: initializing the engine");
     wrappers::initialize(&parent_dir.to_string_lossy());
+    let engine_done = startup.elapsed();
 
     let service = MyAzookeyService::new();
 
@@ -78,6 +96,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Phases, not a single total: the total is already derivable from the two
+    // timestamps around it, and the point is which phase owns the seconds.
+    // "settings" is this process reading settings.json and handing it to the
+    // engine; "engine initialize" is the FFI call, whose own split between
+    // building the converter and warming it up the engine logs itself.
+    tracing::info!(
+        "startup phases: settings {:.2?}, engine initialize {:.2?}, service setup {:.2?}",
+        settings_done,
+        engine_done - settings_done,
+        startup.elapsed() - engine_done
+    );
     tracing::info!("AzookeyServer listening");
 
     Server::builder()
