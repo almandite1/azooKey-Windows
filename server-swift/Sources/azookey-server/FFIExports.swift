@@ -117,9 +117,23 @@ private let warmUpReading = "kesahaiitenkinanodekouenmadearuiteikimashita"
     // the dictionary belongs to the converter instance now, so this is the
     // earliest point it can be built: `path` is where the installer put
     // Dictionary/ and EmojiDictionary/
+    //
+    // Timed for the same reason the warm-up below is, except that this is the
+    // half nobody had a number for. `preloadDictionary` reads the whole
+    // dictionary before the server can open its pipe, and measured against the
+    // server's own startup log it -- not the warm-up -- is what owns that
+    // window: on ten consecutive starts the warm-up ran 0.46-2.08s while the
+    // phase before it ran 1.58-6.83s. Right after an install the file cache is
+    // cold and none of it has been read before, which is the state issue #108
+    // describes.
+    let buildStart = ContinuousClock().now
     let engine = KanaKanjiConverter(
         dictionaryURL: execURL.appendingPathComponent("Dictionary"),
         preloadDictionary: true
+    )
+    enginePrint(
+        level: .info,
+        "converter construction took \(ContinuousClock().now - buildStart)"
     )
     converter = engine
 
